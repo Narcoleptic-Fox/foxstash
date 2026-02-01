@@ -366,7 +366,9 @@ impl PQHNSWIndex {
             0
         };
 
-        self.nodes.len() * (code_size + original_size + overhead_per_node) + codebook_size + cache_size
+        self.nodes.len() * (code_size + original_size + overhead_per_node)
+            + codebook_size
+            + cache_size
     }
 
     /// Get compression ratio vs full f32 storage
@@ -397,10 +399,18 @@ impl PQHNSWIndex {
         }
 
         for layer in (0..=node_level).rev() {
-            current_nearest =
-                self.search_layer_symmetric(&node_code, &current_nearest, self.config.ef_construction, layer);
+            current_nearest = self.search_layer_symmetric(
+                &node_code,
+                &current_nearest,
+                self.config.ef_construction,
+                layer,
+            );
 
-            let m = if layer == 0 { self.config.m0 } else { self.config.m };
+            let m = if layer == 0 {
+                self.config.m0
+            } else {
+                self.config.m
+            };
             let neighbors = self.select_neighbors(&current_nearest, &node_code, m);
 
             for &neighbor_id in &neighbors {
@@ -409,12 +419,23 @@ impl PQHNSWIndex {
                 if layer < self.nodes[neighbor_id].connections.len() {
                     self.nodes[neighbor_id].connections[layer].insert(node_id);
 
-                    let neighbor_m = if layer == 0 { self.config.m0 } else { self.config.m };
+                    let neighbor_m = if layer == 0 {
+                        self.config.m0
+                    } else {
+                        self.config.m
+                    };
                     if self.nodes[neighbor_id].connections[layer].len() > neighbor_m {
                         let neighbor_code = self.nodes[neighbor_id].code.clone();
-                        let neighbor_connections: Vec<usize> =
-                            self.nodes[neighbor_id].connections[layer].iter().copied().collect();
-                        let pruned = self.select_neighbors(&neighbor_connections, &neighbor_code, neighbor_m);
+                        let neighbor_connections: Vec<usize> = self.nodes[neighbor_id].connections
+                            [layer]
+                            .iter()
+                            .copied()
+                            .collect();
+                        let pruned = self.select_neighbors(
+                            &neighbor_connections,
+                            &neighbor_code,
+                            neighbor_m,
+                        );
                         self.nodes[neighbor_id].connections[layer] = pruned.into_iter().collect();
                     }
                 }
@@ -434,7 +455,9 @@ impl PQHNSWIndex {
         let mut best = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = self.pq.distance_with_table(distance_table, &self.nodes[ep].code);
+            let dist = self
+                .pq
+                .distance_with_table(distance_table, &self.nodes[ep].code);
             candidates.push(Reverse((OrderedFloat(dist), ep)));
             best.push((OrderedFloat(dist), ep));
             visited.insert(ep);
@@ -453,7 +476,9 @@ impl PQHNSWIndex {
                 for &neighbor_id in &self.nodes[current_id].connections[layer] {
                     if !visited.contains(&neighbor_id) {
                         visited.insert(neighbor_id);
-                        let dist = self.pq.distance_with_table(distance_table, &self.nodes[neighbor_id].code);
+                        let dist = self
+                            .pq
+                            .distance_with_table(distance_table, &self.nodes[neighbor_id].code);
                         let dist_ord = OrderedFloat(dist);
 
                         if best.len() < ef {
@@ -473,7 +498,10 @@ impl PQHNSWIndex {
             }
         }
 
-        let mut results: Vec<(f32, usize)> = best.into_iter().map(|(OrderedFloat(dist), id)| (dist, id)).collect();
+        let mut results: Vec<(f32, usize)> = best
+            .into_iter()
+            .map(|(OrderedFloat(dist), id)| (dist, id))
+            .collect();
         results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         results.into_iter().map(|(_, id)| id).collect()
     }
@@ -509,7 +537,8 @@ impl PQHNSWIndex {
                 for &neighbor_id in &self.nodes[current_id].connections[layer] {
                     if !visited.contains(&neighbor_id) {
                         visited.insert(neighbor_id);
-                        let dist = self.distance_symmetric(query_code, &self.nodes[neighbor_id].code);
+                        let dist =
+                            self.distance_symmetric(query_code, &self.nodes[neighbor_id].code);
                         let dist_ord = OrderedFloat(dist);
 
                         if best.len() < ef {
@@ -529,7 +558,10 @@ impl PQHNSWIndex {
             }
         }
 
-        let mut results: Vec<(f32, usize)> = best.into_iter().map(|(OrderedFloat(dist), id)| (dist, id)).collect();
+        let mut results: Vec<(f32, usize)> = best
+            .into_iter()
+            .map(|(OrderedFloat(dist), id)| (dist, id))
+            .collect();
         results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         results.into_iter().map(|(_, id)| id).collect()
     }
@@ -668,7 +700,11 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..n)
-            .map(|_| (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0)).collect())
+            .map(|_| {
+                (0..dim)
+                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .collect()
+            })
             .collect()
     }
 
@@ -692,10 +728,13 @@ mod tests {
     #[test]
     fn test_pq_hnsw_basic() {
         let dim = 64;
-        let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
         let training_data = generate_random_vectors(500, dim, 42);
 
-        let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
         assert!(index.is_empty());
 
         let doc = create_test_document("doc1", generate_random_vectors(1, dim, 100)[0].clone());
@@ -707,14 +746,20 @@ mod tests {
     #[test]
     fn test_pq_hnsw_search() {
         let dim = 64;
-        let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
         let training_data = generate_random_vectors(500, dim, 42);
 
-        let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
 
         // Add documents
         for i in 0..100 {
-            let doc = create_test_document(&format!("doc{}", i), generate_random_vectors(1, dim, i)[0].clone());
+            let doc = create_test_document(
+                &format!("doc{}", i),
+                generate_random_vectors(1, dim, i)[0].clone(),
+            );
             index.add(doc).unwrap();
         }
 
@@ -735,14 +780,20 @@ mod tests {
     #[test]
     fn test_pq_hnsw_compression() {
         let dim = 384;
-        let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
         let training_data = generate_random_vectors(500, dim, 42);
 
-        let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
 
         // Use enough vectors to amortize fixed overhead (codebook + distance cache)
         for i in 0..5000 {
-            let doc = create_test_document(&format!("doc{}", i), generate_random_vectors(1, dim, i)[0].clone());
+            let doc = create_test_document(
+                &format!("doc{}", i),
+                generate_random_vectors(1, dim, i)[0].clone(),
+            );
             index.add(doc).unwrap();
         }
 
@@ -756,21 +807,29 @@ mod tests {
         // PQ codes are 8 bytes vs 1536 bytes (192x for vectors alone)
         // But we have fixed overhead from codebook + distance cache + HNSW graph
         // For 5K vectors, should still achieve > 2x compression
-        assert!(memory < full_size / 2, "Memory should be < 50% of full size, got {}%", 
-                (memory as f64 / full_size as f64 * 100.0) as u32);
+        assert!(
+            memory < full_size / 2,
+            "Memory should be < 50% of full size, got {}%",
+            (memory as f64 / full_size as f64 * 100.0) as u32
+        );
     }
 
     #[test]
     fn test_pq_hnsw_with_reranking() {
         let dim = 64;
-        let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
         let training_data = generate_random_vectors(500, dim, 42);
 
         let config = PQHNSWConfig::default().with_reranking(50);
         let mut index = PQHNSWIndex::train(pq_config, &training_data, config).unwrap();
 
         for i in 0..100 {
-            let doc = create_test_document(&format!("doc{}", i), generate_random_vectors(1, dim, i)[0].clone());
+            let doc = create_test_document(
+                &format!("doc{}", i),
+                generate_random_vectors(1, dim, i)[0].clone(),
+            );
             index.add(doc).unwrap();
         }
 
@@ -788,10 +847,13 @@ mod tests {
     #[test]
     fn test_pq_hnsw_dimension_mismatch() {
         let dim = 64;
-        let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
         let training_data = generate_random_vectors(100, dim, 42);
 
-        let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
 
         // Wrong dimension
         let doc = create_test_document("doc1", vec![0.5; 32]);
@@ -801,13 +863,19 @@ mod tests {
     #[test]
     fn test_pq_hnsw_symmetric_search() {
         let dim = 64;
-        let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
         let training_data = generate_random_vectors(500, dim, 42);
 
-        let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
 
         for i in 0..100 {
-            let doc = create_test_document(&format!("doc{}", i), generate_random_vectors(1, dim, i)[0].clone());
+            let doc = create_test_document(
+                &format!("doc{}", i),
+                generate_random_vectors(1, dim, i)[0].clone(),
+            );
             index.add(doc).unwrap();
         }
 

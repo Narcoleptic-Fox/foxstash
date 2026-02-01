@@ -73,7 +73,8 @@ pub struct BatchProgress {
 impl BatchProgress {
     /// Calculate completion percentage (if total is known)
     pub fn percent(&self) -> Option<f64> {
-        self.total.map(|t| (self.completed as f64 / t as f64) * 100.0)
+        self.total
+            .map(|t| (self.completed as f64 / t as f64) * 100.0)
     }
 
     /// Estimate remaining time in milliseconds (if total is known)
@@ -515,11 +516,7 @@ pub struct SearchPage {
 
 impl SearchPage {
     /// Create from results with pagination info
-    pub fn from_results(
-        all_results: Vec<SearchResult>,
-        page: usize,
-        page_size: usize,
-    ) -> Self {
+    pub fn from_results(all_results: Vec<SearchResult>, page: usize, page_size: usize) -> Self {
         let total_results = all_results.len();
         let total_pages = (total_results + page_size - 1) / page_size;
         let start = page * page_size;
@@ -667,7 +664,9 @@ mod tests {
     fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0)).collect()
+        (0..dim)
+            .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+            .collect()
     }
 
     #[test]

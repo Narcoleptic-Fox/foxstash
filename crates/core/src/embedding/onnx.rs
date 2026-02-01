@@ -75,9 +75,13 @@ impl OnnxEmbedder {
     pub fn new(model_path: impl AsRef<Path>, tokenizer_path: impl AsRef<Path>) -> Result<Self> {
         // Load the ONNX model
         let session = Session::builder()
-            .map_err(|e| RagError::EmbeddingError(format!("Failed to create session builder: {}", e)))?
+            .map_err(|e| {
+                RagError::EmbeddingError(format!("Failed to create session builder: {}", e))
+            })?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| RagError::EmbeddingError(format!("Failed to set optimization level: {}", e)))?
+            .map_err(|e| {
+                RagError::EmbeddingError(format!("Failed to set optimization level: {}", e))
+            })?
             .with_intra_threads(4)
             .map_err(|e| RagError::EmbeddingError(format!("Failed to set thread count: {}", e)))?
             .commit_from_file(model_path.as_ref())
@@ -199,11 +203,7 @@ impl OnnxEmbedder {
             .map_err(|e| RagError::EmbeddingError(format!("Tokenization failed: {}", e)))?;
 
         // Get the maximum sequence length and pad all sequences
-        let max_length = encodings
-            .iter()
-            .map(|enc| enc.len())
-            .max()
-            .unwrap_or(0);
+        let max_length = encodings.iter().map(|enc| enc.len()).max().unwrap_or(0);
 
         if max_length == 0 {
             return Err(RagError::EmbeddingError(
@@ -238,11 +238,13 @@ impl OnnxEmbedder {
         let attention_mask: Vec<i64> = attention_mask.iter().map(|&x| x as i64).collect();
 
         // Create input arrays
-        let input_ids_array = Array2::from_shape_vec((batch_size, max_length), input_ids)
-            .map_err(|e| RagError::EmbeddingError(format!("Failed to create input array: {}", e)))?;
+        let input_ids_array =
+            Array2::from_shape_vec((batch_size, max_length), input_ids).map_err(|e| {
+                RagError::EmbeddingError(format!("Failed to create input array: {}", e))
+            })?;
 
-        let attention_mask_array =
-            Array2::from_shape_vec((batch_size, max_length), attention_mask).map_err(|e| {
+        let attention_mask_array = Array2::from_shape_vec((batch_size, max_length), attention_mask)
+            .map_err(|e| {
                 RagError::EmbeddingError(format!("Failed to create attention mask array: {}", e))
             })?;
 
@@ -252,9 +254,13 @@ impl OnnxEmbedder {
         let attention_mask_vec = attention_mask_array.as_slice().unwrap().to_vec();
 
         let input_ids_tensor = Value::from_array(([batch_size, max_length], input_ids_vec))
-            .map_err(|e| RagError::EmbeddingError(format!("Failed to create input tensor: {}", e)))?;
-        let attention_mask_tensor = Value::from_array(([batch_size, max_length], attention_mask_vec))
-            .map_err(|e| RagError::EmbeddingError(format!("Failed to create attention mask tensor: {}", e)))?;
+            .map_err(|e| {
+                RagError::EmbeddingError(format!("Failed to create input tensor: {}", e))
+            })?;
+        let attention_mask_tensor =
+            Value::from_array(([batch_size, max_length], attention_mask_vec)).map_err(|e| {
+                RagError::EmbeddingError(format!("Failed to create attention mask tensor: {}", e))
+            })?;
 
         // Run inference
         let outputs = self
@@ -266,9 +272,10 @@ impl OnnxEmbedder {
         // Shape: (batch_size, sequence_length, hidden_size)
         let output_tensor = &outputs["last_hidden_state"];
 
-        let (output_shape, output_data) = output_tensor
-            .try_extract_tensor::<f32>()
-            .map_err(|e| RagError::EmbeddingError(format!("Failed to extract output tensor: {}", e)))?;
+        let (output_shape, output_data) =
+            output_tensor.try_extract_tensor::<f32>().map_err(|e| {
+                RagError::EmbeddingError(format!("Failed to extract output tensor: {}", e))
+            })?;
 
         if output_shape.len() != 3 {
             return Err(RagError::EmbeddingError(format!(
@@ -290,8 +297,10 @@ impl OnnxEmbedder {
             let end_idx = start_idx + seq_len;
             let sample_data = &output_data[(start_idx * hidden_size)..(end_idx * hidden_size)];
 
-            let hidden_states = Array2::from_shape_vec((seq_len, hidden_size), sample_data.to_vec())
-                .map_err(|e| RagError::EmbeddingError(format!("Failed to reshape sample data: {}", e)))?;
+            let hidden_states =
+                Array2::from_shape_vec((seq_len, hidden_size), sample_data.to_vec()).map_err(
+                    |e| RagError::EmbeddingError(format!("Failed to reshape sample data: {}", e)),
+                )?;
 
             // Get the attention mask for this sample
             let mask_start = i * max_length;
@@ -410,11 +419,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_single_embedding() {
-        let mut embedder = OnnxEmbedder::new(
-            "models/model.onnx",
-            "models/tokenizer.json",
-        )
-        .expect("Failed to create embedder");
+        let mut embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")
+            .expect("Failed to create embedder");
 
         let text = "This is a test sentence.";
         let embedding = embedder.embed(text).expect("Failed to generate embedding");
@@ -445,11 +451,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_batch_embedding() {
-        let mut embedder = OnnxEmbedder::new(
-            "models/model.onnx",
-            "models/tokenizer.json",
-        )
-        .expect("Failed to create embedder");
+        let mut embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")
+            .expect("Failed to create embedder");
 
         let texts = vec![
             "First test sentence.",
@@ -517,18 +520,12 @@ mod tests {
     #[test]
     #[ignore]
     fn test_empty_input() {
-        let mut embedder = OnnxEmbedder::new(
-            "models/model.onnx",
-            "models/tokenizer.json",
-        )
-        .expect("Failed to create embedder");
+        let mut embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")
+            .expect("Failed to create embedder");
 
         // Test empty batch
         let result = embedder.embed_batch(&[]);
-        assert!(
-            result.is_err(),
-            "Empty batch should return an error"
-        );
+        assert!(result.is_err(), "Empty batch should return an error");
 
         // Test empty string
         let result = embedder.embed("");
@@ -545,11 +542,8 @@ mod tests {
     #[test]
     #[ignore]
     fn test_embedding_dim() {
-        let mut embedder = OnnxEmbedder::new(
-            "models/model.onnx",
-            "models/tokenizer.json",
-        )
-        .expect("Failed to create embedder");
+        let mut embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")
+            .expect("Failed to create embedder");
 
         assert_eq!(
             embedder.embedding_dim(),
@@ -585,11 +579,8 @@ mod tests {
     #[test]
     fn test_mean_pooling() {
         // Create a simple 2x3 hidden state matrix
-        let hidden_states = Array2::from_shape_vec(
-            (3, 2),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        )
-        .unwrap();
+        let hidden_states =
+            Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
 
         // All tokens are valid
         let attention_mask = vec![1, 1, 1];
@@ -612,11 +603,7 @@ mod tests {
 
     #[test]
     fn test_mean_pooling_all_masked() {
-        let hidden_states = Array2::from_shape_vec(
-            (2, 2),
-            vec![1.0, 2.0, 3.0, 4.0],
-        )
-        .unwrap();
+        let hidden_states = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
 
         let attention_mask = vec![0, 0];
         let result = mean_pooling(&hidden_states, &attention_mask);

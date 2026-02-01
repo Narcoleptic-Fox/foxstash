@@ -128,7 +128,7 @@ impl PQConfig {
         }
         if self.bits_per_code > 8 {
             return Err(RagError::IndexError(
-                "bits_per_code must be <= 8".to_string()
+                "bits_per_code must be <= 8".to_string(),
             ));
         }
         Ok(())
@@ -224,10 +224,8 @@ impl ProductQuantizer {
             let end = start + sub_dim;
 
             // Extract subvectors for this subspace
-            let subvectors: Vec<Vec<f32>> = samples
-                .iter()
-                .map(|v| v[start..end].to_vec())
-                .collect();
+            let subvectors: Vec<Vec<f32>> =
+                samples.iter().map(|v| v[start..end].to_vec()).collect();
 
             // Run k-means
             let centroids = kmeans(&subvectors, k, config.kmeans_iterations, &mut rng)?;
@@ -639,7 +637,9 @@ mod tests {
     fn test_pq_train_encode_decode() {
         let dim = 64;
         let m = 8;
-        let config = PQConfig::new(dim, m, 8).with_seed(42).with_kmeans_iterations(10);
+        let config = PQConfig::new(dim, m, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
 
         let training_data = generate_random_vectors(500, dim, 42);
         let pq = ProductQuantizer::train(&training_data, config).unwrap();
@@ -663,7 +663,9 @@ mod tests {
     #[test]
     fn test_pq_asymmetric_distance() {
         let dim = 64;
-        let config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
 
         let training_data = generate_random_vectors(500, dim, 42);
         let pq = ProductQuantizer::train(&training_data, config).unwrap();
@@ -680,13 +682,19 @@ mod tests {
 
         // ADC should be close to true distance
         let relative_error = (adc_dist - true_dist).abs() / true_dist.max(0.001);
-        assert!(relative_error < 0.5, "ADC error too high: {}", relative_error);
+        assert!(
+            relative_error < 0.5,
+            "ADC error too high: {}",
+            relative_error
+        );
     }
 
     #[test]
     fn test_pq_distance_table() {
         let dim = 64;
-        let config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
 
         let training_data = generate_random_vectors(500, dim, 42);
         let pq = ProductQuantizer::train(&training_data, config).unwrap();
@@ -708,7 +716,9 @@ mod tests {
     #[test]
     fn test_pq_symmetric_distance() {
         let dim = 64;
-        let config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
 
         let training_data = generate_random_vectors(500, dim, 42);
         let pq = ProductQuantizer::train(&training_data, config).unwrap();
@@ -733,7 +743,9 @@ mod tests {
     #[test]
     fn test_pq_distance_cache() {
         let dim = 64;
-        let config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+        let config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
 
         let training_data = generate_random_vectors(500, dim, 42);
         let pq = ProductQuantizer::train(&training_data, config).unwrap();
@@ -771,7 +783,9 @@ mod tests {
         // Test that PQ preserves nearest neighbor relationships
         let dim = 128;
         let n = 500;
-        let config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(15);
+        let config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(15);
 
         let data = generate_random_vectors(n, dim, 42);
         let pq = ProductQuantizer::train(&data, config).unwrap();
@@ -817,7 +831,11 @@ mod tests {
         println!("PQ Recall@{}: {:.2}%", k, avg_recall * 100.0);
 
         // PQ should achieve at least 50% recall@10
-        assert!(avg_recall >= 0.5, "PQ recall too low: {:.2}%", avg_recall * 100.0);
+        assert!(
+            avg_recall >= 0.5,
+            "PQ recall too low: {:.2}%",
+            avg_recall * 100.0
+        );
     }
 
     #[test]

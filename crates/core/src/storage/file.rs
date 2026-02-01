@@ -84,7 +84,12 @@ pub struct StorageMetadata {
 
 impl StorageMetadata {
     /// Create new metadata
-    fn new(item_type: String, compression: Codec, original_size: usize, compressed_size: usize) -> Self {
+    fn new(
+        item_type: String,
+        compression: Codec,
+        original_size: usize,
+        compressed_size: usize,
+    ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -299,7 +304,10 @@ impl FileStorage {
     pub fn load_document(&self, id: &str) -> Result<Document> {
         // Check if item exists
         if !self.exists(id) {
-            return Err(RagError::StorageError(format!("Document not found: {}", id)));
+            return Err(RagError::StorageError(format!(
+                "Document not found: {}",
+                id
+            )));
         }
 
         // Load metadata
@@ -352,7 +360,11 @@ impl FileStorage {
     /// # Errors
     ///
     /// Returns error if serialization or writing fails.
-    pub fn save_flat_index(&self, name: &str, index: &FlatIndexWrapper) -> Result<CompressionStats> {
+    pub fn save_flat_index(
+        &self,
+        name: &str,
+        index: &FlatIndexWrapper,
+    ) -> Result<CompressionStats> {
         self.save_with_metadata(name, index, "flat_index")
     }
 
@@ -387,7 +399,11 @@ impl FileStorage {
     /// # Errors
     ///
     /// Returns error if serialization or writing fails.
-    pub fn save_hnsw_index(&self, name: &str, index: &HNSWIndexWrapper) -> Result<CompressionStats> {
+    pub fn save_hnsw_index(
+        &self,
+        name: &str,
+        index: &HNSWIndexWrapper,
+    ) -> Result<CompressionStats> {
         self.save_with_metadata(name, index, "hnsw_index")
     }
 
@@ -632,9 +648,8 @@ impl FileStorage {
 
             let path = entry.path();
             if path.is_file() {
-                fs::remove_file(&path).map_err(|e| {
-                    RagError::StorageError(format!("Failed to delete file: {}", e))
-                })?;
+                fs::remove_file(&path)
+                    .map_err(|e| RagError::StorageError(format!("Failed to delete file: {}", e)))?;
             }
         }
 
@@ -863,8 +878,12 @@ pub struct HNSWConfigWrapper {
     pub keep_pruned_connections: bool,
 }
 
-fn default_use_heuristic() -> bool { true }
-fn default_keep_pruned() -> bool { true }
+fn default_use_heuristic() -> bool {
+    true
+}
+fn default_keep_pruned() -> bool {
+    true
+}
 
 impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
     fn from(config: &crate::index::HNSWConfig) -> Self {
@@ -1096,9 +1115,15 @@ mod tests {
 
         assert_eq!(storage.list().unwrap().len(), 0);
 
-        storage.save_document("doc1", &create_test_document("doc1")).unwrap();
-        storage.save_document("doc2", &create_test_document("doc2")).unwrap();
-        storage.save_document("doc3", &create_test_document("doc3")).unwrap();
+        storage
+            .save_document("doc1", &create_test_document("doc1"))
+            .unwrap();
+        storage
+            .save_document("doc2", &create_test_document("doc2"))
+            .unwrap();
+        storage
+            .save_document("doc3", &create_test_document("doc3"))
+            .unwrap();
 
         let items = storage.list().unwrap();
         assert_eq!(items.len(), 3);
@@ -1139,9 +1164,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = FileStorage::new(dir.path()).unwrap();
 
-        storage.save_document("doc1", &create_test_document("doc1")).unwrap();
-        storage.save_document("doc2", &create_test_document("doc2")).unwrap();
-        storage.save_document("doc3", &create_test_document("doc3")).unwrap();
+        storage
+            .save_document("doc1", &create_test_document("doc1"))
+            .unwrap();
+        storage
+            .save_document("doc2", &create_test_document("doc2"))
+            .unwrap();
+        storage
+            .save_document("doc3", &create_test_document("doc3"))
+            .unwrap();
 
         assert_eq!(storage.list().unwrap().len(), 3);
 
@@ -1157,12 +1188,16 @@ mod tests {
 
         assert_eq!(storage.total_size().unwrap(), 0);
 
-        storage.save_document("doc1", &create_test_document("doc1")).unwrap();
+        storage
+            .save_document("doc1", &create_test_document("doc1"))
+            .unwrap();
 
         let size = storage.total_size().unwrap();
         assert!(size > 0);
 
-        storage.save_document("doc2", &create_test_document("doc2")).unwrap();
+        storage
+            .save_document("doc2", &create_test_document("doc2"))
+            .unwrap();
 
         let size2 = storage.total_size().unwrap();
         assert!(size2 > size);
@@ -1203,7 +1238,9 @@ mod tests {
 
         assert!(!storage.exists("doc1"));
 
-        storage.save_document("doc1", &create_test_document("doc1")).unwrap();
+        storage
+            .save_document("doc1", &create_test_document("doc1"))
+            .unwrap();
 
         assert!(storage.exists("doc1"));
         assert!(!storage.exists("doc2"));

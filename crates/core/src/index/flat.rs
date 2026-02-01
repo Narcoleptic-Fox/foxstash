@@ -8,8 +8,8 @@
 //! - Validation and testing of approximate search methods
 //! - Use cases where accuracy is more important than speed
 
-use crate::{Document, Result, SearchResult};
 use crate::vector::cosine_similarity;
+use crate::{Document, Result, SearchResult};
 use std::collections::HashMap;
 
 /// Flat index using brute-force search
@@ -204,8 +204,7 @@ impl FlatIndex {
             .documents
             .values()
             .map(|doc| {
-                let score = cosine_similarity(query, &doc.embedding)
-                    .unwrap_or(0.0); // Should never fail since we validated dimensions
+                let score = cosine_similarity(query, &doc.embedding).unwrap_or(0.0); // Should never fail since we validated dimensions
                 (score, doc)
             })
             .collect();
@@ -469,9 +468,15 @@ mod tests {
         let mut index = FlatIndex::new(3);
 
         // Add documents with varying similarity to query [1, 0, 0]
-        index.add(create_test_document("exact", vec![1.0, 0.0, 0.0])).unwrap();
-        index.add(create_test_document("close", vec![0.9, 0.1, 0.0])).unwrap();
-        index.add(create_test_document("far", vec![0.0, 1.0, 0.0])).unwrap();
+        index
+            .add(create_test_document("exact", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add(create_test_document("close", vec![0.9, 0.1, 0.0]))
+            .unwrap();
+        index
+            .add(create_test_document("far", vec![0.0, 1.0, 0.0]))
+            .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let results = index.search(&query, 10).unwrap();
@@ -493,7 +498,9 @@ mod tests {
         // Add 5 documents
         for i in 0..5 {
             let embedding = vec![i as f32, 0.0, 0.0];
-            index.add(create_test_document(&format!("doc{}", i), embedding)).unwrap();
+            index
+                .add(create_test_document(&format!("doc{}", i), embedding))
+                .unwrap();
         }
 
         let query = vec![10.0, 0.0, 0.0];
@@ -506,7 +513,9 @@ mod tests {
     #[test]
     fn test_search_dimension_mismatch() {
         let mut index = FlatIndex::new(3);
-        index.add(create_test_document("doc1", vec![1.0, 0.0, 0.0])).unwrap();
+        index
+            .add(create_test_document("doc1", vec![1.0, 0.0, 0.0]))
+            .unwrap();
 
         let query = vec![1.0, 0.0]; // Wrong dimension
         let result = index.search(&query, 5);
@@ -564,9 +573,15 @@ mod tests {
     fn test_orthogonal_vectors() {
         let mut index = FlatIndex::new(3);
 
-        index.add(create_test_document("x_axis", vec![1.0, 0.0, 0.0])).unwrap();
-        index.add(create_test_document("y_axis", vec![0.0, 1.0, 0.0])).unwrap();
-        index.add(create_test_document("z_axis", vec![0.0, 0.0, 1.0])).unwrap();
+        index
+            .add(create_test_document("x_axis", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add(create_test_document("y_axis", vec![0.0, 1.0, 0.0]))
+            .unwrap();
+        index
+            .add(create_test_document("z_axis", vec![0.0, 0.0, 1.0]))
+            .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let results = index.search(&query, 3).unwrap();
@@ -597,18 +612,19 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].metadata.is_some());
-        assert_eq!(
-            results[0].metadata.as_ref().unwrap()["source"],
-            "test"
-        );
+        assert_eq!(results[0].metadata.as_ref().unwrap()["source"], "test");
     }
 
     #[test]
     fn test_negative_similarity() {
         let mut index = FlatIndex::new(3);
 
-        index.add(create_test_document("positive", vec![1.0, 0.0, 0.0])).unwrap();
-        index.add(create_test_document("negative", vec![-1.0, 0.0, 0.0])).unwrap();
+        index
+            .add(create_test_document("positive", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add(create_test_document("negative", vec![-1.0, 0.0, 0.0]))
+            .unwrap();
 
         let query = vec![1.0, 0.0, 0.0];
         let results = index.search(&query, 2).unwrap();

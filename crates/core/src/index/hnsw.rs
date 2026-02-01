@@ -60,7 +60,7 @@ impl Default for HNSWConfig {
             ef_construction: 200,
             ef_search: 50,
             ml: 1.0 / (m as f32).ln(),
-            use_heuristic: true,  // Use improved heuristic by default
+            use_heuristic: true, // Use improved heuristic by default
             extend_candidates: false,
             keep_pruned_connections: true,
         }
@@ -243,8 +243,7 @@ impl HNSWIndex {
             .iter()
             .map(|&node_id| {
                 let node = &self.nodes[node_id];
-                let score = crate::vector::cosine_similarity(query, &node.embedding)
-                    .unwrap_or(0.0);
+                let score = crate::vector::cosine_similarity(query, &node.embedding).unwrap_or(0.0);
                 SearchResult {
                     id: node.id.clone(),
                     content: node.content.clone(),
@@ -358,7 +357,8 @@ impl HNSWIndex {
         // Insert into layers from top to bottom
         for layer in (0..=node_level).rev() {
             let query = self.nodes[node_id].embedding.clone();
-            current_nearest = self.search_layer(&query, &current_nearest, self.config.ef_construction, layer);
+            current_nearest =
+                self.search_layer(&query, &current_nearest, self.config.ef_construction, layer);
 
             // Determine M for this layer
             let m = if layer == 0 {
@@ -390,9 +390,17 @@ impl HNSWIndex {
 
                     if self.nodes[neighbor_id].connections[layer].len() > neighbor_m {
                         let neighbor_embedding = self.nodes[neighbor_id].embedding.clone();
-                        let neighbor_connections: Vec<usize> =
-                            self.nodes[neighbor_id].connections[layer].iter().copied().collect();
-                        let pruned = self.select_neighbors(&neighbor_connections, &neighbor_embedding, neighbor_m, layer);
+                        let neighbor_connections: Vec<usize> = self.nodes[neighbor_id].connections
+                            [layer]
+                            .iter()
+                            .copied()
+                            .collect();
+                        let pruned = self.select_neighbors(
+                            &neighbor_connections,
+                            &neighbor_embedding,
+                            neighbor_m,
+                            layer,
+                        );
 
                         self.nodes[neighbor_id].connections[layer] = pruned.into_iter().collect();
                     }
@@ -411,7 +419,13 @@ impl HNSWIndex {
     ///
     /// # Returns
     /// Vector of node IDs sorted by distance (closest first)
-    fn search_layer(&self, query: &[f32], entry_points: &[usize], ef: usize, layer: usize) -> Vec<usize> {
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry_points: &[usize],
+        ef: usize,
+        layer: usize,
+    ) -> Vec<usize> {
         let mut visited = HashSet::new();
         let mut candidates = BinaryHeap::new(); // Min-heap by distance
         let mut best = BinaryHeap::new(); // Max-heap by distance
@@ -484,7 +498,13 @@ impl HNSWIndex {
     /// * `query` - Query point
     /// * `m` - Number of neighbors to select
     /// * `layer` - Current layer
-    fn select_neighbors(&self, candidates: &[usize], query: &[f32], m: usize, layer: usize) -> Vec<usize> {
+    fn select_neighbors(
+        &self,
+        candidates: &[usize],
+        query: &[f32],
+        m: usize,
+        layer: usize,
+    ) -> Vec<usize> {
         if !self.config.use_heuristic {
             // Simple heuristic: select M closest neighbors
             return self.select_neighbors_simple(candidates, query, m);
@@ -632,7 +652,7 @@ mod tests {
         assert_eq!(config.ef_construction, 200);
         assert_eq!(config.ef_search, 50);
         assert!((config.ml - 0.36).abs() < 0.01);
-        assert!(config.use_heuristic);  // Heuristic enabled by default
+        assert!(config.use_heuristic); // Heuristic enabled by default
         assert!(!config.extend_candidates);
         assert!(config.keep_pruned_connections);
     }
@@ -746,10 +766,7 @@ mod tests {
         let mut index = HNSWIndex::with_defaults(3);
 
         for i in 0..5 {
-            let doc = create_test_document(
-                &format!("doc{}", i),
-                vec![i as f32, 0.0, 0.0],
-            );
+            let doc = create_test_document(&format!("doc{}", i), vec![i as f32, 0.0, 0.0]);
             index.add(doc).unwrap();
         }
 

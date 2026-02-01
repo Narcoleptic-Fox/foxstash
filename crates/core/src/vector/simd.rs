@@ -66,9 +66,7 @@ pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
 
     let simd = pulp::Arch::new();
 
-    simd.dispatch(|| {
-        dot_product_simd_impl(simd, a, b)
-    })
+    simd.dispatch(|| dot_product_simd_impl(simd, a, b))
 }
 
 /// Computes L2 (Euclidean) distance using SIMD acceleration.
@@ -104,9 +102,7 @@ pub fn l2_distance_simd(a: &[f32], b: &[f32]) -> f32 {
 
     let simd = pulp::Arch::new();
 
-    simd.dispatch(|| {
-        l2_distance_simd_impl(simd, a, b)
-    })
+    simd.dispatch(|| l2_distance_simd_impl(simd, a, b))
 }
 
 /// Computes cosine similarity using SIMD acceleration.
@@ -199,12 +195,8 @@ fn dot_product_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
             let mut i = 0;
             while i < simd_end {
                 // Load vectors from a and b
-                let a_vec = pulp::cast_lossy::<_, S::f32s>(
-                    simd.f32s_partial_load(&a[i..])
-                );
-                let b_vec = pulp::cast_lossy::<_, S::f32s>(
-                    simd.f32s_partial_load(&b[i..])
-                );
+                let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
+                let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
 
                 // Multiply and accumulate
                 sum = simd.f32s_mul_add_e(a_vec, b_vec, sum);
@@ -251,12 +243,8 @@ fn l2_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
 
             let mut i = 0;
             while i < simd_end {
-                let a_vec = pulp::cast_lossy::<_, S::f32s>(
-                    simd.f32s_partial_load(&a[i..])
-                );
-                let b_vec = pulp::cast_lossy::<_, S::f32s>(
-                    simd.f32s_partial_load(&b[i..])
-                );
+                let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
+                let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
 
                 // Compute difference
                 let diff = simd.f32s_sub(a_vec, b_vec);
@@ -304,9 +292,7 @@ fn magnitude_simd_impl(simd: pulp::Arch, vector: &[f32]) -> f32 {
 
             let mut i = 0;
             while i < simd_end {
-                let vec = pulp::cast_lossy::<_, S::f32s>(
-                    simd.f32s_partial_load(&vector[i..])
-                );
+                let vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&vector[i..]));
 
                 // Multiply and accumulate: vec^2
                 sum_squares = simd.f32s_mul_add_e(vec, vec, sum_squares);
@@ -370,7 +356,9 @@ mod tests {
     #[test]
     fn test_dot_product_simd_various_sizes() {
         // Test different sizes to verify remainder handling
-        for size in [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 383, 384, 767, 768] {
+        for size in [
+            1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 383, 384, 767, 768,
+        ] {
             let a: Vec<f32> = (0..size).map(|i| i as f32).collect();
             let b: Vec<f32> = (0..size).map(|i| (i * 2) as f32).collect();
 
@@ -379,7 +367,7 @@ mod tests {
 
             // Use relative epsilon for large results
             let epsilon = if scalar_result.abs() > 1000.0 {
-                scalar_result.abs() * 1e-5  // 0.001% relative error
+                scalar_result.abs() * 1e-5 // 0.001% relative error
             } else {
                 EPSILON
             };
@@ -387,7 +375,9 @@ mod tests {
             assert!(
                 (simd_result - scalar_result).abs() < epsilon,
                 "Size {}: SIMD={}, Scalar={}",
-                size, simd_result, scalar_result
+                size,
+                simd_result,
+                scalar_result
             );
         }
     }
@@ -415,7 +405,9 @@ mod tests {
 
     #[test]
     fn test_l2_distance_simd_various_sizes() {
-        for size in [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 383, 384, 767, 768] {
+        for size in [
+            1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 383, 384, 767, 768,
+        ] {
             let a: Vec<f32> = (0..size).map(|i| i as f32).collect();
             let b: Vec<f32> = (0..size).map(|i| (i * 2) as f32).collect();
 
@@ -424,7 +416,7 @@ mod tests {
 
             // Use relative epsilon for large results
             let epsilon = if scalar_result.abs() > 1000.0 {
-                scalar_result.abs() * 1e-5  // 0.001% relative error
+                scalar_result.abs() * 1e-5 // 0.001% relative error
             } else {
                 EPSILON
             };
@@ -432,7 +424,9 @@ mod tests {
             assert!(
                 (simd_result - scalar_result).abs() < epsilon,
                 "Size {}: SIMD={}, Scalar={}",
-                size, simd_result, scalar_result
+                size,
+                simd_result,
+                scalar_result
             );
         }
     }
@@ -478,9 +472,13 @@ mod tests {
 
     #[test]
     fn test_cosine_similarity_simd_various_sizes() {
-        for size in [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 383, 384, 767, 768, 1023, 1024] {
+        for size in [
+            1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 383, 384, 767, 768, 1023, 1024,
+        ] {
             let a: Vec<f32> = (0..size).map(|i| (i as f32) / (size as f32)).collect();
-            let b: Vec<f32> = (0..size).map(|i| 1.0 - (i as f32) / (size as f32)).collect();
+            let b: Vec<f32> = (0..size)
+                .map(|i| 1.0 - (i as f32) / (size as f32))
+                .collect();
 
             let simd_result = cosine_similarity_simd(&a, &b);
             let scalar_result = cosine_similarity(&a, &b).unwrap();
@@ -491,7 +489,9 @@ mod tests {
             assert!(
                 (simd_result - scalar_result).abs() < epsilon,
                 "Size {}: SIMD={}, Scalar={}",
-                size, simd_result, scalar_result
+                size,
+                simd_result,
+                scalar_result
             );
         }
     }

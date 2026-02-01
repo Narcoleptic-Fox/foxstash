@@ -266,7 +266,9 @@ impl SQ8HNSWIndex {
             .iter()
             .map(|&node_id| {
                 let node = &self.nodes[node_id];
-                let dist = self.quantizer.distance_quantized(&query_quantized, &node.quantized);
+                let dist = self
+                    .quantizer
+                    .distance_quantized(&query_quantized, &node.quantized);
                 let score = 1.0 / (1.0 + dist);
                 SearchResult {
                     id: node.id.clone(),
@@ -332,10 +334,18 @@ impl SQ8HNSWIndex {
         }
 
         for layer in (0..=node_level).rev() {
-            current_nearest =
-                self.search_layer(&node_quantized, &current_nearest, self.config.ef_construction, layer);
+            current_nearest = self.search_layer(
+                &node_quantized,
+                &current_nearest,
+                self.config.ef_construction,
+                layer,
+            );
 
-            let m = if layer == 0 { self.config.m0 } else { self.config.m };
+            let m = if layer == 0 {
+                self.config.m0
+            } else {
+                self.config.m
+            };
             let neighbors = self.select_neighbors(&current_nearest, &node_quantized, m);
 
             for &neighbor_id in &neighbors {
@@ -344,12 +354,23 @@ impl SQ8HNSWIndex {
                 if layer < self.nodes[neighbor_id].connections.len() {
                     self.nodes[neighbor_id].connections[layer].insert(node_id);
 
-                    let neighbor_m = if layer == 0 { self.config.m0 } else { self.config.m };
+                    let neighbor_m = if layer == 0 {
+                        self.config.m0
+                    } else {
+                        self.config.m
+                    };
                     if self.nodes[neighbor_id].connections[layer].len() > neighbor_m {
                         let neighbor_quantized = self.nodes[neighbor_id].quantized.clone();
-                        let neighbor_connections: Vec<usize> =
-                            self.nodes[neighbor_id].connections[layer].iter().copied().collect();
-                        let pruned = self.select_neighbors(&neighbor_connections, &neighbor_quantized, neighbor_m);
+                        let neighbor_connections: Vec<usize> = self.nodes[neighbor_id].connections
+                            [layer]
+                            .iter()
+                            .copied()
+                            .collect();
+                        let pruned = self.select_neighbors(
+                            &neighbor_connections,
+                            &neighbor_quantized,
+                            neighbor_m,
+                        );
                         self.nodes[neighbor_id].connections[layer] = pruned.into_iter().collect();
                     }
                 }
@@ -369,7 +390,9 @@ impl SQ8HNSWIndex {
         let mut best = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = self.quantizer.distance_quantized(query, &self.nodes[ep].quantized);
+            let dist = self
+                .quantizer
+                .distance_quantized(query, &self.nodes[ep].quantized);
             candidates.push(Reverse((OrderedFloat(dist), ep)));
             best.push((OrderedFloat(dist), ep));
             visited.insert(ep);
@@ -388,8 +411,9 @@ impl SQ8HNSWIndex {
                 for &neighbor_id in &self.nodes[current_id].connections[layer] {
                     if !visited.contains(&neighbor_id) {
                         visited.insert(neighbor_id);
-                        let dist =
-                            self.quantizer.distance_quantized(query, &self.nodes[neighbor_id].quantized);
+                        let dist = self
+                            .quantizer
+                            .distance_quantized(query, &self.nodes[neighbor_id].quantized);
                         let dist_ord = OrderedFloat(dist);
 
                         if best.len() < ef {
@@ -409,16 +433,26 @@ impl SQ8HNSWIndex {
             }
         }
 
-        let mut results: Vec<(f32, usize)> = best.into_iter().map(|(OrderedFloat(dist), id)| (dist, id)).collect();
+        let mut results: Vec<(f32, usize)> = best
+            .into_iter()
+            .map(|(OrderedFloat(dist), id)| (dist, id))
+            .collect();
         results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         results.into_iter().map(|(_, id)| id).collect()
     }
 
-    fn select_neighbors(&self, candidates: &[usize], query: &ScalarQuantizedVector, m: usize) -> Vec<usize> {
+    fn select_neighbors(
+        &self,
+        candidates: &[usize],
+        query: &ScalarQuantizedVector,
+        m: usize,
+    ) -> Vec<usize> {
         let mut scored: Vec<(f32, usize)> = candidates
             .iter()
             .map(|&id| {
-                let dist = self.quantizer.distance_quantized(query, &self.nodes[id].quantized);
+                let dist = self
+                    .quantizer
+                    .distance_quantized(query, &self.nodes[id].quantized);
                 (dist, id)
             })
             .collect();
@@ -592,7 +626,9 @@ impl BinaryHNSWIndex {
             .iter()
             .map(|&node_id| {
                 let node = &self.nodes[node_id];
-                let dist = self.quantizer.distance_quantized(&query_quantized, &node.quantized);
+                let dist = self
+                    .quantizer
+                    .distance_quantized(&query_quantized, &node.quantized);
                 // Convert Hamming distance to similarity (max distance = dim)
                 let score = 1.0 - (dist / self.embedding_dim as f32);
                 SearchResult {
@@ -619,7 +655,12 @@ impl BinaryHNSWIndex {
     /// * `query` - Query vector
     /// * `candidates` - Number of candidates to retrieve in binary phase
     /// * `k` - Number of final results
-    pub fn search_and_rerank(&self, query: &[f32], candidates: usize, k: usize) -> Result<Vec<SearchResult>> {
+    pub fn search_and_rerank(
+        &self,
+        query: &[f32],
+        candidates: usize,
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
         if query.len() != self.embedding_dim {
             return Err(RagError::DimensionMismatch {
                 expected: self.embedding_dim,
@@ -655,7 +696,9 @@ impl BinaryHNSWIndex {
                     crate::vector::cosine_similarity(query, full_vec).unwrap_or(0.0)
                 } else {
                     // Fall back to binary similarity
-                    let dist = self.quantizer.distance_quantized(&query_quantized, &node.quantized);
+                    let dist = self
+                        .quantizer
+                        .distance_quantized(&query_quantized, &node.quantized);
                     1.0 - (dist / self.embedding_dim as f32)
                 };
 
@@ -728,10 +771,18 @@ impl BinaryHNSWIndex {
         }
 
         for layer in (0..=node_level).rev() {
-            current_nearest =
-                self.search_layer(&node_quantized, &current_nearest, self.config.ef_construction, layer);
+            current_nearest = self.search_layer(
+                &node_quantized,
+                &current_nearest,
+                self.config.ef_construction,
+                layer,
+            );
 
-            let m = if layer == 0 { self.config.m0 } else { self.config.m };
+            let m = if layer == 0 {
+                self.config.m0
+            } else {
+                self.config.m
+            };
             let neighbors = self.select_neighbors(&current_nearest, &node_quantized, m);
 
             for &neighbor_id in &neighbors {
@@ -740,12 +791,23 @@ impl BinaryHNSWIndex {
                 if layer < self.nodes[neighbor_id].connections.len() {
                     self.nodes[neighbor_id].connections[layer].insert(node_id);
 
-                    let neighbor_m = if layer == 0 { self.config.m0 } else { self.config.m };
+                    let neighbor_m = if layer == 0 {
+                        self.config.m0
+                    } else {
+                        self.config.m
+                    };
                     if self.nodes[neighbor_id].connections[layer].len() > neighbor_m {
                         let neighbor_quantized = self.nodes[neighbor_id].quantized.clone();
-                        let neighbor_connections: Vec<usize> =
-                            self.nodes[neighbor_id].connections[layer].iter().copied().collect();
-                        let pruned = self.select_neighbors(&neighbor_connections, &neighbor_quantized, neighbor_m);
+                        let neighbor_connections: Vec<usize> = self.nodes[neighbor_id].connections
+                            [layer]
+                            .iter()
+                            .copied()
+                            .collect();
+                        let pruned = self.select_neighbors(
+                            &neighbor_connections,
+                            &neighbor_quantized,
+                            neighbor_m,
+                        );
                         self.nodes[neighbor_id].connections[layer] = pruned.into_iter().collect();
                     }
                 }
@@ -765,7 +827,9 @@ impl BinaryHNSWIndex {
         let mut best = BinaryHeap::new();
 
         for &ep in entry_points {
-            let dist = self.quantizer.distance_quantized(query, &self.nodes[ep].quantized);
+            let dist = self
+                .quantizer
+                .distance_quantized(query, &self.nodes[ep].quantized);
             candidates.push(Reverse((OrderedFloat(dist), ep)));
             best.push((OrderedFloat(dist), ep));
             visited.insert(ep);
@@ -784,8 +848,9 @@ impl BinaryHNSWIndex {
                 for &neighbor_id in &self.nodes[current_id].connections[layer] {
                     if !visited.contains(&neighbor_id) {
                         visited.insert(neighbor_id);
-                        let dist =
-                            self.quantizer.distance_quantized(query, &self.nodes[neighbor_id].quantized);
+                        let dist = self
+                            .quantizer
+                            .distance_quantized(query, &self.nodes[neighbor_id].quantized);
                         let dist_ord = OrderedFloat(dist);
 
                         if best.len() < ef {
@@ -805,16 +870,26 @@ impl BinaryHNSWIndex {
             }
         }
 
-        let mut results: Vec<(f32, usize)> = best.into_iter().map(|(OrderedFloat(dist), id)| (dist, id)).collect();
+        let mut results: Vec<(f32, usize)> = best
+            .into_iter()
+            .map(|(OrderedFloat(dist), id)| (dist, id))
+            .collect();
         results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         results.into_iter().map(|(_, id)| id).collect()
     }
 
-    fn select_neighbors(&self, candidates: &[usize], query: &BinaryQuantizedVector, m: usize) -> Vec<usize> {
+    fn select_neighbors(
+        &self,
+        candidates: &[usize],
+        query: &BinaryQuantizedVector,
+        m: usize,
+    ) -> Vec<usize> {
         let mut scored: Vec<(f32, usize)> = candidates
             .iter()
             .map(|&id| {
-                let dist = self.quantizer.distance_quantized(query, &self.nodes[id].quantized);
+                let dist = self
+                    .quantizer
+                    .distance_quantized(query, &self.nodes[id].quantized);
                 (dist, id)
             })
             .collect();
@@ -866,7 +941,9 @@ mod tests {
     fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0)).collect()
+        (0..dim)
+            .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+            .collect()
     }
 
     // ========================================================================
@@ -932,7 +1009,12 @@ mod tests {
         let full_precision = num_docs * dim * 4; // f32 size
 
         // SQ8 should use ~1/4 the memory for vectors
-        assert!(memory < full_precision, "SQ8 memory: {}, full: {}", memory, full_precision);
+        assert!(
+            memory < full_precision,
+            "SQ8 memory: {}, full: {}",
+            memory,
+            full_precision
+        );
     }
 
     // ========================================================================
@@ -1003,7 +1085,12 @@ mod tests {
         let full_precision = num_docs * dim * 4; // f32 size
 
         // Binary should use ~1/32 the memory for vectors
-        assert!(memory < full_precision / 10, "Binary memory: {}, full: {}", memory, full_precision);
+        assert!(
+            memory < full_precision / 10,
+            "Binary memory: {}, full: {}",
+            memory,
+            full_precision
+        );
     }
 
     // ========================================================================
@@ -1021,12 +1108,17 @@ mod tests {
 
         // Generate random vectors
         let vectors: Vec<Vec<f32>> = (0..num_docs)
-            .map(|_| (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0)).collect())
+            .map(|_| {
+                (0..dim)
+                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .collect()
+            })
             .collect();
 
         // Build indices
         let mut sq8_index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
-        let mut binary_index = BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
+        let mut binary_index =
+            BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
 
         for (i, vec) in vectors.iter().enumerate() {
             let doc = create_test_document(&format!("doc{}", i), vec.clone());
@@ -1075,6 +1167,11 @@ mod tests {
         // SQ8 should have at least 40% recall (conservative for random data)
         assert!(sq8_recall >= 4, "SQ8 recall too low: {}/{}", sq8_recall, k);
         // Binary with reranking should have at least 30% recall
-        assert!(binary_recall >= 3, "Binary recall too low: {}/{}", binary_recall, k);
+        assert!(
+            binary_recall >= 3,
+            "Binary recall too low: {}/{}",
+            binary_recall,
+            k
+        );
     }
 }

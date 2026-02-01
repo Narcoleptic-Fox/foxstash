@@ -46,6 +46,6 @@ pub use hnsw::{HNSWConfig, HNSWIndex};
 pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
 pub use hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex};
 pub use streaming::{
-    BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult,
-    FilteredSearchBuilder, PaginationConfig, SearchPage, SearchResultIterator,
+    BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult, FilteredSearchBuilder,
+    PaginationConfig, SearchPage, SearchResultIterator,
 };

@@ -56,20 +56,10 @@ pub mod simd;
 use crate::{RagError, Result};
 
 // Re-export commonly used functions
-pub use ops::{
-    approx_equal,
-    cosine_similarity,
-    dot_product,
-    l2_distance,
-    normalize,
-};
+pub use ops::{approx_equal, cosine_similarity, dot_product, l2_distance, normalize};
 
 // Re-export SIMD functions
-pub use simd::{
-    cosine_similarity_simd,
-    dot_product_simd,
-    l2_distance_simd,
-};
+pub use simd::{cosine_similarity_simd, dot_product_simd, l2_distance_simd};
 
 /// Automatically selects between SIMD and scalar cosine similarity.
 ///
@@ -246,14 +236,18 @@ mod tests {
         // Test with typical embedding sizes
         for size in [384, 768, 1024] {
             let a: Vec<f32> = (0..size).map(|i| (i as f32) / (size as f32)).collect();
-            let b: Vec<f32> = (0..size).map(|i| 1.0 - (i as f32) / (size as f32)).collect();
+            let b: Vec<f32> = (0..size)
+                .map(|i| 1.0 - (i as f32) / (size as f32))
+                .collect();
 
             let auto_sim = cosine_similarity_auto(&a, &b).unwrap();
             let scalar_sim = cosine_similarity(&a, &b).unwrap();
             assert!(
-                (auto_sim - scalar_sim).abs() < 1e-4,  // Relaxed for large vectors
+                (auto_sim - scalar_sim).abs() < 1e-4, // Relaxed for large vectors
                 "Size {}: auto={}, scalar={}",
-                size, auto_sim, scalar_sim
+                size,
+                auto_sim,
+                scalar_sim
             );
 
             let auto_dist = l2_distance_auto(&a, &b).unwrap();
@@ -263,7 +257,9 @@ mod tests {
             assert!(
                 (auto_dist - scalar_dist).abs() < epsilon,
                 "Size {}: auto={}, scalar={}",
-                size, auto_dist, scalar_dist
+                size,
+                auto_dist,
+                scalar_dist
             );
         }
     }

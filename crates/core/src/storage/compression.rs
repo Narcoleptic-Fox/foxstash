@@ -28,9 +28,9 @@
 //! assert_eq!(data.as_slice(), decompressed.as_slice());
 //! ```
 
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::time::Instant;
-use serde::{Deserialize, Serialize};
 
 /// Compression codec identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,12 +68,19 @@ impl Codec {
             #[cfg(feature = "lz4")]
             2 => Ok(Codec::Lz4),
             #[cfg(not(feature = "lz4"))]
-            2 => Err(CompressionError::UnsupportedCodec("LZ4 feature not enabled".to_string())),
+            2 => Err(CompressionError::UnsupportedCodec(
+                "LZ4 feature not enabled".to_string(),
+            )),
             #[cfg(feature = "zstd")]
             3 => Ok(Codec::Zstd),
             #[cfg(not(feature = "zstd"))]
-            3 => Err(CompressionError::UnsupportedCodec("Zstd feature not enabled".to_string())),
-            _ => Err(CompressionError::InvalidHeader(format!("Unknown codec ID: {}", id))),
+            3 => Err(CompressionError::UnsupportedCodec(
+                "Zstd feature not enabled".to_string(),
+            )),
+            _ => Err(CompressionError::InvalidHeader(format!(
+                "Unknown codec ID: {}",
+                id
+            ))),
         }
     }
 
@@ -161,18 +168,20 @@ fn create_header(codec: Codec) -> [u8; HEADER_SIZE] {
 /// Parse compression header
 fn parse_header(data: &[u8]) -> Result<(Codec, usize), CompressionError> {
     if data.len() < HEADER_SIZE {
-        return Err(CompressionError::InvalidHeader(
-            format!("Data too small: {} bytes", data.len())
-        ));
+        return Err(CompressionError::InvalidHeader(format!(
+            "Data too small: {} bytes",
+            data.len()
+        )));
     }
 
     let codec = Codec::from_id(data[0])?;
     let version = data[1];
 
     if version != VERSION {
-        return Err(CompressionError::InvalidHeader(
-            format!("Unsupported version: {}", version)
-        ));
+        return Err(CompressionError::InvalidHeader(format!(
+            "Unsupported version: {}",
+            version
+        )));
     }
 
     Ok((codec, HEADER_SIZE))
@@ -236,7 +245,10 @@ pub fn compress(data: &[u8]) -> Result<(Vec<u8>, CompressionStats), CompressionE
 /// let (compressed, stats) = compress_with(&data, Codec::Gzip).unwrap();
 /// assert_eq!(stats.codec, Codec::Gzip);
 /// ```
-pub fn compress_with(data: &[u8], codec: Codec) -> Result<(Vec<u8>, CompressionStats), CompressionError> {
+pub fn compress_with(
+    data: &[u8],
+    codec: Codec,
+) -> Result<(Vec<u8>, CompressionStats), CompressionError> {
     let start = Instant::now();
     let original_size = data.len();
 
@@ -328,7 +340,8 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
 
     let mut decoder = GzDecoder::new(data);
     let mut result = Vec::new();
-    decoder.read_to_end(&mut result)
+    decoder
+        .read_to_end(&mut result)
         .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
     Ok(result)
 }
@@ -343,8 +356,12 @@ fn compress_lz4(data: &[u8], output: &mut Vec<u8>) -> Result<(), CompressionErro
     let original_size = data.len() as u32;
     output.extend_from_slice(&original_size.to_le_bytes());
 
-    let compressed = lz4::block::compress(data, Some(lz4::block::CompressionMode::HIGHCOMPRESSION(9)), false)
-        .map_err(|e| CompressionError::CompressionFailed(e.to_string()))?;
+    let compressed = lz4::block::compress(
+        data,
+        Some(lz4::block::CompressionMode::HIGHCOMPRESSION(9)),
+        false,
+    )
+    .map_err(|e| CompressionError::CompressionFailed(e.to_string()))?;
     output.extend_from_slice(&compressed);
     Ok(())
 }
@@ -356,7 +373,7 @@ fn compress_lz4(data: &[u8], output: &mut Vec<u8>) -> Result<(), CompressionErro
 fn decompress_lz4(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
     if data.len() < 4 {
         return Err(CompressionError::DecompressionFailed(
-            "LZ4 data too small: missing size header".to_string()
+            "LZ4 data too small: missing size header".to_string(),
         ));
     }
 
@@ -382,8 +399,7 @@ fn compress_zstd(data: &[u8], output: &mut Vec<u8>) -> Result<(), CompressionErr
 /// Decompress using Zstd
 #[cfg(feature = "zstd")]
 fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    zstd::decode_all(data)
-        .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
+    zstd::decode_all(data).map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
 }
 
 // ============================================================================
@@ -407,7 +423,8 @@ mod tests {
             }
             Compressibility::Structured => {
                 // JSON-like structured data
-                let json = r#"{"id": "doc-001", "content": "This is a test document", "score": 0.95}"#;
+                let json =
+                    r#"{"id": "doc-001", "content": "This is a test document", "score": 0.95}"#;
                 json.repeat(size / json.len() + 1).as_bytes()[..size].to_vec()
             }
         }
@@ -482,7 +499,10 @@ mod tests {
 
         assert_eq!(stats.codec, Codec::Gzip);
         assert_eq!(stats.original_size, data.len());
-        assert!(stats.compressed_size < data.len(), "Gzip should compress repeated data");
+        assert!(
+            stats.compressed_size < data.len(),
+            "Gzip should compress repeated data"
+        );
         assert!(stats.ratio > 1.0);
         assert!(stats.duration_ms >= 0.0);
 
@@ -498,7 +518,10 @@ mod tests {
 
         assert_eq!(stats.codec, Codec::Lz4);
         assert_eq!(stats.original_size, data.len());
-        assert!(stats.compressed_size < data.len(), "LZ4 should compress repeated data");
+        assert!(
+            stats.compressed_size < data.len(),
+            "LZ4 should compress repeated data"
+        );
         assert!(stats.ratio > 1.0);
 
         let decompressed = decompress(&compressed).unwrap();
@@ -513,7 +536,10 @@ mod tests {
 
         assert_eq!(stats.codec, Codec::Zstd);
         assert_eq!(stats.original_size, data.len());
-        assert!(stats.compressed_size < data.len(), "Zstd should compress repeated data");
+        assert!(
+            stats.compressed_size < data.len(),
+            "Zstd should compress repeated data"
+        );
         assert!(stats.ratio > 1.0);
 
         let decompressed = decompress(&compressed).unwrap();
@@ -547,7 +573,10 @@ mod tests {
         let data = &[1, 2]; // Too small
         let result = decompress(data);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), CompressionError::InvalidHeader(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            CompressionError::InvalidHeader(_)
+        ));
     }
 
     #[test]
@@ -594,11 +623,13 @@ mod tests {
         let data = generate_test_data(1_000_000, Compressibility::Structured);
         let (compressed, stats) = compress(&data).unwrap();
 
-        println!("Large data compression: {:.2} MB -> {:.2} MB ({:.2}x, {:.2} MB/s)",
-                 stats.original_size as f64 / 1_000_000.0,
-                 stats.compressed_size as f64 / 1_000_000.0,
-                 stats.ratio,
-                 stats.throughput_mbps());
+        println!(
+            "Large data compression: {:.2} MB -> {:.2} MB ({:.2}x, {:.2} MB/s)",
+            stats.original_size as f64 / 1_000_000.0,
+            stats.compressed_size as f64 / 1_000_000.0,
+            stats.ratio,
+            stats.throughput_mbps()
+        );
 
         assert!(stats.ratio > 1.0, "Should compress structured data");
 
@@ -616,7 +647,10 @@ mod tests {
         // Note: Our pseudo-random data is still somewhat compressible
         // True random data would have ratio < 1.0 (expansion)
         println!("Random data ratio: {:.2}x", stats.ratio);
-        assert!(stats.ratio < 10.0, "Random data should not compress as well as structured data");
+        assert!(
+            stats.ratio < 10.0,
+            "Random data should not compress as well as structured data"
+        );
 
         // Verify roundtrip works
         let decompressed = decompress(&compressed).unwrap();
@@ -627,20 +661,21 @@ mod tests {
     fn test_embedding_vectors() {
         // Simulate embedding vectors (f32 arrays)
         let embeddings: Vec<f32> = (0..384).map(|i| (i as f32) * 0.001).collect();
-        let data: Vec<u8> = embeddings.iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = embeddings.iter().flat_map(|f| f.to_le_bytes()).collect();
 
         let (compressed, stats) = compress(&data).unwrap();
 
-        println!("Embedding compression: {} -> {} bytes ({:.2}x)",
-                 stats.original_size, stats.compressed_size, stats.ratio);
+        println!(
+            "Embedding compression: {} -> {} bytes ({:.2}x)",
+            stats.original_size, stats.compressed_size, stats.ratio
+        );
 
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(data, decompressed);
 
         // Verify we can reconstruct embeddings
-        let reconstructed: Vec<f32> = decompressed.chunks_exact(4)
+        let reconstructed: Vec<f32> = decompressed
+            .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         assert_eq!(embeddings, reconstructed);
@@ -674,8 +709,10 @@ mod tests {
             ("Large Structured", 100_000, Compressibility::Structured),
         ];
 
-        println!("\n{:<20} {:<10} {:<12} {:<12} {:<10} {:<12}",
-                 "Test Case", "Codec", "Original", "Compressed", "Ratio", "Speed (MB/s)");
+        println!(
+            "\n{:<20} {:<10} {:<12} {:<12} {:<10} {:<12}",
+            "Test Case", "Codec", "Original", "Compressed", "Ratio", "Speed (MB/s)"
+        );
         println!("{}", "=".repeat(85));
 
         for (name, size, comp_type) in test_cases {
@@ -693,13 +730,15 @@ mod tests {
 
             for codec in codecs {
                 let (_, stats) = compress_with(&data, codec).unwrap();
-                println!("{:<20} {:<10} {:<12} {:<12} {:<10.2} {:<12.2}",
-                         name,
-                         codec.name(),
-                         stats.original_size,
-                         stats.compressed_size,
-                         stats.ratio,
-                         stats.throughput_mbps());
+                println!(
+                    "{:<20} {:<10} {:<12} {:<12} {:<10.2} {:<12.2}",
+                    name,
+                    codec.name(),
+                    stats.original_size,
+                    stats.compressed_size,
+                    stats.ratio,
+                    stats.throughput_mbps()
+                );
             }
         }
     }
@@ -711,7 +750,11 @@ mod tests {
         let (compressed, comp_stats) = compress(&data).unwrap();
 
         println!("\nDecompression benchmark:");
-        println!("Codec: {:?}, Compressed size: {} bytes", comp_stats.codec, compressed.len());
+        println!(
+            "Codec: {:?}, Compressed size: {} bytes",
+            comp_stats.codec,
+            compressed.len()
+        );
 
         let iterations = 10;
         let start = Instant::now();

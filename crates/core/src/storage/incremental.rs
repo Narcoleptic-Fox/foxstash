@@ -281,9 +281,7 @@ impl WalWriter {
             .open(path)
             .map_err(|e| RagError::StorageError(format!("Failed to open WAL: {}", e)))?;
 
-        let current_size = file.metadata()
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
+        let current_size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
 
         Ok(Self {
             file: BufWriter::new(file),
@@ -299,9 +297,11 @@ impl WalWriter {
         let len = data.len() as u32;
 
         // Write length prefix + data
-        self.file.write_all(&len.to_le_bytes())
+        self.file
+            .write_all(&len.to_le_bytes())
             .map_err(|e| RagError::StorageError(format!("WAL write failed: {}", e)))?;
-        self.file.write_all(&data)
+        self.file
+            .write_all(&data)
             .map_err(|e| RagError::StorageError(format!("WAL write failed: {}", e)))?;
 
         self.current_size += 4 + data.len();
@@ -315,9 +315,12 @@ impl WalWriter {
 
     /// Sync WAL to disk
     fn sync(&mut self) -> Result<()> {
-        self.file.flush()
+        self.file
+            .flush()
             .map_err(|e| RagError::StorageError(format!("WAL sync failed: {}", e)))?;
-        self.file.get_ref().sync_all()
+        self.file
+            .get_ref()
+            .sync_all()
             .map_err(|e| RagError::StorageError(format!("WAL sync failed: {}", e)))?;
         Ok(())
     }
@@ -362,7 +365,8 @@ impl WalReader {
 
             let len = u32::from_le_bytes(len_buf) as usize;
             let mut data = vec![0u8; len];
-            self.file.read_exact(&mut data)
+            self.file
+                .read_exact(&mut data)
                 .map_err(|e| RagError::StorageError(format!("WAL read failed: {}", e)))?;
 
             let entry: WalEntry = bincode::deserialize(&data)?;
@@ -421,7 +425,10 @@ impl IncrementalStorage {
         };
 
         // Open WAL writer
-        let wal_path = base_path.join(format!("wal_{:05}.log", manifest.current_checkpoint.unwrap_or(0)));
+        let wal_path = base_path.join(format!(
+            "wal_{:05}.log",
+            manifest.current_checkpoint.unwrap_or(0)
+        ));
         let wal_writer = WalWriter::open(&wal_path, config.sync_on_write)?;
 
         Ok(Self {
@@ -482,7 +489,11 @@ impl IncrementalStorage {
     }
 
     /// Create a checkpoint from serializable index data
-    pub fn checkpoint<T: Serialize>(&mut self, index: &T, meta: IndexMetadata) -> Result<CheckpointMeta> {
+    pub fn checkpoint<T: Serialize>(
+        &mut self,
+        index: &T,
+        meta: IndexMetadata,
+    ) -> Result<CheckpointMeta> {
         // Sync WAL first
         if let Some(ref mut writer) = self.wal_writer {
             writer.sync()?;
@@ -499,7 +510,9 @@ impl IncrementalStorage {
         let compressed_size = compressed.len();
 
         // Write checkpoint file
-        let checkpoint_path = self.base_path.join(format!("checkpoint_{:05}.bin", checkpoint_id));
+        let checkpoint_path = self
+            .base_path
+            .join(format!("checkpoint_{:05}.bin", checkpoint_id));
         fs::write(&checkpoint_path, &compressed)
             .map_err(|e| RagError::StorageError(format!("Failed to write checkpoint: {}", e)))?;
 
@@ -520,11 +533,14 @@ impl IncrementalStorage {
         };
 
         // Write checkpoint metadata
-        let meta_path = self.base_path.join(format!("checkpoint_{:05}.meta", checkpoint_id));
+        let meta_path = self
+            .base_path
+            .join(format!("checkpoint_{:05}.meta", checkpoint_id));
         let meta_json = serde_json::to_string_pretty(&checkpoint_meta)
             .map_err(|e| RagError::StorageError(format!("Failed to serialize meta: {}", e)))?;
-        fs::write(&meta_path, &meta_json)
-            .map_err(|e| RagError::StorageError(format!("Failed to write checkpoint meta: {}", e)))?;
+        fs::write(&meta_path, &meta_json).map_err(|e| {
+            RagError::StorageError(format!("Failed to write checkpoint meta: {}", e))
+        })?;
 
         // Log checkpoint marker to WAL
         self.manifest.wal_seq += 1;
@@ -555,21 +571,29 @@ impl IncrementalStorage {
     }
 
     /// Load checkpoint and return deserialized data
-    pub fn load_checkpoint<T: for<'de> Deserialize<'de>>(&self) -> Result<Option<(T, CheckpointMeta)>> {
+    pub fn load_checkpoint<T: for<'de> Deserialize<'de>>(
+        &self,
+    ) -> Result<Option<(T, CheckpointMeta)>> {
         let checkpoint_id = match self.manifest.current_checkpoint {
             Some(id) => id,
             None => return Ok(None),
         };
 
         // Load metadata
-        let meta_path = self.base_path.join(format!("checkpoint_{:05}.meta", checkpoint_id));
-        let meta_json = fs::read_to_string(&meta_path)
-            .map_err(|e| RagError::StorageError(format!("Failed to read checkpoint meta: {}", e)))?;
-        let meta: CheckpointMeta = serde_json::from_str(&meta_json)
-            .map_err(|e| RagError::StorageError(format!("Failed to parse checkpoint meta: {}", e)))?;
+        let meta_path = self
+            .base_path
+            .join(format!("checkpoint_{:05}.meta", checkpoint_id));
+        let meta_json = fs::read_to_string(&meta_path).map_err(|e| {
+            RagError::StorageError(format!("Failed to read checkpoint meta: {}", e))
+        })?;
+        let meta: CheckpointMeta = serde_json::from_str(&meta_json).map_err(|e| {
+            RagError::StorageError(format!("Failed to parse checkpoint meta: {}", e))
+        })?;
 
         // Load and decompress checkpoint
-        let checkpoint_path = self.base_path.join(format!("checkpoint_{:05}.bin", checkpoint_id));
+        let checkpoint_path = self
+            .base_path
+            .join(format!("checkpoint_{:05}.bin", checkpoint_id));
         let compressed = fs::read(&checkpoint_path)
             .map_err(|e| RagError::StorageError(format!("Failed to read checkpoint: {}", e)))?;
         let data = compression::decompress(&compressed)?;
@@ -620,7 +644,9 @@ impl IncrementalStorage {
     pub fn stats(&self) -> StorageStats {
         let wal_size = self.wal_writer.as_ref().map(|w| w.size()).unwrap_or(0);
 
-        let checkpoint_size = self.manifest.current_checkpoint
+        let checkpoint_size = self
+            .manifest
+            .current_checkpoint
             .map(|id| {
                 let path = self.base_path.join(format!("checkpoint_{:05}.bin", id));
                 fs::metadata(&path).map(|m| m.len() as usize).unwrap_or(0)
@@ -662,10 +688,9 @@ impl IncrementalStorage {
         }
 
         // Delete old WAL if exists
-        let old_wal = self.base_path.join(format!(
-            "wal_{:05}.log",
-            checkpoint_id.saturating_sub(1)
-        ));
+        let old_wal = self
+            .base_path
+            .join(format!("wal_{:05}.log", checkpoint_id.saturating_sub(1)));
         if old_wal.exists() {
             let _ = fs::remove_file(&old_wal);
         }
@@ -687,12 +712,16 @@ impl IncrementalStorage {
         for entry in fs::read_dir(&self.base_path)
             .map_err(|e| RagError::StorageError(format!("Failed to read dir: {}", e)))?
         {
-            let entry = entry.map_err(|e| RagError::StorageError(format!("Dir entry error: {}", e)))?;
+            let entry =
+                entry.map_err(|e| RagError::StorageError(format!("Dir entry error: {}", e)))?;
             let name = entry.file_name().to_string_lossy().to_string();
 
             if name.starts_with("checkpoint_") {
                 // Extract checkpoint ID
-                if let Some(id_str) = name.strip_prefix("checkpoint_").and_then(|s| s.split('.').next()) {
+                if let Some(id_str) = name
+                    .strip_prefix("checkpoint_")
+                    .and_then(|s| s.split('.').next())
+                {
                     if let Ok(id) = id_str.parse::<u64>() {
                         if id < cutoff {
                             let _ = fs::remove_file(entry.path());
@@ -824,7 +853,8 @@ mod tests {
     #[test]
     fn test_wal_logging() {
         let dir = TempDir::new().unwrap();
-        let mut storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
 
         // Log some operations
         storage.log_add(&create_test_document("doc1", 128)).unwrap();
@@ -860,23 +890,27 @@ mod tests {
         let mut storage = IncrementalStorage::new(
             dir.path(),
             IncrementalConfig::default().with_checkpoint_threshold(100),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Simulate index data (use String for serialization)
-        let test_data: Vec<String> = vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()];
+        let test_data: Vec<String> =
+            vec!["doc1".to_string(), "doc2".to_string(), "doc3".to_string()];
         for id in &test_data {
             storage.log_add(&create_test_document(id, 128)).unwrap();
         }
 
         // Create checkpoint
-        let meta = storage.checkpoint(
-            &test_data,
-            IndexMetadata {
-                document_count: 3,
-                embedding_dim: 128,
-                index_type: "test".to_string(),
-            },
-        ).unwrap();
+        let meta = storage
+            .checkpoint(
+                &test_data,
+                IndexMetadata {
+                    document_count: 3,
+                    embedding_dim: 128,
+                    index_type: "test".to_string(),
+                },
+            )
+            .unwrap();
 
         assert_eq!(meta.id, 1);
         assert_eq!(meta.document_count, 3);
@@ -906,10 +940,13 @@ mod tests {
         let mut storage = IncrementalStorage::new(
             dir.path(),
             IncrementalConfig::default().with_checkpoint_threshold(5),
-        ).unwrap();
+        )
+        .unwrap();
 
         for i in 0..4 {
-            storage.log_add(&create_test_document(&format!("doc{}", i), 128)).unwrap();
+            storage
+                .log_add(&create_test_document(&format!("doc{}", i), 128))
+                .unwrap();
         }
         assert!(!storage.needs_checkpoint());
 
@@ -920,10 +957,13 @@ mod tests {
     #[test]
     fn test_storage_stats() {
         let dir = TempDir::new().unwrap();
-        let mut storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
 
         for i in 0..10 {
-            storage.log_add(&create_test_document(&format!("doc{}", i), 128)).unwrap();
+            storage
+                .log_add(&create_test_document(&format!("doc{}", i), 128))
+                .unwrap();
         }
         storage.sync().unwrap();
 
@@ -936,7 +976,8 @@ mod tests {
     #[test]
     fn test_recovery_helper() {
         let dir = TempDir::new().unwrap();
-        let mut storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
 
         // Log operations
         storage.log_add(&create_test_document("doc1", 128)).unwrap();
@@ -949,14 +990,16 @@ mod tests {
         let mut adds = 0;
         let mut removes = 0;
 
-        helper.replay_wal(|op| {
-            match op {
-                WalOperation::Add(_) => adds += 1,
-                WalOperation::Remove(_) => removes += 1,
-                _ => {}
-            }
-            Ok(())
-        }).unwrap();
+        helper
+            .replay_wal(|op| {
+                match op {
+                    WalOperation::Add(_) => adds += 1,
+                    WalOperation::Remove(_) => removes += 1,
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(adds, 2);
         assert_eq!(removes, 1);
@@ -968,7 +1011,8 @@ mod tests {
 
         // First session
         {
-            let mut storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+            let mut storage =
+                IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
             storage.log_add(&create_test_document("doc1", 128)).unwrap();
             storage.log_add(&create_test_document("doc2", 128)).unwrap();
             storage.sync().unwrap();
@@ -976,7 +1020,8 @@ mod tests {
 
         // Reopen
         {
-            let storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+            let storage =
+                IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
             assert_eq!(storage.manifest().wal_seq, 2);
 
             let entries = storage.get_wal_entries().unwrap();

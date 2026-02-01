@@ -259,10 +259,7 @@ pub fn approx_equal(a: &[f32], b: &[f32], epsilon: f32) -> bool {
 /// Caller must ensure vectors have the same length.
 #[inline(always)]
 fn dot_product_unchecked(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| x * y)
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 /// Internal helper: computes the L2 magnitude (Euclidean norm) of a vector.

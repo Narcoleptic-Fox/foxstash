@@ -12,12 +12,11 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use foxstash_core::vector::{cosine_similarity, l2_distance};
+use foxstash_core::vector::product_quantize::{PQConfig, PQDistanceCache, ProductQuantizer};
 use foxstash_core::vector::quantize::{
-    BinaryQuantizer, Quantizer, ScalarQuantizer,
-    hamming_distance_simd, sq8_l2_distance_simd,
+    hamming_distance_simd, sq8_l2_distance_simd, BinaryQuantizer, Quantizer, ScalarQuantizer,
 };
-use foxstash_core::vector::product_quantize::{PQConfig, ProductQuantizer, PQDistanceCache};
+use foxstash_core::vector::{cosine_similarity, l2_distance};
 use rand::{Rng, SeedableRng};
 
 fn create_test_vectors(size: usize, seed: u64) -> Vec<Vec<f32>> {
@@ -57,17 +56,13 @@ fn bench_full_precision(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("l2_distance", dim),
-            &dim,
-            |bench, _| {
-                bench.iter(|| {
-                    for v in &vectors {
-                        black_box(l2_distance(&query, v).unwrap());
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("l2_distance", dim), &dim, |bench, _| {
+            bench.iter(|| {
+                for v in &vectors {
+                    black_box(l2_distance(&query, v).unwrap());
+                }
+            });
+        });
     }
 
     group.finish();
@@ -118,17 +113,13 @@ fn bench_sq8(c: &mut Criterion) {
         );
 
         // Raw SIMD L2 distance on quantized bytes
-        group.bench_with_input(
-            BenchmarkId::new("simd_l2_bytes", dim),
-            &dim,
-            |bench, _| {
-                bench.iter(|| {
-                    for qv in &quantized {
-                        black_box(sq8_l2_distance_simd(&query_quantized.data, &qv.data));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("simd_l2_bytes", dim), &dim, |bench, _| {
+            bench.iter(|| {
+                for qv in &quantized {
+                    black_box(sq8_l2_distance_simd(&query_quantized.data, &qv.data));
+                }
+            });
+        });
     }
 
     group.finish();
@@ -166,17 +157,13 @@ fn bench_binary(c: &mut Criterion) {
         );
 
         // Raw SIMD Hamming
-        group.bench_with_input(
-            BenchmarkId::new("simd_hamming", dim),
-            &dim,
-            |bench, _| {
-                bench.iter(|| {
-                    for qv in &quantized {
-                        black_box(hamming_distance_simd(&query_quantized.data, &qv.data));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("simd_hamming", dim), &dim, |bench, _| {
+            bench.iter(|| {
+                for qv in &quantized {
+                    black_box(hamming_distance_simd(&query_quantized.data, &qv.data));
+                }
+            });
+        });
     }
 
     group.finish();
@@ -212,30 +199,22 @@ fn bench_pq(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1000));
 
         // ADC with precomputed table (fastest for batch)
-        group.bench_with_input(
-            BenchmarkId::new("adc_with_table", dim),
-            &dim,
-            |bench, _| {
-                bench.iter(|| {
-                    for code in &codes {
-                        black_box(pq.distance_with_table(&table, code));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("adc_with_table", dim), &dim, |bench, _| {
+            bench.iter(|| {
+                for code in &codes {
+                    black_box(pq.distance_with_table(&table, code));
+                }
+            });
+        });
 
         // ADC without table (per-query)
-        group.bench_with_input(
-            BenchmarkId::new("adc_direct", dim),
-            &dim,
-            |bench, _| {
-                bench.iter(|| {
-                    for code in &codes {
-                        black_box(pq.asymmetric_distance(&query, code));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("adc_direct", dim), &dim, |bench, _| {
+            bench.iter(|| {
+                for code in &codes {
+                    black_box(pq.asymmetric_distance(&query, code));
+                }
+            });
+        });
 
         // Symmetric with cache
         group.bench_with_input(
@@ -290,11 +269,29 @@ fn bench_memory_comparison(c: &mut Criterion) {
     let binary_size = count * ((dim + 7) / 8);
     let pq_size = count * 8;
 
-    println!("\n=== Memory Comparison ({} vectors x {} dims) ===", count, dim);
-    println!("Full precision (f32): {:.2} MB", full_size as f64 / 1_000_000.0);
-    println!("SQ8: {:.2} MB ({:.0}x compression)", sq8_size as f64 / 1_000_000.0, full_size as f64 / sq8_size as f64);
-    println!("Binary: {:.2} MB ({:.0}x compression)", binary_size as f64 / 1_000_000.0, full_size as f64 / binary_size as f64);
-    println!("PQ (M=8): {:.2} MB ({:.0}x compression)", pq_size as f64 / 1_000_000.0, full_size as f64 / pq_size as f64);
+    println!(
+        "\n=== Memory Comparison ({} vectors x {} dims) ===",
+        count, dim
+    );
+    println!(
+        "Full precision (f32): {:.2} MB",
+        full_size as f64 / 1_000_000.0
+    );
+    println!(
+        "SQ8: {:.2} MB ({:.0}x compression)",
+        sq8_size as f64 / 1_000_000.0,
+        full_size as f64 / sq8_size as f64
+    );
+    println!(
+        "Binary: {:.2} MB ({:.0}x compression)",
+        binary_size as f64 / 1_000_000.0,
+        full_size as f64 / binary_size as f64
+    );
+    println!(
+        "PQ (M=8): {:.2} MB ({:.0}x compression)",
+        pq_size as f64 / 1_000_000.0,
+        full_size as f64 / pq_size as f64
+    );
     println!();
 
     // Benchmark encode speed
@@ -318,7 +315,9 @@ fn bench_memory_comparison(c: &mut Criterion) {
         });
     });
 
-    let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
+    let pq_config = PQConfig::new(dim, 8, 8)
+        .with_seed(42)
+        .with_kmeans_iterations(10);
     let pq = ProductQuantizer::train(&vectors[..1000], pq_config).unwrap();
     group.bench_function("pq_encode", |bench| {
         bench.iter(|| {

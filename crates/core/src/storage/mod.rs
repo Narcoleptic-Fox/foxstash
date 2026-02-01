@@ -38,15 +38,15 @@ pub mod file;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod incremental;
 
-pub use compression::{Codec, compress, decompress, compress_with, best_codec, CompressionStats};
+pub use compression::{best_codec, compress, compress_with, decompress, Codec, CompressionStats};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use file::FileStorage;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use incremental::{
-    IncrementalStorage, IncrementalConfig, IndexMetadata, StorageStats,
-    WalOperation, WalEntry, CheckpointMeta, Manifest, RecoveryHelper,
+    CheckpointMeta, IncrementalConfig, IncrementalStorage, IndexMetadata, Manifest, RecoveryHelper,
+    StorageStats, WalEntry, WalOperation,
 };
 
 // Legacy placeholder (will be removed in future)

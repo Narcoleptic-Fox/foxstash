@@ -52,7 +52,10 @@ impl OnnxEmbedder {
     /// foxstash-core = { version = "*", features = ["onnx"] }
     /// ```
     #[allow(dead_code)]
-    pub fn new<P: AsRef<std::path::Path>>(_model_path: P, _tokenizer_path: P) -> crate::Result<Self> {
+    pub fn new<P: AsRef<std::path::Path>>(
+        _model_path: P,
+        _tokenizer_path: P,
+    ) -> crate::Result<Self> {
         Err(crate::RagError::EmbeddingError(
             "ONNX feature is not enabled. Enable it in Cargo.toml with features = [\"onnx\"]"
                 .to_string(),

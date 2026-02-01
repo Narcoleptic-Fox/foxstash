@@ -139,7 +139,10 @@ impl ScalarQuantizer {
     ///
     /// Panics if training vectors have inconsistent dimensions.
     pub fn fit(training_vectors: &[Vec<f32>]) -> Self {
-        assert!(!training_vectors.is_empty(), "Need at least one training vector");
+        assert!(
+            !training_vectors.is_empty(),
+            "Need at least one training vector"
+        );
 
         let dim = training_vectors[0].len();
         let mut mins = vec![f32::INFINITY; dim];
@@ -413,7 +416,9 @@ fn sq8_asymmetric_l2_impl(
         fn with_simd<S: Simd>(self, _simd: S) -> Self::Output {
             let mut sum_sq: f32 = 0.0;
 
-            for ((&q, &qv), param) in self.query.iter()
+            for ((&q, &qv), param) in self
+                .query
+                .iter()
                 .zip(self.quantized.iter())
                 .zip(self.params.iter())
             {
@@ -426,7 +431,11 @@ fn sq8_asymmetric_l2_impl(
         }
     }
 
-    simd.dispatch(AsymL2 { query, quantized, params })
+    simd.dispatch(AsymL2 {
+        query,
+        quantized,
+        params,
+    })
 }
 
 /// SIMD-accelerated Hamming distance for binary vectors
@@ -459,12 +468,24 @@ fn hamming_distance_impl(simd: pulp::Arch, a: &[u8], b: &[u8]) -> u32 {
             for i in 0..chunks {
                 let offset = i * 8;
                 let a_u64 = u64::from_le_bytes([
-                    self.a[offset], self.a[offset + 1], self.a[offset + 2], self.a[offset + 3],
-                    self.a[offset + 4], self.a[offset + 5], self.a[offset + 6], self.a[offset + 7],
+                    self.a[offset],
+                    self.a[offset + 1],
+                    self.a[offset + 2],
+                    self.a[offset + 3],
+                    self.a[offset + 4],
+                    self.a[offset + 5],
+                    self.a[offset + 6],
+                    self.a[offset + 7],
                 ]);
                 let b_u64 = u64::from_le_bytes([
-                    self.b[offset], self.b[offset + 1], self.b[offset + 2], self.b[offset + 3],
-                    self.b[offset + 4], self.b[offset + 5], self.b[offset + 6], self.b[offset + 7],
+                    self.b[offset],
+                    self.b[offset + 1],
+                    self.b[offset + 2],
+                    self.b[offset + 3],
+                    self.b[offset + 4],
+                    self.b[offset + 5],
+                    self.b[offset + 6],
+                    self.b[offset + 7],
                 ]);
                 distance += (a_u64 ^ b_u64).count_ones();
             }
@@ -583,10 +604,7 @@ mod tests {
 
     #[test]
     fn test_scalar_quantizer_roundtrip() {
-        let vectors = vec![
-            vec![-1.0, 0.0, 1.0],
-            vec![-0.5, 0.5, 0.5],
-        ];
+        let vectors = vec![vec![-1.0, 0.0, 1.0], vec![-0.5, 0.5, 0.5]];
 
         let sq = ScalarQuantizer::fit(&vectors);
         let original = vec![-0.7, 0.3, 0.8];
@@ -701,8 +719,8 @@ mod tests {
     fn test_binary_hamming_distance() {
         let bq = BinaryQuantizer::new(8);
 
-        let a = vec![1.0; 8];   // All positive
-        let b = vec![-1.0; 8];  // All negative
+        let a = vec![1.0; 8]; // All positive
+        let b = vec![-1.0; 8]; // All negative
 
         let qa = bq.quantize(&a);
         let qb = bq.quantize(&b);
@@ -715,8 +733,9 @@ mod tests {
     fn test_binary_hamming_same() {
         let bq = BinaryQuantizer::new(16);
 
-        let a = vec![0.5, -0.3, 0.1, -0.9, 0.2, -0.4, 0.6, -0.8,
-                     0.5, -0.3, 0.1, -0.9, 0.2, -0.4, 0.6, -0.8];
+        let a = vec![
+            0.5, -0.3, 0.1, -0.9, 0.2, -0.4, 0.6, -0.8, 0.5, -0.3, 0.1, -0.9, 0.2, -0.4, 0.6, -0.8,
+        ];
 
         let qa = bq.quantize(&a);
         let qb = bq.quantize(&a);
@@ -826,7 +845,11 @@ mod tests {
         let num_vectors = 100;
 
         let vectors: Vec<Vec<f32>> = (0..num_vectors)
-            .map(|_| (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0)).collect())
+            .map(|_| {
+                (0..dim)
+                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .collect()
+            })
             .collect();
 
         let sq = ScalarQuantizer::fit(&vectors);
@@ -883,7 +906,11 @@ mod tests {
         let num_vectors = 100;
 
         let vectors: Vec<Vec<f32>> = (0..num_vectors)
-            .map(|_| (0..dim).map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0)).collect())
+            .map(|_| {
+                (0..dim)
+                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .collect()
+            })
             .collect();
 
         let bq = BinaryQuantizer::new(dim);

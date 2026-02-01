@@ -11,7 +11,9 @@ use foxstash_core::vector::{
 
 fn create_test_vectors(size: usize) -> (Vec<f32>, Vec<f32>) {
     let a: Vec<f32> = (0..size).map(|i| (i as f32) / (size as f32)).collect();
-    let b: Vec<f32> = (0..size).map(|i| 1.0 - (i as f32) / (size as f32)).collect();
+    let b: Vec<f32> = (0..size)
+        .map(|i| 1.0 - (i as f32) / (size as f32))
+        .collect();
     (a, b)
 }
 
@@ -94,5 +96,10 @@ fn bench_cosine_similarity(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dot_product, bench_l2_distance, bench_cosine_similarity);
+criterion_group!(
+    benches,
+    bench_dot_product,
+    bench_l2_distance,
+    bench_cosine_similarity
+);
 criterion_main!(benches);
