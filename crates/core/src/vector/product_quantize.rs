@@ -23,16 +23,20 @@
 //! use foxstash_core::vector::product_quantize::{ProductQuantizer, PQConfig};
 //!
 //! // Configure PQ: 8 subvectors, 256 centroids each
-//! let config = PQConfig::new(384, 8, 8); // dim, M, bits
+//! let config = PQConfig::new(128, 8, 8); // dim, M, bits
 //!
-//! // Train on sample vectors
-//! let training_data: Vec<Vec<f32>> = load_training_vectors();
-//! let pq = ProductQuantizer::train(&training_data, config)?;
+//! // Train on sample vectors (need enough for clustering)
+//! let training_data: Vec<Vec<f32>> = (0..1000)
+//!     .map(|i| (0..128).map(|j| ((i * j) % 100) as f32 / 100.0).collect())
+//!     .collect();
+//! let pq = ProductQuantizer::train(&training_data, config).unwrap();
 //!
 //! // Encode vectors
+//! let vector: Vec<f32> = vec![0.5; 128];
 //! let codes = pq.encode(&vector);
 //!
 //! // Fast distance computation
+//! let query: Vec<f32> = vec![0.6; 128];
 //! let dist = pq.asymmetric_distance(&query, &codes);
 //! ```
 
@@ -189,7 +193,7 @@ impl ProductQuantizer {
         let sub_dim = config.subvector_dim();
 
         // Validate training data dimensions
-        for (i, v) in training_data.iter().enumerate() {
+        for (_i, v) in training_data.iter().enumerate() {
             if v.len() != dim {
                 return Err(RagError::DimensionMismatch {
                     expected: dim,

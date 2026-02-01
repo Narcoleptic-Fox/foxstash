@@ -14,19 +14,23 @@
 //! use foxstash_core::Document;
 //!
 //! let config = BatchConfig::default()
-//!     .with_batch_size(1000)
-//!     .with_progress(|progress| {
-//!         println!("Indexed {}/{} documents", progress.completed, progress.total);
-//!     });
+//!     .with_batch_size(100);
 //!
-//! let mut index = HNSWIndex::with_defaults(384);
+//! let mut index = HNSWIndex::with_defaults(128);
 //! let mut builder = BatchBuilder::new(&mut index, config);
 //!
-//! // Stream documents from any source
-//! for doc in document_iterator {
-//!     builder.add(doc)?;
+//! // Add documents
+//! for i in 0..10 {
+//!     let doc = Document {
+//!         id: format!("doc_{}", i),
+//!         content: format!("Content {}", i),
+//!         embedding: vec![i as f32 / 10.0; 128],
+//!         metadata: None,
+//!     };
+//!     builder.add(doc).unwrap();
 //! }
-//! builder.finish()?;
+//! let result = builder.finish();
+//! assert_eq!(result.documents_indexed, 10);
 //! ```
 //!
 //! # Example: Streaming Search
@@ -43,7 +47,6 @@
 //! ```
 
 use crate::{Document, RagError, Result, SearchResult};
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 // ============================================================================

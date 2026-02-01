@@ -49,11 +49,11 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use crate::storage::compression::{self, Codec, CompressionStats};
+use crate::storage::compression::{self, Codec};
 use crate::{Document, RagError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -266,7 +266,8 @@ pub struct CheckpointMeta {
 /// Write-Ahead Log writer
 struct WalWriter {
     file: BufWriter<File>,
-    path: PathBuf,
+    #[allow(dead_code)]
+    path: PathBuf, // Kept for future: WAL rotation, recovery logging
     current_size: usize,
     sync_on_write: bool,
 }

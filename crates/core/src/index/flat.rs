@@ -20,8 +20,8 @@ use std::collections::HashMap;
 ///
 /// # Examples
 /// ```
-/// use nexus_core::index::FlatIndex;
-/// use nexus_core::Document;
+/// use foxstash_core::index::FlatIndex;
+/// use foxstash_core::Document;
 ///
 /// let mut index = FlatIndex::new(384);
 ///
@@ -58,7 +58,7 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
+    /// use foxstash_core::index::FlatIndex;
     ///
     /// let index = FlatIndex::new(384);
     /// assert_eq!(index.len(), 0);
@@ -84,8 +84,8 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
-    /// use nexus_core::Document;
+    /// use foxstash_core::index::FlatIndex;
+    /// use foxstash_core::Document;
     ///
     /// let mut index = FlatIndex::new(384);
     /// let doc = Document {
@@ -125,8 +125,8 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
-    /// use nexus_core::Document;
+    /// use foxstash_core::index::FlatIndex;
+    /// use foxstash_core::Document;
     ///
     /// let mut index = FlatIndex::new(384);
     /// let docs = vec![
@@ -172,8 +172,8 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
-    /// use nexus_core::Document;
+    /// use foxstash_core::index::FlatIndex;
+    /// use foxstash_core::Document;
     ///
     /// let mut index = FlatIndex::new(3);
     /// let doc = Document {
@@ -238,8 +238,8 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
-    /// use nexus_core::Document;
+    /// use foxstash_core::index::FlatIndex;
+    /// use foxstash_core::Document;
     ///
     /// let mut index = FlatIndex::new(384);
     /// let doc = Document {
@@ -270,7 +270,7 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
+    /// use foxstash_core::index::FlatIndex;
     ///
     /// let index = FlatIndex::new(384);
     /// assert_eq!(index.len(), 0);
@@ -286,7 +286,7 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
+    /// use foxstash_core::index::FlatIndex;
     ///
     /// let index = FlatIndex::new(384);
     /// assert!(index.is_empty());
@@ -299,8 +299,8 @@ impl FlatIndex {
     ///
     /// # Examples
     /// ```
-    /// use nexus_core::index::FlatIndex;
-    /// use nexus_core::Document;
+    /// use foxstash_core::index::FlatIndex;
+    /// use foxstash_core::Document;
     ///
     /// let mut index = FlatIndex::new(384);
     /// let doc = Document {
