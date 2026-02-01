@@ -44,3 +44,7 @@ tempfile = "3.8"
 [[bench]]
 name = "vector_simd"
 harness = false
+
+[[bench]]
+name = "quantization"
+harness = false

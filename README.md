@@ -1,4 +1,4 @@
-# 🦊 Foxstash
+# Foxstash
 
 **High-performance local RAG library for Rust**
 
@@ -10,13 +10,14 @@ Foxstash is a local-first Retrieval-Augmented Generation (RAG) library featuring
 
 ## Features
 
-- 🚀 **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with 3-4x speedup
-- 📊 **HNSW Indexing** - Hierarchical Navigable Small World graphs for fast similarity search
-- 📉 **Vector Quantization** - Int8 (4x) and Binary (32x) quantization for memory efficiency
-- 🧠 **ONNX Embeddings** - Generate embeddings locally with MiniLM-L6-v2 or any ONNX model
-- 🌐 **WASM Support** - Run in the browser with IndexedDB persistence
-- 🗜️ **Compression** - Gzip, LZ4, and Zstd support for efficient storage
-- 🔒 **Local-First** - Your data never leaves your machine
+- **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with 3-4x speedup
+- **HNSW Indexing** - Hierarchical Navigable Small World graphs for fast similarity search
+- **Vector Quantization** - Int8 (4x), Binary (32x), and Product Quantization (192x)
+- **ONNX Embeddings** - Generate embeddings locally with MiniLM-L6-v2 or any ONNX model
+- **WASM Support** - Run in the browser with IndexedDB persistence
+- **Compression** - Gzip, LZ4, and Zstd support for efficient storage
+- **Incremental Persistence** - Write-ahead log for fast updates without full rewrites
+- **Local-First** - Your data never leaves your machine
 
 ## Quick Start
 
@@ -56,7 +57,7 @@ for result in results {
 
 ### Memory-Efficient Indexing with Quantization
 
-For large datasets, use quantized indexes to reduce memory by 4-32x:
+For large datasets, use quantized indexes to reduce memory by 4-192x:
 
 ```rust
 use foxstash_core::index::{SQ8HNSWIndex, BinaryHNSWIndex, QuantizedHNSWConfig};
@@ -81,23 +82,13 @@ binary_index.add_with_full_precision(doc)?;
 // Search with SQ8 (high quality, 4x memory savings)
 let results = sq8_index.search(&query, 10)?;
 
-// Two-phase search with Binary (fast filter → precise rerank)
+// Two-phase search with Binary (fast filter, then precise rerank)
 let results = binary_index.search_and_rerank(&query, 100, 10)?;
 ```
 
-#### Memory Comparison (1M vectors × 384 dims)
-
-| Index Type | Memory | Recall | Use Case |
-|------------|--------|--------|----------|
-| HNSW (f32) | 1.5 GB | ~98% | Default choice |
-| SQ8 HNSW | 384 MB | ~95% | Memory constrained |
-| Binary HNSW | 48 MB | ~90%* | Massive datasets |
-
-*Binary recall improves significantly with two-phase search (filter + rerank).
-
 ### Product Quantization (Extreme Compression)
 
-For massive datasets, use Product Quantization for up to **192x compression**:
+For massive datasets, use Product Quantization for up to 192x compression:
 
 ```rust
 use foxstash_core::index::{PQHNSWIndex, PQHNSWConfig};
@@ -111,28 +102,25 @@ let pq_config = PQConfig::new(384, 8, 8)
 let training_data = load_sample_vectors(10_000);
 let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default())?;
 
-// Add documents
+// Add documents (automatically compressed)
 for doc in documents {
     index.add(doc)?;
 }
 
 // Search using Asymmetric Distance Computation (ADC)
-// Full-precision query vs compressed database
 let results = index.search(&query, 10)?;
-
-println!("Compression: {:.0}x", index.compression_ratio());
 ```
 
-#### PQ Memory Comparison (1M vectors × 384 dims)
+### Memory Comparison (1M vectors, 384 dimensions)
 
-| Storage | Memory | Compression | Recall |
-|---------|--------|-------------|--------|
-| f32 | 1.5 GB | 1x | 100% |
-| SQ8 | 384 MB | 4x | ~95% |
-| Binary | 48 MB | 32x | ~85%* |
-| PQ (M=8) | 8 MB | 192x | ~80%** |
+| Index Type | Memory | Compression | Recall |
+|------------|--------|-------------|--------|
+| HNSW (f32) | 1.5 GB | 1x | ~98% |
+| SQ8 HNSW | 384 MB | 4x | ~95% |
+| Binary HNSW | 48 MB | 32x | ~90%* |
+| PQ HNSW (M=8) | 8 MB | 192x | ~80%** |
 
-*With reranking. **ADC search, improves with more subvectors.
+*With two-phase reranking. **Using ADC search.
 
 ### Streaming Batch Ingestion
 
@@ -140,28 +128,24 @@ For large datasets, use streaming batch ingestion with progress tracking:
 
 ```rust
 use foxstash_core::index::{HNSWIndex, BatchBuilder, BatchConfig};
-use foxstash_core::Document;
 
 let mut index = HNSWIndex::with_defaults(384);
 
-// Configure batch processing with progress callback
 let config = BatchConfig::default()
     .with_batch_size(1000)
     .with_total(100_000)
     .with_progress(|progress| {
         println!(
-            "Indexed {}/{} ({:.1}%) - {:.0} docs/sec, ETA: {}s",
+            "Indexed {}/{} ({:.1}%) - {:.0} docs/sec",
             progress.completed,
             progress.total.unwrap_or(0),
             progress.percent().unwrap_or(0.0),
-            progress.docs_per_sec,
-            progress.eta_ms().unwrap_or(0) / 1000
+            progress.docs_per_sec
         );
     });
 
 let mut builder = BatchBuilder::new(&mut index, config);
 
-// Stream documents from any source
 for doc in document_iterator {
     builder.add(doc)?;
 }
@@ -170,66 +154,26 @@ let result = builder.finish();
 println!("Indexed {} documents in {}ms", result.documents_indexed, result.elapsed_ms);
 ```
 
-### Filtered Search with Pagination
-
-```rust
-use foxstash_core::index::{FilteredSearchBuilder, SearchPage};
-
-// Build filtered search
-let results = index.search(&query, 100)?;
-
-let filtered = FilteredSearchBuilder::new()
-    .min_score(0.7)
-    .has_metadata_field("category")
-    .metadata_equals("type", serde_json::json!("article"))
-    .max_results(50)
-    .apply(results);
-
-// Paginate results
-let page = SearchPage::from_results(filtered, 0, 10);
-println!("Page {}/{}, {} results", page.page + 1, page.total_pages, page.results.len());
-```
-
 ### Incremental Persistence (WAL)
 
-For large indexes with frequent updates, use incremental storage to avoid rewriting the entire index:
+Avoid rewriting the entire index on every update:
 
 ```rust
 use foxstash_core::storage::{IncrementalStorage, IncrementalConfig, IndexMetadata};
-use foxstash_core::index::HNSWIndex;
 
-// Configure WAL-based persistence
 let config = IncrementalConfig::default()
-    .with_checkpoint_threshold(10_000)  // Checkpoint every 10K ops
-    .with_wal_sync_interval(100);       // Sync WAL every 100 ops
+    .with_checkpoint_threshold(10_000)  // Full snapshot every 10K ops
+    .with_wal_sync_interval(100);       // Sync to disk every 100 ops
 
 let mut storage = IncrementalStorage::new("/tmp/my_index", config)?;
 
-// Load existing index or create new one
-let mut index = if let Some((data, _meta)) = storage.load_checkpoint::<HNSWIndex>()? {
-    data
-} else {
-    HNSWIndex::with_defaults(384)
-};
-
-// Replay any operations since last checkpoint
-let helper = storage::RecoveryHelper::new(&storage);
-helper.replay_wal(|op| {
-    match op {
-        WalOperation::Add(doc) => index.add(doc.clone()),
-        WalOperation::Remove(id) => index.remove(id),
-        WalOperation::Clear => { index.clear(); Ok(()) },
-        _ => Ok(()),
-    }
-})?;
-
-// Add documents - logged to WAL (fast append-only)
+// Fast append-only writes to WAL
 for doc in new_documents {
     storage.log_add(&doc)?;
     index.add(doc)?;
 }
 
-// Automatic checkpoint when threshold reached
+// Periodic checkpoint
 if storage.needs_checkpoint() {
     storage.checkpoint(&index, IndexMetadata {
         document_count: index.len(),
@@ -268,19 +212,6 @@ assert_eq!(embedding.len(), 384);
 | `foxstash-wasm` | WebAssembly bindings with IndexedDB persistence |
 | `foxstash-native` | Native bindings with full ONNX support |
 
-## Performance
-
-Benchmarked on Intel i7-12700K:
-
-| Operation | Throughput |
-|-----------|------------|
-| Cosine similarity (384-dim, SIMD) | 15M ops/sec |
-| HNSW search (10K docs, k=10) | 50K queries/sec |
-| HNSW insert | 8K docs/sec |
-| SQ8 distance (quantized) | 40M ops/sec |
-| Binary Hamming distance | 100M ops/sec |
-| Embedding generation (MiniLM) | 500 docs/sec |
-
 ## Architecture
 
 ```
@@ -288,13 +219,23 @@ foxstash/
 ├── crates/
 │   ├── core/           # Main library
 │   │   ├── embedding/  # ONNX Runtime + caching
-│   │   ├── index/      # HNSW + Flat + Quantized indexes
-│   │   ├── storage/    # File persistence + compression
-│   │   └── vector/     # SIMD ops + quantization
+│   │   ├── index/      # HNSW, Flat, SQ8, Binary, PQ indexes
+│   │   ├── storage/    # File persistence, compression, WAL
+│   │   └── vector/     # SIMD ops, quantization
 │   ├── wasm/           # Browser target
 │   ├── native/         # Desktop/server target
 │   └── benches/        # Comprehensive benchmarks
 ```
+
+## Benchmarks
+
+Run benchmarks with:
+
+```bash
+cargo bench -p foxstash-benches
+```
+
+See `crates/benches/` for benchmark implementations.
 
 ## Roadmap
 
@@ -302,6 +243,7 @@ foxstash/
 - [x] Streaming add/search for large datasets
 - [x] Incremental persistence (WAL + checkpointing)
 - [x] Product quantization (PQ) - up to 192x compression
+- [x] Diversity-aware neighbor selection (Algorithm 4)
 - [ ] GPU acceleration (optional)
 - [ ] Hybrid search (sparse + dense vectors)
 - [ ] Multi-vector support (late interaction)
@@ -312,8 +254,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Credits
 
-Built by [Narcoleptic Fox](https://narcolepticfox.com) 🦊
-
----
-
-*Why "Foxstash"? Foxes are famous for caching food and retrieving it later - just like a RAG system stores and retrieves knowledge.*
+Built by [Narcoleptic Fox](https://narcolepticfox.com)
