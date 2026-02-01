@@ -49,6 +49,7 @@
 //! ```
 
 pub mod ops;
+pub mod quantize;
 pub mod simd;
 
 use crate::{RagError, Result};
