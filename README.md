@@ -151,6 +151,55 @@ let page = SearchPage::from_results(filtered, 0, 10);
 println!("Page {}/{}, {} results", page.page + 1, page.total_pages, page.results.len());
 ```
 
+### Incremental Persistence (WAL)
+
+For large indexes with frequent updates, use incremental storage to avoid rewriting the entire index:
+
+```rust
+use foxstash_core::storage::{IncrementalStorage, IncrementalConfig, IndexMetadata};
+use foxstash_core::index::HNSWIndex;
+
+// Configure WAL-based persistence
+let config = IncrementalConfig::default()
+    .with_checkpoint_threshold(10_000)  // Checkpoint every 10K ops
+    .with_wal_sync_interval(100);       // Sync WAL every 100 ops
+
+let mut storage = IncrementalStorage::new("/tmp/my_index", config)?;
+
+// Load existing index or create new one
+let mut index = if let Some((data, _meta)) = storage.load_checkpoint::<HNSWIndex>()? {
+    data
+} else {
+    HNSWIndex::with_defaults(384)
+};
+
+// Replay any operations since last checkpoint
+let helper = storage::RecoveryHelper::new(&storage);
+helper.replay_wal(|op| {
+    match op {
+        WalOperation::Add(doc) => index.add(doc.clone()),
+        WalOperation::Remove(id) => index.remove(id),
+        WalOperation::Clear => { index.clear(); Ok(()) },
+        _ => Ok(()),
+    }
+})?;
+
+// Add documents - logged to WAL (fast append-only)
+for doc in new_documents {
+    storage.log_add(&doc)?;
+    index.add(doc)?;
+}
+
+// Automatic checkpoint when threshold reached
+if storage.needs_checkpoint() {
+    storage.checkpoint(&index, IndexMetadata {
+        document_count: index.len(),
+        embedding_dim: 384,
+        index_type: "hnsw".to_string(),
+    })?;
+}
+```
+
 ### With ONNX Embeddings
 
 Enable the `onnx` feature:
@@ -212,7 +261,7 @@ foxstash/
 
 - [x] Int8/Binary quantization (4-32x memory reduction)
 - [x] Streaming add/search for large datasets
-- [ ] Incremental persistence (delta updates)
+- [x] Incremental persistence (WAL + checkpointing)
 - [ ] Product quantization (PQ)
 - [ ] GPU acceleration (optional)
 

@@ -32,6 +32,9 @@ pub enum RagError {
 
     #[error("Serialization error: {0}")]
     SerializationError(#[from] bincode::Error),
+
+    #[error("Compression error: {0}")]
+    CompressionError(#[from] storage::compression::CompressionError),
 }
 
 /// Document with embedding
