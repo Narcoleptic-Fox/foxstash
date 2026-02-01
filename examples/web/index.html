@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nexus RAG - Local Vector Search Demo</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>Nexus RAG - Local Vector Search Demo</h1>
+            <p class="subtitle">
+                High-performance privacy-first vector search powered by Rust and WebAssembly.
+                All processing happens locally in your browser - no data leaves your device.
+            </p>
+            <div class="tech-stack">
+                <span class="tech-badge">Rust</span>
+                <span class="tech-badge">WebAssembly</span>
+                <span class="tech-badge">IndexedDB</span>
+                <span class="tech-badge">HNSW Algorithm</span>
+            </div>
+        </header>
+
+        <!-- Status Bar -->
+        <div class="status-bar" id="statusBar">
+            <div class="status-indicator" id="statusIndicator">
+                <span class="status-dot status-inactive"></span>
+                <span id="statusText">Not Initialized</span>
+            </div>
+            <div class="metrics">
+                <span class="metric">
+                    <strong>Documents:</strong> <span id="docCount">0</span>
+                </span>
+                <span class="metric">
+                    <strong>Dimension:</strong> <span id="currentDim">-</span>
+                </span>
+                <span class="metric">
+                    <strong>Index Type:</strong> <span id="currentIndexType">-</span>
+                </span>
+            </div>
+        </div>
+
+        <!-- Main Content Grid -->
+        <div class="grid">
+            <!-- Configuration Panel -->
+            <section class="card">
+                <h2>1. Configuration</h2>
+                <div class="form-group">
+                    <label for="embeddingDim">Embedding Dimension</label>
+                    <input
+                        type="number"
+                        id="embeddingDim"
+                        value="384"
+                        min="1"
+                        max="2048"
+                        placeholder="384 (MiniLM-L6-v2)"
+                    >
+                    <small>Default: 384 for MiniLM-L6-v2 embeddings</small>
+                </div>
+                <div class="form-group">
+                    <label for="indexType">Index Type</label>
+                    <select id="indexType">
+                        <option value="hnsw">HNSW (Fast, Approximate)</option>
+                        <option value="flat">Flat (Exact, Slower)</option>
+                    </select>
+                    <small>HNSW recommended for &gt;1000 documents</small>
+                </div>
+                <button id="initButton" class="btn btn-primary btn-large">
+                    Initialize RAG System
+                </button>
+            </section>
+
+            <!-- Document Management -->
+            <section class="card">
+                <h2>2. Document Management</h2>
+                <div class="form-group">
+                    <label for="docId">Document ID</label>
+                    <input
+                        type="text"
+                        id="docId"
+                        placeholder="e.g., doc-001"
+                        disabled
+                    >
+                </div>
+                <div class="form-group">
+                    <label for="docContent">Content</label>
+                    <textarea
+                        id="docContent"
+                        rows="3"
+                        placeholder="Enter document content..."
+                        disabled
+                    ></textarea>
+                </div>
+                <div class="form-group">
+                    <label for="docEmbedding">Embedding Vector</label>
+                    <textarea
+                        id="docEmbedding"
+                        rows="2"
+                        placeholder="Comma-separated floats (e.g., 0.1, 0.2, 0.3, ...)"
+                        disabled
+                    ></textarea>
+                    <div class="button-group">
+                        <button id="generateRandomBtn" class="btn btn-secondary btn-small" disabled>
+                            Generate Random
+                        </button>
+                        <button id="loadSampleDataBtn" class="btn btn-secondary btn-small" disabled>
+                            Load Sample Data
+                        </button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="docMetadata">Metadata (Optional JSON)</label>
+                    <textarea
+                        id="docMetadata"
+                        rows="2"
+                        placeholder='{"category": "example", "tags": ["demo"]}'
+                        disabled
+                    ></textarea>
+                </div>
+                <button id="addDocButton" class="btn btn-primary" disabled>
+                    Add Document
+                </button>
+
+                <!-- Documents List -->
+                <div class="documents-section">
+                    <h3>Added Documents</h3>
+                    <div id="documentsList" class="documents-list">
+                        <p class="empty-state">No documents added yet</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Search Interface -->
+            <section class="card">
+                <h2>3. Search</h2>
+                <div class="form-group">
+                    <label for="queryVector">Query Vector</label>
+                    <textarea
+                        id="queryVector"
+                        rows="2"
+                        placeholder="Comma-separated floats matching the embedding dimension"
+                        disabled
+                    ></textarea>
+                    <div class="button-group">
+                        <button id="useSampleQueryBtn" class="btn btn-secondary btn-small" disabled>
+                            Use Sample Query
+                        </button>
+                        <button id="generateRandomQueryBtn" class="btn btn-secondary btn-small" disabled>
+                            Generate Random
+                        </button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="kResults">Number of Results (k)</label>
+                    <input
+                        type="number"
+                        id="kResults"
+                        value="5"
+                        min="1"
+                        max="100"
+                        disabled
+                    >
+                </div>
+                <button id="searchButton" class="btn btn-primary" disabled>
+                    Search
+                </button>
+
+                <!-- Performance Metrics -->
+                <div id="performanceMetrics" class="metrics-box" style="display: none;">
+                    <h4>Performance</h4>
+                    <div class="metric-row">
+                        <span>Search Time:</span>
+                        <strong id="searchTime">-</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Results Found:</span>
+                        <strong id="resultsCount">-</strong>
+                    </div>
+                </div>
+
+                <!-- Search Results -->
+                <div class="results-section">
+                    <h3>Search Results</h3>
+                    <div id="searchResults" class="search-results">
+                        <p class="empty-state">No search performed yet</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Persistence Controls -->
+            <section class="card">
+                <h2>4. Persistence (IndexedDB)</h2>
+                <div class="form-group">
+                    <label for="saveKey">Save/Load Key</label>
+                    <input
+                        type="text"
+                        id="saveKey"
+                        placeholder="e.g., my-rag-index"
+                        value="default-index"
+                        disabled
+                    >
+                </div>
+                <div class="button-group">
+                    <button id="saveButton" class="btn btn-primary" disabled>
+                        Save to IndexedDB
+                    </button>
+                    <button id="loadButton" class="btn btn-secondary" disabled>
+                        Load from IndexedDB
+                    </button>
+                </div>
+
+                <!-- Saved Indices List -->
+                <div class="saved-indices-section">
+                    <h3>Saved Indices</h3>
+                    <div id="savedIndicesList" class="saved-indices-list">
+                        <p class="empty-state">No saved indices</p>
+                    </div>
+                    <button id="listIndicesButton" class="btn btn-secondary btn-small" disabled>
+                        Refresh List
+                    </button>
+                </div>
+
+                <div class="danger-zone">
+                    <h4>Danger Zone</h4>
+                    <button id="clearAllButton" class="btn btn-danger" disabled>
+                        Clear All Data
+                    </button>
+                    <small>This will remove all documents and reset the index</small>
+                </div>
+            </section>
+        </div>
+
+        <!-- Notification Toast -->
+        <div id="toast" class="toast"></div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>
+                <strong>Nexus Local RAG</strong> -
+                <a href="https://github.com/nexus/nexus-local-rag" target="_blank">GitHub Repository</a>
+            </p>
+            <p class="tech-info">
+                Built with Rust, WebAssembly, and the HNSW algorithm for fast approximate nearest neighbor search.
+                All data processing happens locally - your privacy is protected.
+            </p>
+        </footer>
+    </div>
+
+    <!-- Loading Spinner Overlay -->
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="spinner"></div>
+        <p>Loading WASM module...</p>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

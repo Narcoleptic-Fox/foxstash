@@ -1,0 +1,43 @@
+[package]
+name = "foxstash-core"
+version.workspace = true
+edition.workspace = true
+description = "High-performance local RAG library - SIMD-accelerated vector search, HNSW indexing"
+repository = "https://github.com/Narcoleptic-Fox/foxstash"
+license = "MIT"
+keywords = ["rag", "vector-search", "hnsw", "embeddings", "simd"]
+categories = ["algorithms", "data-structures", "science"]
+
+[dependencies]
+ndarray.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror = "1.0"
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
+
+# SIMD dependencies
+pulp = "0.18"
+
+# Compression dependencies
+flate2 = "1.0"
+lz4 = { version = "1.24", optional = true }
+zstd = { version = "0.13", optional = true }
+
+[features]
+default = []
+onnx = ["ort", "tokenizers", "lru"]
+lz4 = ["dep:lz4"]
+zstd = ["dep:zstd"]
+compression-all = ["lz4", "zstd"]
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile = "3.8"
+
+[[bench]]
+name = "vector_simd"
+harness = false

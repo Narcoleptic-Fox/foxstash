@@ -1,0 +1,24 @@
+{
+  "name": "nexus-rag-demo",
+  "version": "0.1.0",
+  "description": "Nexus RAG - Local Vector Search Demo Application",
+  "type": "module",
+  "scripts": {
+    "build": "cd ../../crates/wasm && wasm-pack build --target web --out-dir ../../examples/web/pkg",
+    "serve": "python3 -m http.server 8080",
+    "dev": "npm run build && npm run serve",
+    "clean": "rm -rf pkg"
+  },
+  "keywords": [
+    "rag",
+    "vector-search",
+    "wasm",
+    "rust",
+    "local-first"
+  ],
+  "author": "Nexus Team",
+  "license": "MIT",
+  "devDependencies": {
+    "wasm-pack": "^0.12.1"
+  }
+}

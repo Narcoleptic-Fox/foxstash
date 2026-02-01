@@ -1,0 +1,23 @@
+[package]
+name = "foxstash-benches"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+foxstash-core = { path = "../core", features = ["onnx", "compression-all"] }
+criterion.workspace = true
+rand.workspace = true
+tempfile = "3.8"
+
+[[bench]]
+name = "embedding"
+harness = false
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "full"
+harness = false

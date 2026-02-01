@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nexus RAG - WASM Performance Benchmarks</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .subtitle {
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        label {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: #555;
+        }
+
+        select, input, button {
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: all 0.3s;
+        }
+
+        select:focus, input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+
+        .status.info {
+            background: #e3f2fd;
+            color: #1976d2;
+            border-left: 4px solid #1976d2;
+        }
+
+        .status.success {
+            background: #e8f5e9;
+            color: #388e3c;
+            border-left: 4px solid #388e3c;
+        }
+
+        .status.error {
+            background: #ffebee;
+            color: #d32f2f;
+            border-left: 4px solid #d32f2f;
+        }
+
+        .status.warning {
+            background: #fff3e0;
+            color: #f57c00;
+            border-left: 4px solid #f57c00;
+        }
+
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .metric-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 12px;
+            text-align: center;
+        }
+
+        .metric-label {
+            font-size: 0.9rem;
+            opacity: 0.9;
+            margin-bottom: 10px;
+        }
+
+        .metric-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .metric-unit {
+            font-size: 1rem;
+            opacity: 0.8;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 400px;
+            margin-bottom: 30px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        th {
+            background: #f5f5f5;
+            font-weight: 600;
+            color: #555;
+        }
+
+        tr:hover {
+            background: #f9f9f9;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .badge.pass {
+            background: #e8f5e9;
+            color: #388e3c;
+        }
+
+        .badge.fail {
+            background: #ffebee;
+            color: #d32f2f;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s;
+        }
+
+        footer {
+            text-align: center;
+            color: white;
+            margin-top: 40px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Nexus RAG Performance Benchmarks</h1>
+            <p class="subtitle">WASM-based Vector Search Performance Testing</p>
+        </header>
+
+        <div class="card">
+            <h2>Benchmark Configuration</h2>
+            <div class="controls">
+                <div class="control-group">
+                    <label for="indexSize">Index Size (documents)</label>
+                    <select id="indexSize">
+                        <option value="100">100</option>
+                        <option value="500">500</option>
+                        <option value="1000">1,000</option>
+                        <option value="5000">5,000</option>
+                        <option value="10000" selected>10,000</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="indexType">Index Type</label>
+                    <select id="indexType">
+                        <option value="hnsw" selected>HNSW (Fast)</option>
+                        <option value="flat">Flat (Exact)</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="numQueries">Number of Queries</label>
+                    <select id="numQueries">
+                        <option value="10">10</option>
+                        <option value="50">50</option>
+                        <option value="100" selected>100</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label for="kValue">Results per Query (k)</label>
+                    <select id="kValue">
+                        <option value="1">1</option>
+                        <option value="10" selected>10</option>
+                        <option value="50">50</option>
+                    </select>
+                </div>
+            </div>
+            <button id="runBenchmark" onclick="runBenchmarks()">Run Benchmarks</button>
+        </div>
+
+        <div id="status" class="card" style="display:none;">
+            <div id="statusMessage" class="status info">Initializing...</div>
+            <div class="progress-bar">
+                <div id="progressFill" class="progress-fill" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <div id="results" style="display:none;">
+            <div class="card">
+                <h2>Performance Metrics</h2>
+                <div class="results-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Index Construction</div>
+                        <div class="metric-value" id="constructionTime">--</div>
+                        <div class="metric-unit">ms</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Avg Search Time</div>
+                        <div class="metric-value" id="avgSearchTime">--</div>
+                        <div class="metric-unit">ms</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">P95 Search Time</div>
+                        <div class="metric-value" id="p95SearchTime">--</div>
+                        <div class="metric-unit">ms</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">P99 Search Time</div>
+                        <div class="metric-value" id="p99SearchTime">--</div>
+                        <div class="metric-unit">ms</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Total Memory</div>
+                        <div class="metric-value" id="totalMemory">--</div>
+                        <div class="metric-unit">MB</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Memory per Doc</div>
+                        <div class="metric-value" id="memoryPerDoc">--</div>
+                        <div class="metric-unit">KB</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Search Latency Distribution</h2>
+                <div class="chart-container">
+                    <canvas id="latencyChart"></canvas>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Performance Targets</h2>
+                <table id="targetsTable">
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Target</th>
+                            <th>Actual</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="targetsBody">
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>Detailed Results</h2>
+                <table id="detailsTable">
+                    <thead>
+                        <tr>
+                            <th>Query #</th>
+                            <th>Search Time (ms)</th>
+                            <th>Results Found</th>
+                        </tr>
+                    </thead>
+                    <tbody id="detailsBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <footer>
+            <p>Nexus Local RAG - Phase 6: Optimization & Benchmarking</p>
+            <p>Built with Rust + WebAssembly</p>
+        </footer>
+    </div>
+
+    <script type="module">
+        import init, * as wasm from './pkg/nexus_rag_wasm.js';
+
+        let wasmModule = null;
+        let latencyChart = null;
+
+        // Initialize WASM
+        async function initWasm() {
+            try {
+                await init();
+                wasmModule = wasm;
+                console.log('WASM module loaded successfully');
+            } catch (error) {
+                console.error('Failed to load WASM module:', error);
+                showStatus('Failed to load WASM module: ' + error.message, 'error');
+            }
+        }
+
+        // Show status message
+        function showStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            const statusMessage = document.getElementById('statusMessage');
+            statusMessage.textContent = message;
+            statusMessage.className = `status ${type}`;
+            statusDiv.style.display = 'block';
+        }
+
+        // Update progress
+        function updateProgress(percent) {
+            document.getElementById('progressFill').style.width = percent + '%';
+        }
+
+        // Generate random embedding
+        function generateRandomEmbedding(dim = 384) {
+            return Array.from({ length: dim }, () => Math.random() * 2 - 1);
+        }
+
+        // Generate test documents
+        function generateTestDocuments(count) {
+            const documents = [];
+            for (let i = 0; i < count; i++) {
+                documents.push({
+                    id: `doc_${i}`,
+                    content: `Test document content for document ${i}`,
+                    embedding: generateRandomEmbedding(),
+                    metadata: null
+                });
+            }
+            return documents;
+        }
+
+        // Calculate percentile
+        function calculatePercentile(values, percentile) {
+            const sorted = values.slice().sort((a, b) => a - b);
+            const index = Math.ceil((percentile / 100) * sorted.length) - 1;
+            return sorted[Math.max(0, index)];
+        }
+
+        // Run benchmarks
+        window.runBenchmarks = async function() {
+            if (!wasmModule) {
+                showStatus('WASM module not loaded. Please refresh the page.', 'error');
+                return;
+            }
+
+            const indexSize = parseInt(document.getElementById('indexSize').value);
+            const indexType = document.getElementById('indexType').value;
+            const numQueries = parseInt(document.getElementById('numQueries').value);
+            const kValue = parseInt(document.getElementById('kValue').value);
+
+            document.getElementById('runBenchmark').disabled = true;
+            document.getElementById('results').style.display = 'none';
+            showStatus('Generating test data...', 'info');
+            updateProgress(10);
+
+            try {
+                // Generate test data
+                const documents = generateTestDocuments(indexSize);
+                const queries = Array.from({ length: numQueries }, () => generateRandomEmbedding());
+
+                // Measure index construction time
+                showStatus('Building index...', 'info');
+                updateProgress(30);
+
+                const startConstruction = performance.now();
+                const indexInstance = indexType === 'hnsw'
+                    ? new wasmModule.WasmHNSWIndex()
+                    : new wasmModule.WasmFlatIndex();
+
+                for (const doc of documents) {
+                    indexInstance.add_document(doc);
+                }
+                const constructionTime = performance.now() - startConstruction;
+
+                // Measure memory usage
+                const memoryBefore = performance.memory?.usedJSHeapSize || 0;
+                const estimatedMemory = (memoryBefore / (1024 * 1024)).toFixed(2);
+                const memoryPerDoc = ((memoryBefore / indexSize) / 1024).toFixed(2);
+
+                // Run search benchmarks
+                showStatus('Running search benchmarks...', 'info');
+                updateProgress(60);
+
+                const searchTimes = [];
+                const detailsData = [];
+
+                for (let i = 0; i < numQueries; i++) {
+                    const startSearch = performance.now();
+                    const results = indexInstance.search(queries[i], kValue);
+                    const searchTime = performance.now() - startSearch;
+
+                    searchTimes.push(searchTime);
+                    detailsData.push({
+                        query: i + 1,
+                        time: searchTime.toFixed(3),
+                        results: results.length
+                    });
+
+                    if ((i + 1) % 10 === 0) {
+                        updateProgress(60 + (i / numQueries) * 30);
+                    }
+                }
+
+                // Calculate statistics
+                const avgSearchTime = (searchTimes.reduce((a, b) => a + b, 0) / searchTimes.length).toFixed(3);
+                const p50SearchTime = calculatePercentile(searchTimes, 50).toFixed(3);
+                const p95SearchTime = calculatePercentile(searchTimes, 95).toFixed(3);
+                const p99SearchTime = calculatePercentile(searchTimes, 99).toFixed(3);
+
+                // Display results
+                showStatus('Benchmark completed successfully!', 'success');
+                updateProgress(100);
+
+                document.getElementById('constructionTime').textContent = constructionTime.toFixed(0);
+                document.getElementById('avgSearchTime').textContent = avgSearchTime;
+                document.getElementById('p95SearchTime').textContent = p95SearchTime;
+                document.getElementById('p99SearchTime').textContent = p99SearchTime;
+                document.getElementById('totalMemory').textContent = estimatedMemory;
+                document.getElementById('memoryPerDoc').textContent = memoryPerDoc;
+
+                // Update chart
+                updateLatencyChart(searchTimes);
+
+                // Update targets table
+                updateTargetsTable({
+                    avgSearchTime: parseFloat(avgSearchTime),
+                    p99SearchTime: parseFloat(p99SearchTime),
+                    memoryPerDoc: parseFloat(memoryPerDoc)
+                });
+
+                // Update details table
+                updateDetailsTable(detailsData);
+
+                document.getElementById('results').style.display = 'block';
+
+                // Save results to IndexedDB
+                await saveResults({
+                    timestamp: new Date().toISOString(),
+                    indexSize,
+                    indexType,
+                    numQueries,
+                    kValue,
+                    constructionTime,
+                    avgSearchTime,
+                    p95SearchTime,
+                    p99SearchTime,
+                    estimatedMemory,
+                    memoryPerDoc
+                });
+
+            } catch (error) {
+                showStatus('Benchmark failed: ' + error.message, 'error');
+                console.error('Benchmark error:', error);
+            } finally {
+                document.getElementById('runBenchmark').disabled = false;
+            }
+        };
+
+        // Update latency chart
+        function updateLatencyChart(searchTimes) {
+            const ctx = document.getElementById('latencyChart').getContext('2d');
+
+            if (latencyChart) {
+                latencyChart.destroy();
+            }
+
+            latencyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: searchTimes.map((_, i) => i + 1),
+                    datasets: [{
+                        label: 'Search Latency (ms)',
+                        data: searchTimes,
+                        borderColor: '#667eea',
+                        backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                        borderWidth: 2,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Latency (ms)'
+                            }
+                        },
+                        x: {
+                            title: {
+                                display: true,
+                                text: 'Query Number'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Update targets table
+        function updateTargetsTable(metrics) {
+            const targets = [
+                { metric: 'Avg Search Time', target: 50, actual: metrics.avgSearchTime, unit: 'ms' },
+                { metric: 'P99 Search Time', target: 100, actual: metrics.p99SearchTime, unit: 'ms' },
+                { metric: 'Memory per Document', target: 20, actual: metrics.memoryPerDoc, unit: 'KB' }
+            ];
+
+            const tbody = document.getElementById('targetsBody');
+            tbody.innerHTML = '';
+
+            for (const target of targets) {
+                const row = tbody.insertRow();
+                row.insertCell(0).textContent = target.metric;
+                row.insertCell(1).textContent = `< ${target.target} ${target.unit}`;
+                row.insertCell(2).textContent = `${target.actual.toFixed(2)} ${target.unit}`;
+
+                const statusCell = row.insertCell(3);
+                const pass = target.actual < target.target;
+                statusCell.innerHTML = `<span class="badge ${pass ? 'pass' : 'fail'}">${pass ? 'PASS' : 'FAIL'}</span>`;
+            }
+        }
+
+        // Update details table
+        function updateDetailsTable(details) {
+            const tbody = document.getElementById('detailsBody');
+            tbody.innerHTML = '';
+
+            for (const detail of details) {
+                const row = tbody.insertRow();
+                row.insertCell(0).textContent = detail.query;
+                row.insertCell(1).textContent = detail.time;
+                row.insertCell(2).textContent = detail.results;
+            }
+        }
+
+        // Save results to IndexedDB
+        async function saveResults(results) {
+            try {
+                const dbName = 'nexus-rag-benchmarks';
+                const request = indexedDB.open(dbName, 1);
+
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    if (!db.objectStoreNames.contains('results')) {
+                        db.createObjectStore('results', { keyPath: 'timestamp' });
+                    }
+                };
+
+                request.onsuccess = (event) => {
+                    const db = event.target.result;
+                    const transaction = db.transaction(['results'], 'readwrite');
+                    const store = transaction.objectStore('results');
+                    store.add(results);
+                    console.log('Results saved to IndexedDB');
+                };
+
+                request.onerror = (event) => {
+                    console.error('IndexedDB error:', event.target.error);
+                };
+            } catch (error) {
+                console.error('Failed to save results:', error);
+            }
+        }
+
+        // Initialize on page load
+        initWasm();
+    </script>
+</body>
+</html>
