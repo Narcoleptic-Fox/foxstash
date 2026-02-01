@@ -36,6 +36,19 @@ pub struct HNSWConfig {
     /// Normalization factor for level generation
     /// Typical value: 1.0 / ln(m) ≈ 0.36 for m=16
     pub ml: f32,
+
+    /// Use the heuristic neighbor selection algorithm (Algorithm 4 from paper)
+    /// When true, selects diverse neighbors that aren't "behind" already-selected ones.
+    /// This improves graph connectivity and recall at slight construction cost.
+    pub use_heuristic: bool,
+
+    /// When using heuristic, also consider neighbors of candidates (extend_candidates)
+    /// This can find better neighbors but increases construction time.
+    pub extend_candidates: bool,
+
+    /// When pruning, keep some pruned connections for better connectivity
+    /// Only applies when use_heuristic is true.
+    pub keep_pruned_connections: bool,
 }
 
 impl Default for HNSWConfig {
@@ -47,7 +60,44 @@ impl Default for HNSWConfig {
             ef_construction: 200,
             ef_search: 50,
             ml: 1.0 / (m as f32).ln(),
+            use_heuristic: true,  // Use improved heuristic by default
+            extend_candidates: false,
+            keep_pruned_connections: true,
         }
+    }
+}
+
+impl HNSWConfig {
+    /// Use simple nearest-neighbor selection (faster construction, lower recall)
+    pub fn with_simple_selection(mut self) -> Self {
+        self.use_heuristic = false;
+        self
+    }
+
+    /// Enable extended candidate search (better quality, slower construction)
+    pub fn with_extended_candidates(mut self) -> Self {
+        self.extend_candidates = true;
+        self
+    }
+
+    /// Set ef_search parameter
+    pub fn with_ef_search(mut self, ef: usize) -> Self {
+        self.ef_search = ef;
+        self
+    }
+
+    /// Set ef_construction parameter
+    pub fn with_ef_construction(mut self, ef: usize) -> Self {
+        self.ef_construction = ef;
+        self
+    }
+
+    /// Set M parameter (connections per node)
+    pub fn with_m(mut self, m: usize) -> Self {
+        self.m = m;
+        self.m0 = m * 2;
+        self.ml = 1.0 / (m as f32).ln();
+        self
     }
 }
 
@@ -424,13 +474,99 @@ impl HNSWIndex {
 
     /// Selects M best neighbors using a heuristic
     ///
+    /// When `use_heuristic` is enabled (default), uses Algorithm 4 from the HNSW paper
+    /// which ensures diversity by only selecting candidates that are closer to the query
+    /// than to any already-selected neighbor. This prevents selecting neighbors that are
+    /// "behind" other neighbors, improving graph connectivity.
+    ///
     /// # Arguments
     /// * `candidates` - Candidate neighbor IDs
     /// * `query` - Query point
     /// * `m` - Number of neighbors to select
     /// * `layer` - Current layer
-    fn select_neighbors(&self, candidates: &[usize], query: &[f32], m: usize, _layer: usize) -> Vec<usize> {
-        // Simple heuristic: select M closest neighbors
+    fn select_neighbors(&self, candidates: &[usize], query: &[f32], m: usize, layer: usize) -> Vec<usize> {
+        if !self.config.use_heuristic {
+            // Simple heuristic: select M closest neighbors
+            return self.select_neighbors_simple(candidates, query, m);
+        }
+
+        // Algorithm 4 from the HNSW paper: SELECT-NEIGHBORS-HEURISTIC
+        // This ensures diversity by checking if each candidate is closer to query
+        // than to any already-selected neighbor.
+
+        // Optionally extend candidates with their neighbors
+        let mut working_candidates: Vec<usize> = candidates.to_vec();
+        if self.config.extend_candidates {
+            let mut seen: HashSet<usize> = candidates.iter().copied().collect();
+            for &candidate in candidates {
+                if layer < self.nodes[candidate].connections.len() {
+                    for &neighbor in &self.nodes[candidate].connections[layer] {
+                        if seen.insert(neighbor) {
+                            working_candidates.push(neighbor);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Score and sort candidates by distance to query
+        let mut scored: Vec<(f32, usize)> = working_candidates
+            .iter()
+            .map(|&id| {
+                let dist = self.distance(query, &self.nodes[id].embedding);
+                (dist, id)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        // Select neighbors using the heuristic
+        let mut selected: Vec<usize> = Vec::with_capacity(m);
+        let mut pruned: Vec<(f32, usize)> = Vec::new();
+
+        for (dist_to_query, candidate_id) in scored {
+            if selected.len() >= m {
+                break;
+            }
+
+            // Check if this candidate is closer to query than to any selected neighbor
+            let candidate_embedding = &self.nodes[candidate_id].embedding;
+            let mut is_good = true;
+
+            for &selected_id in &selected {
+                let selected_embedding = &self.nodes[selected_id].embedding;
+                let dist_to_selected = self.distance(candidate_embedding, selected_embedding);
+
+                // If candidate is closer to a selected neighbor than to query,
+                // it's "behind" that neighbor and we should skip it
+                if dist_to_selected < dist_to_query {
+                    is_good = false;
+                    pruned.push((dist_to_query, candidate_id));
+                    break;
+                }
+            }
+
+            if is_good {
+                selected.push(candidate_id);
+            }
+        }
+
+        // Optionally add back some pruned connections if we didn't get enough
+        if self.config.keep_pruned_connections && selected.len() < m {
+            for (_, pruned_id) in pruned {
+                if selected.len() >= m {
+                    break;
+                }
+                if !selected.contains(&pruned_id) {
+                    selected.push(pruned_id);
+                }
+            }
+        }
+
+        selected
+    }
+
+    /// Simple neighbor selection: just pick M closest
+    fn select_neighbors_simple(&self, candidates: &[usize], query: &[f32], m: usize) -> Vec<usize> {
         let mut scored: Vec<(f32, usize)> = candidates
             .iter()
             .map(|&id| {
@@ -496,6 +632,26 @@ mod tests {
         assert_eq!(config.ef_construction, 200);
         assert_eq!(config.ef_search, 50);
         assert!((config.ml - 0.36).abs() < 0.01);
+        assert!(config.use_heuristic);  // Heuristic enabled by default
+        assert!(!config.extend_candidates);
+        assert!(config.keep_pruned_connections);
+    }
+
+    #[test]
+    fn test_hnsw_config_builders() {
+        let config = HNSWConfig::default()
+            .with_m(32)
+            .with_ef_search(100)
+            .with_ef_construction(400)
+            .with_simple_selection()
+            .with_extended_candidates();
+
+        assert_eq!(config.m, 32);
+        assert_eq!(config.m0, 64);
+        assert_eq!(config.ef_search, 100);
+        assert_eq!(config.ef_construction, 400);
+        assert!(!config.use_heuristic);
+        assert!(config.extend_candidates);
     }
 
     #[test]

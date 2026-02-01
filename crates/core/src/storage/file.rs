@@ -855,7 +855,16 @@ pub struct HNSWConfigWrapper {
     pub ef_construction: usize,
     pub ef_search: usize,
     pub ml: f32,
+    #[serde(default = "default_use_heuristic")]
+    pub use_heuristic: bool,
+    #[serde(default)]
+    pub extend_candidates: bool,
+    #[serde(default = "default_keep_pruned")]
+    pub keep_pruned_connections: bool,
 }
+
+fn default_use_heuristic() -> bool { true }
+fn default_keep_pruned() -> bool { true }
 
 impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
     fn from(config: &crate::index::HNSWConfig) -> Self {
@@ -865,6 +874,9 @@ impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
             ef_construction: config.ef_construction,
             ef_search: config.ef_search,
             ml: config.ml,
+            use_heuristic: config.use_heuristic,
+            extend_candidates: config.extend_candidates,
+            keep_pruned_connections: config.keep_pruned_connections,
         }
     }
 }
@@ -877,6 +889,9 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             ef_construction: wrapper.ef_construction,
             ef_search: wrapper.ef_search,
             ml: wrapper.ml,
+            use_heuristic: wrapper.use_heuristic,
+            extend_candidates: wrapper.extend_candidates,
+            keep_pruned_connections: wrapper.keep_pruned_connections,
         }
     }
 }
