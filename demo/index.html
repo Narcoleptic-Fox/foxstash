@@ -11,10 +11,19 @@
             padding: 0;
         }
         
+        :root {
+            --deep-teal: #065465;
+            --silver: #C0C0C0;
+            --lilac: #C8A2C8;
+            --rust: #B7410E;
+            --terracotta: #E2725B;
+            --slate-950: #0f172a;
+        }
+        
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #e0e0e0;
+            background: var(--slate-950);
+            color: var(--silver);
             min-height: 100vh;
             padding: 2rem;
         }
@@ -32,14 +41,14 @@
         h1 {
             font-size: 2.5rem;
             margin-bottom: 0.5rem;
-            background: linear-gradient(90deg, #f97316, #fb923c);
+            background: linear-gradient(90deg, var(--rust), var(--terracotta));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
         
         .subtitle {
-            color: #9ca3af;
+            color: var(--silver);
             font-size: 1.1rem;
         }
         
@@ -70,7 +79,7 @@
         .card h2 {
             font-size: 1.25rem;
             margin-bottom: 1rem;
-            color: #f97316;
+            color: var(--deep-teal);
         }
         
         .input-group {
@@ -96,7 +105,7 @@
         
         input[type="text"]:focus, textarea:focus {
             outline: none;
-            border-color: #f97316;
+            border-color: var(--deep-teal);
         }
         
         textarea {
@@ -105,7 +114,7 @@
         }
         
         button {
-            background: linear-gradient(90deg, #f97316, #ea580c);
+            background: linear-gradient(90deg, var(--rust), var(--terracotta));
             color: white;
             border: none;
             padding: 0.75rem 1.5rem;
@@ -117,7 +126,7 @@
         
         button:hover {
             transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(249, 115, 22, 0.3);
+            box-shadow: 0 4px 12px rgba(183, 65, 14, 0.3);
         }
         
         button:disabled {
@@ -153,12 +162,12 @@
         .stat-value {
             font-size: 1.5rem;
             font-weight: bold;
-            color: #f97316;
+            color: var(--deep-teal);
         }
         
         .stat-label {
             font-size: 0.8rem;
-            color: #9ca3af;
+            color: var(--silver);
         }
         
         .results {
@@ -170,12 +179,12 @@
             padding: 1rem;
             border-radius: 0.5rem;
             margin-bottom: 0.5rem;
-            border-left: 3px solid #f97316;
+            border-left: 3px solid var(--deep-teal);
         }
         
         .result-score {
             float: right;
-            background: #f97316;
+            background: var(--rust);
             color: white;
             padding: 0.25rem 0.5rem;
             border-radius: 0.25rem;
@@ -188,7 +197,7 @@
         }
         
         .result-content {
-            color: #9ca3af;
+            color: var(--silver);
             font-size: 0.9rem;
         }
         
@@ -219,7 +228,7 @@
             width: 20px;
             height: 20px;
             border: 2px solid #374151;
-            border-top-color: #f97316;
+            border-top-color: var(--rust);
             border-radius: 50%;
             animation: spin 1s linear infinite;
         }
@@ -238,7 +247,7 @@
         }
         
         footer a {
-            color: #f97316;
+            color: var(--deep-teal);
             text-decoration: none;
         }
         
