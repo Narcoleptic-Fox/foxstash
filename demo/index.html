@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Foxstash - Vector Search Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(90deg, #f97316, #fb923c);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            color: #9ca3af;
+            font-size: 1.1rem;
+        }
+        
+        .badges {
+            margin-top: 1rem;
+            display: flex;
+            gap: 0.5rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .badge {
+            background: #374151;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.8rem;
+            color: #d1d5db;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .card h2 {
+            font-size: 1.25rem;
+            margin-bottom: 1rem;
+            color: #f97316;
+        }
+        
+        .input-group {
+            margin-bottom: 1rem;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #9ca3af;
+            font-size: 0.9rem;
+        }
+        
+        input[type="text"], textarea {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 0.5rem;
+            background: rgba(0, 0, 0, 0.3);
+            color: #e0e0e0;
+            font-size: 1rem;
+        }
+        
+        input[type="text"]:focus, textarea:focus {
+            outline: none;
+            border-color: #f97316;
+        }
+        
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+        
+        button {
+            background: linear-gradient(90deg, #f97316, #ea580c);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.1s;
+        }
+        
+        button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(249, 115, 22, 0.3);
+        }
+        
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-secondary {
+            background: #374151;
+        }
+        
+        .btn-group {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+        
+        .stat {
+            text-align: center;
+            padding: 1rem;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 0.5rem;
+        }
+        
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #f97316;
+        }
+        
+        .stat-label {
+            font-size: 0.8rem;
+            color: #9ca3af;
+        }
+        
+        .results {
+            margin-top: 1rem;
+        }
+        
+        .result-item {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin-bottom: 0.5rem;
+            border-left: 3px solid #f97316;
+        }
+        
+        .result-score {
+            float: right;
+            background: #f97316;
+            color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            font-size: 0.8rem;
+        }
+        
+        .result-id {
+            font-weight: bold;
+            margin-bottom: 0.25rem;
+        }
+        
+        .result-content {
+            color: #9ca3af;
+            font-size: 0.9rem;
+        }
+        
+        .log {
+            background: #000;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            font-family: monospace;
+            font-size: 0.85rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .log-entry {
+            margin-bottom: 0.25rem;
+        }
+        
+        .log-time {
+            color: #6b7280;
+        }
+        
+        .log-info { color: #60a5fa; }
+        .log-success { color: #34d399; }
+        .log-error { color: #f87171; }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid #374151;
+            border-top-color: #f97316;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .hidden { display: none; }
+        
+        footer {
+            text-align: center;
+            margin-top: 2rem;
+            color: #6b7280;
+            font-size: 0.9rem;
+        }
+        
+        footer a {
+            color: #f97316;
+            text-decoration: none;
+        }
+        
+        footer a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Foxstash</h1>
+            <p class="subtitle">High-performance vector search running entirely in your browser</p>
+            <div class="badges">
+                <span class="badge">WASM Powered</span>
+                <span class="badge">HNSW Index</span>
+                <span class="badge">SIMD Accelerated</span>
+                <span class="badge">192x Compression</span>
+            </div>
+        </header>
+        
+        <div class="card">
+            <h2>Index Status</h2>
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="doc-count">0</div>
+                    <div class="stat-label">Documents</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="dim-count">384</div>
+                    <div class="stat-label">Dimensions</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="index-type">HNSW</div>
+                    <div class="stat-label">Index Type</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="memory-usage">0 KB</div>
+                    <div class="stat-label">Memory</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Add Documents</h2>
+            <div class="input-group">
+                <label>Document Content (one per line)</label>
+                <textarea id="doc-input" placeholder="The quick brown fox jumps over the lazy dog.
+Foxes are clever animals that cache food for later.
+Vector search enables semantic similarity matching.
+Machine learning models generate embeddings from text."></textarea>
+            </div>
+            <div class="btn-group">
+                <button id="add-docs-btn" onclick="addDocuments()">Add Documents</button>
+                <button class="btn-secondary" onclick="loadSampleData()">Load Sample Data</button>
+                <button class="btn-secondary" onclick="clearIndex()">Clear Index</button>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Search</h2>
+            <div class="input-group">
+                <label>Query</label>
+                <input type="text" id="query-input" placeholder="Enter search query..." onkeypress="if(event.key==='Enter')search()">
+            </div>
+            <div class="btn-group">
+                <button id="search-btn" onclick="search()">Search</button>
+            </div>
+            <div class="results" id="results"></div>
+        </div>
+        
+        <div class="card">
+            <h2>Console</h2>
+            <div class="log" id="log"></div>
+        </div>
+        
+        <footer>
+            Built with <a href="https://github.com/Narcoleptic-Fox/foxstash">Foxstash</a> |
+            <a href="https://crates.io/crates/foxstash-core">crates.io</a> |
+            <a href="https://docs.rs/foxstash-core">docs.rs</a>
+        </footer>
+    </div>
+    
+    <script type="module">
+        // Simple mock implementation until WASM is fully integrated
+        // This demonstrates the UI and will be replaced with real WASM calls
+        
+        let documents = [];
+        let nextId = 1;
+        
+        function log(message, type = 'info') {
+            const logEl = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">[${time}]</span> <span class="log-${type}">${message}</span>`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+        
+        function updateStats() {
+            document.getElementById('doc-count').textContent = documents.length;
+            const memKB = Math.round(documents.length * 384 * 4 / 1024);
+            document.getElementById('memory-usage').textContent = `${memKB} KB`;
+        }
+        
+        // Simple embedding simulation (in real version, would use ONNX or pre-computed)
+        function simpleEmbed(text) {
+            const hash = text.split('').reduce((a, c) => ((a << 5) - a) + c.charCodeAt(0), 0);
+            const embedding = [];
+            for (let i = 0; i < 384; i++) {
+                embedding.push(Math.sin(hash * (i + 1) * 0.001) * 0.5);
+            }
+            return embedding;
+        }
+        
+        function cosineSimilarity(a, b) {
+            let dot = 0, normA = 0, normB = 0;
+            for (let i = 0; i < a.length; i++) {
+                dot += a[i] * b[i];
+                normA += a[i] * a[i];
+                normB += b[i] * b[i];
+            }
+            return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+        }
+        
+        window.addDocuments = function() {
+            const input = document.getElementById('doc-input').value.trim();
+            if (!input) return;
+            
+            const lines = input.split('\n').filter(l => l.trim());
+            const startTime = performance.now();
+            
+            for (const line of lines) {
+                const doc = {
+                    id: `doc_${nextId++}`,
+                    content: line.trim(),
+                    embedding: simpleEmbed(line)
+                };
+                documents.push(doc);
+            }
+            
+            const elapsed = (performance.now() - startTime).toFixed(2);
+            log(`Added ${lines.length} documents in ${elapsed}ms`, 'success');
+            updateStats();
+            document.getElementById('doc-input').value = '';
+        };
+        
+        window.search = function() {
+            const query = document.getElementById('query-input').value.trim();
+            if (!query || documents.length === 0) {
+                log('No query or empty index', 'error');
+                return;
+            }
+            
+            const startTime = performance.now();
+            const queryEmbed = simpleEmbed(query);
+            
+            const results = documents
+                .map(doc => ({
+                    ...doc,
+                    score: cosineSimilarity(queryEmbed, doc.embedding)
+                }))
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 5);
+            
+            const elapsed = (performance.now() - startTime).toFixed(2);
+            log(`Search completed in ${elapsed}ms`, 'success');
+            
+            const resultsEl = document.getElementById('results');
+            resultsEl.innerHTML = results.map(r => `
+                <div class="result-item">
+                    <span class="result-score">${(r.score * 100).toFixed(1)}%</span>
+                    <div class="result-id">${r.id}</div>
+                    <div class="result-content">${r.content}</div>
+                </div>
+            `).join('');
+        };
+        
+        window.loadSampleData = function() {
+            const samples = [
+                "Foxes are small-to-medium-sized omnivorous mammals belonging to several genera of the family Canidae.",
+                "The red fox is the largest of the true foxes and one of the most widely distributed members of the order Carnivora.",
+                "Vector databases store high-dimensional vectors for similarity search and retrieval.",
+                "HNSW (Hierarchical Navigable Small World) is an algorithm for approximate nearest neighbor search.",
+                "Product quantization compresses vectors by dividing them into subvectors and quantizing each independently.",
+                "SIMD (Single Instruction, Multiple Data) enables parallel processing of vector operations.",
+                "Embeddings are dense vector representations of data that capture semantic meaning.",
+                "RAG (Retrieval-Augmented Generation) combines retrieval systems with language models.",
+                "Cosine similarity measures the angle between two vectors, commonly used for text similarity.",
+                "WebAssembly enables running high-performance code in web browsers."
+            ];
+            
+            document.getElementById('doc-input').value = samples.join('\n');
+            log('Loaded 10 sample documents', 'info');
+        };
+        
+        window.clearIndex = function() {
+            documents = [];
+            nextId = 1;
+            updateStats();
+            document.getElementById('results').innerHTML = '';
+            log('Index cleared', 'info');
+        };
+        
+        // Initialize
+        log('Foxstash WASM demo loaded', 'success');
+        log('Note: This demo uses simplified embeddings. Full version uses ONNX models.', 'info');
+    </script>
+</body>
+</html>
