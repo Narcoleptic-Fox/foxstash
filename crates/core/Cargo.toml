@@ -5,6 +5,7 @@ edition.workspace = true
 description = "High-performance local RAG library - SIMD-accelerated vector search, HNSW indexing"
 repository = "https://github.com/Narcoleptic-Fox/foxstash"
 license = "MIT"
+readme = "../../README.md"
 keywords = ["rag", "vector-search", "hnsw", "embeddings", "simd"]
 categories = ["algorithms", "data-structures", "science"]
 
