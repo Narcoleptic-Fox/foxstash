@@ -70,7 +70,16 @@ pub struct SerializedHNSWConfig {
     pub ef_construction: usize,
     pub ef_search: usize,
     pub ml: f32,
+    #[serde(default = "default_use_heuristic")]
+    pub use_heuristic: bool,
+    #[serde(default)]
+    pub extend_candidates: bool,
+    #[serde(default = "default_keep_pruned")]
+    pub keep_pruned_connections: bool,
 }
+
+fn default_use_heuristic() -> bool { true }
+fn default_keep_pruned() -> bool { true }
 
 /// Serializable representation of an HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,6 +541,9 @@ pub fn create_hnsw_index(
             ef_construction,
             ef_search,
             ml,
+            use_heuristic: true,
+            extend_candidates: false,
+            keep_pruned_connections: true,
         },
         nodes,
         entry_point,
@@ -581,6 +593,9 @@ pub fn serialize_hnsw_index(
             ef_construction: config.ef_construction,
             ef_search: config.ef_search,
             ml: config.ml,
+            use_heuristic: config.use_heuristic,
+            extend_candidates: config.extend_candidates,
+            keep_pruned_connections: config.keep_pruned_connections,
         },
         nodes,
         entry_point: index.entry_point(),
@@ -610,6 +625,9 @@ pub fn deserialize_hnsw_index(data: SerializedHNSWIndex) -> Result<foxstash_core
         ef_construction: data.config.ef_construction,
         ef_search: data.config.ef_search,
         ml: data.config.ml,
+        use_heuristic: data.config.use_heuristic,
+        extend_candidates: data.config.extend_candidates,
+        keep_pruned_connections: data.config.keep_pruned_connections,
     };
 
     let mut index = foxstash_core::index::HNSWIndex::new(data.embedding_dim, config);
