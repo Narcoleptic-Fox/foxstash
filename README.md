@@ -95,6 +95,62 @@ let results = binary_index.search_and_rerank(&query, 100, 10)?;
 
 *Binary recall improves significantly with two-phase search (filter + rerank).
 
+### Streaming Batch Ingestion
+
+For large datasets, use streaming batch ingestion with progress tracking:
+
+```rust
+use foxstash_core::index::{HNSWIndex, BatchBuilder, BatchConfig};
+use foxstash_core::Document;
+
+let mut index = HNSWIndex::with_defaults(384);
+
+// Configure batch processing with progress callback
+let config = BatchConfig::default()
+    .with_batch_size(1000)
+    .with_total(100_000)
+    .with_progress(|progress| {
+        println!(
+            "Indexed {}/{} ({:.1}%) - {:.0} docs/sec, ETA: {}s",
+            progress.completed,
+            progress.total.unwrap_or(0),
+            progress.percent().unwrap_or(0.0),
+            progress.docs_per_sec,
+            progress.eta_ms().unwrap_or(0) / 1000
+        );
+    });
+
+let mut builder = BatchBuilder::new(&mut index, config);
+
+// Stream documents from any source
+for doc in document_iterator {
+    builder.add(doc)?;
+}
+
+let result = builder.finish();
+println!("Indexed {} documents in {}ms", result.documents_indexed, result.elapsed_ms);
+```
+
+### Filtered Search with Pagination
+
+```rust
+use foxstash_core::index::{FilteredSearchBuilder, SearchPage};
+
+// Build filtered search
+let results = index.search(&query, 100)?;
+
+let filtered = FilteredSearchBuilder::new()
+    .min_score(0.7)
+    .has_metadata_field("category")
+    .metadata_equals("type", serde_json::json!("article"))
+    .max_results(50)
+    .apply(results);
+
+// Paginate results
+let page = SearchPage::from_results(filtered, 0, 10);
+println!("Page {}/{}, {} results", page.page + 1, page.total_pages, page.results.len());
+```
+
 ### With ONNX Embeddings
 
 Enable the `onnx` feature:
@@ -155,7 +211,7 @@ foxstash/
 ## Roadmap
 
 - [x] Int8/Binary quantization (4-32x memory reduction)
-- [ ] Streaming add/search for large datasets
+- [x] Streaming add/search for large datasets
 - [ ] Incremental persistence (delta updates)
 - [ ] Product quantization (PQ)
 - [ ] GPU acceleration (optional)

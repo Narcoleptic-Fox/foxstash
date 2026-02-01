@@ -707,6 +707,11 @@ impl BinaryHNSWIndex {
         self.nodes.len() * (binary_size + full_size + overhead_per_node)
     }
 
+    /// Get the embedding dimension
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
     fn random_level(&self) -> usize {
         let mut rng = rand::thread_rng();
         let uniform: f32 = rng.gen();
