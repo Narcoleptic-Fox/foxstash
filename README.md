@@ -95,6 +95,45 @@ let results = binary_index.search_and_rerank(&query, 100, 10)?;
 
 *Binary recall improves significantly with two-phase search (filter + rerank).
 
+### Product Quantization (Extreme Compression)
+
+For massive datasets, use Product Quantization for up to **192x compression**:
+
+```rust
+use foxstash_core::index::{PQHNSWIndex, PQHNSWConfig};
+use foxstash_core::vector::product_quantize::PQConfig;
+
+// Configure PQ: 8 subvectors, 256 centroids each
+let pq_config = PQConfig::new(384, 8, 8)
+    .with_kmeans_iterations(20);
+
+// Train on sample vectors
+let training_data = load_sample_vectors(10_000);
+let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default())?;
+
+// Add documents
+for doc in documents {
+    index.add(doc)?;
+}
+
+// Search using Asymmetric Distance Computation (ADC)
+// Full-precision query vs compressed database
+let results = index.search(&query, 10)?;
+
+println!("Compression: {:.0}x", index.compression_ratio());
+```
+
+#### PQ Memory Comparison (1M vectors × 384 dims)
+
+| Storage | Memory | Compression | Recall |
+|---------|--------|-------------|--------|
+| f32 | 1.5 GB | 1x | 100% |
+| SQ8 | 384 MB | 4x | ~95% |
+| Binary | 48 MB | 32x | ~85%* |
+| PQ (M=8) | 8 MB | 192x | ~80%** |
+
+*With reranking. **ADC search, improves with more subvectors.
+
 ### Streaming Batch Ingestion
 
 For large datasets, use streaming batch ingestion with progress tracking:
@@ -262,8 +301,10 @@ foxstash/
 - [x] Int8/Binary quantization (4-32x memory reduction)
 - [x] Streaming add/search for large datasets
 - [x] Incremental persistence (WAL + checkpointing)
-- [ ] Product quantization (PQ)
+- [x] Product quantization (PQ) - up to 192x compression
 - [ ] GPU acceleration (optional)
+- [ ] Hybrid search (sparse + dense vectors)
+- [ ] Multi-vector support (late interaction)
 
 ## License
 

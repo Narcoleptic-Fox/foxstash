@@ -37,11 +37,13 @@
 
 pub mod flat;
 pub mod hnsw;
+pub mod hnsw_pq;
 pub mod hnsw_quantized;
 pub mod streaming;
 
 pub use flat::FlatIndex;
 pub use hnsw::{HNSWConfig, HNSWIndex};
+pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
 pub use hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex};
 pub use streaming::{
     BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult,
