@@ -1,0 +1,83 @@
+[
+  {
+    "library": "FAISS",
+    "algorithm": "HNSW (M=16, ef=32)",
+    "build_time": 5.265170097351074,
+    "memory_mb": 66.375,
+    "recall@10": 0.26334,
+    "recall@100": 0.18987199999999999,
+    "qps": 77691.28749990738
+  },
+  {
+    "library": "FAISS",
+    "algorithm": "HNSW (M=16, ef=64)",
+    "build_time": 5.347680330276489,
+    "memory_mb": 62.125,
+    "recall@10": 0.39985,
+    "recall@100": 0.300001,
+    "qps": 55953.74612127502
+  },
+  {
+    "library": "FAISS",
+    "algorithm": "HNSW (M=16, ef=128)",
+    "build_time": 5.350919961929321,
+    "memory_mb": 63.375,
+    "recall@10": 0.56188,
+    "recall@100": 0.44581399999999993,
+    "qps": 32162.170244710764
+  },
+  {
+    "library": "hnswlib",
+    "algorithm": "HNSW (M=16, ef=32)",
+    "build_time": 4.388796806335449,
+    "memory_mb": 79.125,
+    "recall@10": 0.44215,
+    "recall@100": 0.33959700000000004,
+    "qps": 31222.022063749646
+  },
+  {
+    "library": "hnswlib",
+    "algorithm": "HNSW (M=16, ef=64)",
+    "build_time": 4.373553991317749,
+    "memory_mb": 66.0,
+    "recall@10": 0.4421,
+    "recall@100": 0.339575,
+    "qps": 31495.081972137057
+  },
+  {
+    "library": "hnswlib",
+    "algorithm": "HNSW (M=16, ef=128)",
+    "build_time": 4.346053838729858,
+    "memory_mb": 64.625,
+    "recall@10": 0.4991900000000001,
+    "recall@100": 0.391671,
+    "qps": 25332.098830302337
+  },
+  {
+    "library": "Annoy",
+    "algorithm": "Trees (n=10)",
+    "build_time": 0.6428353786468506,
+    "memory_mb": 87.125,
+    "recall@10": 0.07373,
+    "recall@100": 0.055466999999999995,
+    "qps": 9741.983885315849
+  },
+  {
+    "library": "Annoy",
+    "algorithm": "Trees (n=50)",
+    "build_time": 0.9745643138885498,
+    "memory_mb": 127.5,
+    "recall@10": 0.3081400000000001,
+    "recall@100": 0.24072,
+    "qps": 2203.912728228862
+  },
+  {
+    "library": "Annoy",
+    "algorithm": "Trees (n=100)",
+    "build_time": 1.3600192070007324,
+    "memory_mb": 187.5,
+    "recall@10": 0.5171100000000001,
+    "recall@100": 0.419145,
+    "qps": 1133.9186892698622
+  }
+]
