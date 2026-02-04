@@ -10,6 +10,9 @@ criterion.workspace = true
 rand.workspace = true
 tempfile = "3.8"
 
+# Comparison benchmarks
+instant-distance = "0.6"
+
 [[bench]]
 name = "embedding"
 harness = false
@@ -20,4 +23,8 @@ harness = false
 
 [[bench]]
 name = "full"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
