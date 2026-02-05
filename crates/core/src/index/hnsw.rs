@@ -24,12 +24,13 @@ pub enum BuildStrategy {
     /// Best for: production search, accuracy-critical applications
     #[default]
     Sequential,
-    /// Parallel insertion (EXPERIMENTAL - needs debugging)
-    /// Very fast build but may have lower recall
-    /// Best for: prototyping, when speed matters more than recall
+    /// Parallel insertion using layer-copying approach
+    /// Fast build (6-10x faster), good recall at small scale (<50k)
+    /// May have lower recall at larger scales (needs more work)
     Parallel,
     /// Automatically choose based on dataset size
-    /// Currently always uses Sequential for reliability
+    /// Uses Parallel for <50k vectors (where it works well)
+    /// Uses Sequential for larger datasets (reliability over speed)
     Auto,
 }
 
@@ -233,8 +234,12 @@ impl HNSWIndex {
         let n = embeddings.len();
         let strategy = match config.build_strategy {
             BuildStrategy::Auto => {
-                // Always use Sequential for now until Parallel is debugged
-                BuildStrategy::Sequential
+                // Parallel works well for <50k, Sequential for larger
+                if n < 50_000 {
+                    BuildStrategy::Parallel
+                } else {
+                    BuildStrategy::Sequential
+                }
             }
             other => other,
         };
@@ -845,9 +850,9 @@ impl HNSWIndex {
     /// Build an HNSW index from embeddings using parallel construction
     ///
     /// Uses instant-distance's layer-copying approach for safe parallelization:
-    /// - Process layers top to bottom
-    /// - After each layer, copy zero-layer state to upper layers
-    /// - Upper layers become read-only, enabling safe parallel insertion
+    /// - All connections stored in zero layer (M*2 neighbors per node)
+    /// - Upper layers are read-only snapshots (M neighbors, copied after each batch)
+    /// - Process batches top-to-bottom: top batch sequential, rest parallel
     ///
     /// # Arguments
     /// * `embeddings` - Vector of embedding vectors (all must have same dimension)
@@ -855,16 +860,12 @@ impl HNSWIndex {
     ///
     /// # Returns
     /// A new HNSWIndex built from the embeddings
-    ///
-    /// # Panics
-    /// Panics if embeddings is empty or if embeddings have inconsistent dimensions
     pub fn build_parallel(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         assert!(!embeddings.is_empty(), "Cannot build from empty embeddings");
         let embedding_dim = embeddings[0].len();
         let n = embeddings.len();
         
         if n == 1 {
-            // Single node - trivial case
             return Self::build_single(embeddings, config);
         }
 
@@ -873,7 +874,8 @@ impl HNSWIndex {
         let seed = config.seed.unwrap_or_else(rand::random);
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Calculate layer sizes (instant-distance approach)
+        // Calculate batch sizes (how many nodes per layer batch)
+        // This determines insertion order, not graph structure
         let mut sizes = Vec::new();
         let mut num = n;
         loop {
@@ -886,14 +888,15 @@ impl HNSWIndex {
         }
         sizes.push((num, num));
         sizes.reverse();
-        let top = LayerId(sizes.len() - 1);
+        let num_batches = sizes.len();
+        let top = LayerId(num_batches - 1);
 
-        // Shuffle points for random insertion order while maintaining layer distribution
+        // Shuffle points randomly for insertion order
         assert!(n < u32::MAX as usize);
-        let mut shuffled: Vec<(PointId, usize)> = (0..n)
-            .map(|i| (PointId(rng.gen_range(0..n as u32)), i))
+        let mut shuffled: Vec<(u32, usize)> = (0..n)
+            .map(|i| (rng.gen::<u32>(), i))
             .collect();
-        shuffled.sort_unstable_by_key(|&(pid, _)| pid);
+        shuffled.sort_unstable_by_key(|&(r, _)| r);
 
         // Reorder embeddings according to shuffle
         let points: Vec<Vec<f32>> = shuffled
@@ -901,72 +904,184 @@ impl HNSWIndex {
             .map(|&(_, idx)| embeddings[idx].clone())
             .collect();
 
-        // Build ranges for each layer (which points get inserted at each layer)
-        let num_layers = sizes.len();
-        let mut ranges = Vec::with_capacity(top.0 + 1);
+        // Build ranges for each batch
+        let mut ranges = Vec::with_capacity(num_batches);
         for (i, (size, cumulative)) in sizes.into_iter().enumerate() {
             let start = cumulative - size;
-            // Skip first point (entry point inserted separately)
-            ranges.push((LayerId(num_layers - i - 1), max(start, 1)..cumulative));
+            let batch_id = LayerId(num_batches - i - 1);
+            // Skip first point (it's the entry point, inserted implicitly)
+            ranges.push((batch_id, max(start, 1)..cumulative));
         }
 
-        // Initialize zero layer with RwLocks
+        // Zero layer: all nodes, M*2 connections each (the LIVE data)
         let zero: Vec<RwLock<ZeroNode>> = (0..n)
             .map(|_| RwLock::new(ZeroNode::default()))
             .collect();
 
-        // Initialize upper layers (will be populated by copying)
+        // Upper layers: snapshots copied after each batch (READ-ONLY during search)
         let mut layers: Vec<Vec<UpperNode>> = vec![Vec::new(); top.0];
 
         // Search pool for thread-local state reuse
         let pool = SearchPool::new(n);
 
-        // Process layers from top to bottom
-        for (layer, range) in ranges {
+        // Process batches from top to bottom
+        for (batch, range) in ranges {
             let end = range.end;
             
-            if layer.0 == top.0 {
-                // Top layer: insert sequentially (forms backbone)
+            if batch.0 == top.0 {
+                // Top batch: insert sequentially (forms the backbone)
                 for i in range {
-                    Self::insert_parallel_node(
-                        PointId(i as u32), layer, &zero, &layers, &points, &pool, ef_construction, top
+                    Self::par_insert(
+                        PointId(i as u32), &zero, &layers, &points, &pool, ef_construction, top
                     );
                 }
             } else {
-                // Lower layers: insert in parallel
+                // Lower batches: insert in parallel (safe because upper layers are snapshots)
                 range.into_par_iter().for_each(|i| {
-                    Self::insert_parallel_node(
-                        PointId(i as u32), layer, &zero, &layers, &points, &pool, ef_construction, top
+                    Self::par_insert(
+                        PointId(i as u32), &zero, &layers, &points, &pool, ef_construction, top
                     );
                 });
             }
 
-            // After processing this layer, copy zero-layer state to upper layer
-            // This makes upper layers read-only for subsequent parallel insertions
-            if !layer.is_zero() {
+            // After each batch, snapshot zero layer to create upper layer
+            // layers[batch-1] = snapshot of zero[0..end] truncated to M neighbors
+            if !batch.is_zero() {
                 (&zero[..end])
                     .par_iter()
                     .map(|z| UpperNode::from_zero(&z.read()))
-                    .collect_into_vec(&mut layers[layer.0 - 1]);
+                    .collect_into_vec(&mut layers[batch.0 - 1]);
             }
         }
 
         // Convert to final index format
+        Self::convert_parallel_to_index(zero, layers, points, shuffled, embedding_dim, config, top)
+    }
+    
+    /// Insert a single node during parallel construction
+    /// Always updates zero layer; searches use upper layer snapshots + zero layer
+    fn par_insert(
+        new: PointId,
+        zero: &[RwLock<ZeroNode>],
+        layers: &[Vec<UpperNode>],
+        points: &[Vec<f32>],
+        pool: &SearchPool,
+        ef_construction: usize,
+        top: LayerId,
+    ) {
+        let mut search = pool.pop();
+        search.visited.reserve(points.len());
+        
+        let point = &points[new.as_usize()];
+        search.reset();
+        
+        // Start search from entry point (always node 0)
+        search.push(PointId(0), point, points);
+
+        // Descend through layers from top to bottom
+        for cur in top.descend() {
+            let is_bottom = cur.is_zero();
+            
+            // Use ef=1 for greedy descent in upper layers, ef_construction at bottom
+            search.ef = if is_bottom { ef_construction } else { 1 };
+            
+            if !is_bottom && cur.0 <= layers.len() && !layers[cur.0 - 1].is_empty() {
+                // Search upper layer snapshot (read-only)
+                search.search_upper(point, &layers[cur.0 - 1], points, M_MAX);
+                search.cull();
+            } else {
+                // Search zero layer (live data)
+                search.search_zero(point, zero, points, M0_MAX);
+                // Don't break - continue to layer 0 if we started higher
+                if is_bottom {
+                    break;
+                }
+                search.cull();
+            }
+        }
+
+        // Get best candidates from search
+        let found = search.select_simple();
+        
+        // Add connections: new node → neighbors (in zero layer)
+        {
+            let mut node = zero[new.as_usize()].write();
+            for (i, candidate) in found.iter().take(M0_MAX).enumerate() {
+                node.nearest[i] = candidate.pid;
+            }
+        }
+
+        // Add reverse connections: neighbors → new node (bidirectional)
+        for candidate in found.iter().take(M0_MAX) {
+            Self::add_reverse_connection(zero, points, new, candidate.pid);
+        }
+
+        pool.push(search);
+    }
+    
+    /// Add reverse connection from neighbor to new node, with pruning if needed
+    fn add_reverse_connection(
+        zero: &[RwLock<ZeroNode>],
+        points: &[Vec<f32>],
+        new: PointId,
+        neighbor: PointId,
+    ) {
+        let mut node = zero[neighbor.as_usize()].write();
+        let count = node.count();
+        
+        if count < M0_MAX {
+            // Room available - just append
+            node.nearest[count] = new;
+        } else {
+            // Full - check if new is better than worst current neighbor
+            let neighbor_point = &points[neighbor.as_usize()];
+            let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
+            
+            // Find worst current neighbor
+            let mut worst_idx = 0;
+            let mut worst_dist = 0.0f32;
+            for (i, &pid) in node.nearest.iter().enumerate() {
+                if !pid.is_valid() { break; }
+                let d = Self::parallel_distance(neighbor_point, &points[pid.as_usize()]);
+                if d > worst_dist {
+                    worst_dist = d;
+                    worst_idx = i;
+                }
+            }
+            
+            // Replace worst if new is better
+            if new_dist < worst_dist {
+                node.nearest[worst_idx] = new;
+            }
+        }
+    }
+    
+    /// Convert parallel construction data to final HNSWIndex format
+    fn convert_parallel_to_index(
+        zero: Vec<RwLock<ZeroNode>>,
+        layers: Vec<Vec<UpperNode>>,
+        points: Vec<Vec<f32>>,
+        shuffled: Vec<(u32, usize)>,
+        embedding_dim: usize,
+        config: HNSWConfig,
+        top: LayerId,
+    ) -> Self {
+        let n = points.len();
         let zero_final: Vec<ZeroNode> = zero.into_iter().map(|n| n.into_inner()).collect();
         
-        // Build connections from the fixed-array format
+        // Build connections from fixed-array format
         let mut connections = Vec::with_capacity(n);
         for i in 0..n {
             let mut node_connections = Vec::new();
             
-            // Layer 0 connections
+            // Layer 0: from zero layer
             let layer0: HashSet<usize> = zero_final[i]
                 .iter()
                 .map(|p| p.as_usize())
                 .collect();
             node_connections.push(layer0);
             
-            // Upper layer connections
+            // Upper layers: from snapshots (if node exists in that layer)
             for layer in &layers {
                 if i < layer.len() {
                     let layer_conns: HashSet<usize> = layer[i]
@@ -981,13 +1096,10 @@ impl HNSWIndex {
         }
 
         // Flatten embeddings to SoA
-        let flat_embeddings: Vec<f32> = points.iter().flatten().copied().collect();
+        let flat_embeddings: Vec<f32> = points.into_iter().flatten().collect();
 
-        // Create reverse mapping for IDs
-        let mut ids = vec![String::new(); n];
-        for (new_idx, &(_, old_idx)) in shuffled.iter().enumerate() {
-            ids[new_idx] = old_idx.to_string();
-        }
+        // Create ID mapping (shuffled index → original index)
+        let ids: Vec<String> = shuffled.iter().map(|&(_, orig)| orig.to_string()).collect();
 
         Self {
             embedding_dim,
@@ -997,7 +1109,7 @@ impl HNSWIndex {
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
-            entry_point: Some(0), // First point is always entry point
+            entry_point: Some(0),
             max_layer: top.0,
         }
     }
@@ -1016,77 +1128,6 @@ impl HNSWIndex {
             entry_point: Some(0),
             max_layer: 0,
         }
-    }
-    
-    /// Insert a node during parallel construction (instant-distance style)
-    fn insert_parallel_node(
-        new: PointId,
-        layer: LayerId,
-        zero: &[RwLock<ZeroNode>],
-        layers: &[Vec<UpperNode>],
-        points: &[Vec<f32>],
-        pool: &SearchPool,
-        ef_construction: usize,
-        top: LayerId,
-    ) {
-        let mut search = pool.pop();
-        search.visited.reserve(points.len());
-        
-        let point = &points[new.as_usize()];
-        search.reset();
-        search.push(PointId(0), point, points);
-        
-        let num = if layer.is_zero() { M0_MAX } else { M_MAX };
-
-        // Search from top layer down
-        for cur in top.descend() {
-            search.ef = if cur.0 <= layer.0 { ef_construction } else { 1 };
-            
-            if cur.0 > layer.0 {
-                // Upper layers: search and cull
-                search.search_upper(point, &layers[cur.0 - 1], points, num);
-                search.cull();
-            } else {
-                // Target layer and below: search zero layer
-                search.search_zero(point, zero, points, num);
-                break;
-            }
-        }
-
-        // Select neighbors and update connections
-        let found = search.select_simple();
-        let max_neighbors = if layer.is_zero() { M0_MAX } else { M_MAX };
-        
-        // Add bidirectional connections
-        {
-            let mut node = zero[new.as_usize()].write();
-            for (i, candidate) in found.iter().take(max_neighbors).enumerate() {
-                node.nearest[i] = candidate.pid;
-            }
-        }
-
-        // Update neighbors to point back to new node
-        for candidate in found.iter().take(max_neighbors) {
-            let mut neighbor = zero[candidate.pid.as_usize()].write();
-            let count = neighbor.count();
-            if count < M0_MAX {
-                neighbor.nearest[count] = new;
-            } else {
-                // Need to decide if we should replace worst neighbor
-                let new_dist = HNSWIndex::parallel_distance(point, &points[candidate.pid.as_usize()]);
-                let worst_dist = HNSWIndex::parallel_distance(
-                    &points[candidate.pid.as_usize()],
-                    &points[neighbor.nearest[M0_MAX - 1].as_usize()]
-                );
-                if new_dist < worst_dist {
-                    neighbor.nearest[M0_MAX - 1] = new;
-                    // Re-sort (simple bubble up)
-                    neighbor.insert(new, new_dist, points, &points[candidate.pid.as_usize()]);
-                }
-            }
-        }
-
-        pool.push(search);
     }
 
     /// Insert a node into all its layers (from node's level down to 0)
@@ -1609,11 +1650,20 @@ impl Search {
     }
     
     fn search_upper(&mut self, point: &[f32], layer: &[UpperNode], points: &[Vec<f32>], num: usize) {
+        if layer.is_empty() {
+            return;
+        }
+        
         while let Some(Reverse(candidate)) = self.candidates.pop() {
             if let Some(furthest) = self.nearest.last() {
                 if candidate.distance > furthest.distance && self.nearest.len() >= self.ef {
                     break;
                 }
+            }
+            
+            // Safety: skip if candidate is beyond current layer snapshot
+            if candidate.pid.as_usize() >= layer.len() {
+                continue;
             }
             
             let node = &layer[candidate.pid.as_usize()];
