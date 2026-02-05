@@ -104,38 +104,46 @@ fn main() {
     // === Recall Check ===
     println!("\n--- Recall Check (100 queries, brute-force ground truth) ---");
     let recall_queries = 100;
-    let mut total_recall = 0.0;
+    let mut foxstash_total_recall = 0.0;
+    let mut id_total_recall = 0.0;
     
     for i in 0..recall_queries {
         let q = &query_vecs[i];
         
-        // Brute-force ground truth using cosine similarity (same as Foxstash)
-        let mut similarities: Vec<(f32, usize)> = base_vecs
+        // Brute-force ground truth using Euclidean distance (same as instant-distance)
+        let mut distances: Vec<(f32, usize)> = base_vecs
             .iter()
             .enumerate()
             .map(|(j, v)| {
-                // Cosine similarity
-                let dot: f32 = q.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
-                let norm_q: f32 = q.iter().map(|a| a * a).sum::<f32>().sqrt();
-                let norm_v: f32 = v.iter().map(|a| a * a).sum::<f32>().sqrt();
-                let sim = if norm_q > 0.0 && norm_v > 0.0 { dot / (norm_q * norm_v) } else { 0.0 };
-                (sim, j)
+                // Euclidean distance
+                let dist: f32 = q.iter().zip(v.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+                (dist, j)
             })
             .collect();
-        // Sort by similarity descending (highest first)
-        similarities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        let ground_truth: std::collections::HashSet<usize> = similarities.iter().take(K).map(|(_, j)| *j).collect();
+        // Sort by distance ascending (closest first)
+        distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let ground_truth: std::collections::HashSet<usize> = distances.iter().take(K).map(|(_, j)| *j).collect();
         
-        // Foxstash results
+        // Foxstash results (using Euclidean now)
         let results = index.search(q, K).unwrap();
         let foxstash_ids: std::collections::HashSet<usize> = results.iter().map(|r| r.id.parse().unwrap()).collect();
         
         let overlap = ground_truth.intersection(&foxstash_ids).count();
-        total_recall += overlap as f32 / K as f32;
+        foxstash_total_recall += overlap as f32 / K as f32;
+        
+        // instant-distance results
+        let query_point = Point(q.clone());
+        let id_results: Vec<_> = hnsw.search(&query_point, &mut search).take(K).collect();
+        let id_ids: std::collections::HashSet<usize> = id_results.iter().map(|item| *item.value).collect();
+        
+        let id_overlap = ground_truth.intersection(&id_ids).count();
+        id_total_recall += id_overlap as f32 / K as f32;
     }
     
-    let avg_recall = total_recall / recall_queries as f32;
-    println!("Foxstash Recall@{}: {:.2}%", K, avg_recall * 100.0);
+    let foxstash_avg_recall = foxstash_total_recall / recall_queries as f32;
+    let id_avg_recall = id_total_recall / recall_queries as f32;
+    println!("Foxstash Recall@{}: {:.2}%", K, foxstash_avg_recall * 100.0);
+    println!("instant-distance Recall@{}: {:.2}%", K, id_avg_recall * 100.0);
     
     // === Summary ===
     println!("\n=== SUMMARY ===");
