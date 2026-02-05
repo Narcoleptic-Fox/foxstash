@@ -230,10 +230,32 @@ foxstash/
 
 ## Benchmarks
 
+### HNSW Performance (100k vectors, 128d, Recall@10)
+
+| Library | Build Time | Search QPS | Recall |
+|---------|-----------|------------|--------|
+| **Foxstash** | **7.5s** | 863 | **61.0%** |
+| instant-distance (Rust) | 72.0s | 606 | 60.9% |
+| hnswlib (C++/Python) | 5.4s | 4,245 | 40.3% |
+| faiss-hnsw (C++/Python) | 8.0s | 3,277 | 46.4% |
+
+**Key takeaways:**
+- **9.6x faster build** than instant-distance with equivalent recall
+- **50% better recall** than hnswlib at similar build times
+- Best recall-to-speed ratio among tested libraries
+
+### Build Strategies
+
+| Strategy | Build Time | Search QPS | Recall | Use Case |
+|----------|-----------|------------|--------|----------|
+| Sequential | 578.9s | 817 | 59.0% | Maximum quality |
+| **Parallel** | **7.4s** | 808 | **59.7%** | Production (78x faster) |
+
 Run benchmarks with:
 
 ```bash
 cargo bench -p foxstash-benches
+cargo run -p foxstash-benches --example quick_comparison --release
 ```
 
 See `crates/benches/` for benchmark implementations.

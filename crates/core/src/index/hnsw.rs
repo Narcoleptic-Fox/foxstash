@@ -932,14 +932,14 @@ impl HNSWIndex {
                 // Top batch: insert sequentially (forms the backbone)
                 for i in range {
                     Self::par_insert(
-                        PointId(i as u32), &zero, &layers, &points, &pool, ef_construction, top
+                        PointId(i as u32), batch, &zero, &layers, &points, &pool, ef_construction, top
                     );
                 }
             } else {
                 // Lower batches: insert in parallel (safe because upper layers are snapshots)
                 range.into_par_iter().for_each(|i| {
                     Self::par_insert(
-                        PointId(i as u32), &zero, &layers, &points, &pool, ef_construction, top
+                        PointId(i as u32), batch, &zero, &layers, &points, &pool, ef_construction, top
                     );
                 });
             }
@@ -962,6 +962,7 @@ impl HNSWIndex {
     /// Always updates zero layer; searches use upper layer snapshots + zero layer
     fn par_insert(
         new: PointId,
+        target_layer: LayerId,  // The batch/layer this node belongs to
         zero: &[RwLock<ZeroNode>],
         layers: &[Vec<UpperNode>],
         points: &[Vec<f32>],
@@ -980,23 +981,21 @@ impl HNSWIndex {
 
         // Descend through layers from top to bottom
         for cur in top.descend() {
-            let is_bottom = cur.is_zero();
+            // Use ef=1 for greedy descent ABOVE target layer
+            // Use ef_construction at target layer and below
+            search.ef = if cur.0 <= target_layer.0 { ef_construction } else { 1 };
             
-            // Use ef=1 for greedy descent in upper layers, ef_construction at bottom
-            search.ef = if is_bottom { ef_construction } else { 1 };
-            
-            if !is_bottom && cur.0 <= layers.len() && !layers[cur.0 - 1].is_empty() {
-                // Search upper layer snapshot (read-only)
-                search.search_upper(point, &layers[cur.0 - 1], points, M_MAX);
-                search.cull();
-            } else {
-                // Search zero layer (live data)
-                search.search_zero(point, zero, points, M0_MAX);
-                // Don't break - continue to layer 0 if we started higher
-                if is_bottom {
-                    break;
+            if cur.0 > target_layer.0 {
+                // Above target layer: search upper layer snapshot, then cull
+                if cur.0 <= layers.len() && !layers[cur.0 - 1].is_empty() {
+                    search.search_upper(point, &layers[cur.0 - 1], points, M_MAX);
+                    search.cull();
                 }
-                search.cull();
+                // If snapshot doesn't exist, just continue descent
+            } else {
+                // At or below target layer: search zero layer and BREAK
+                search.search_zero(point, zero, points, M0_MAX);
+                break;  // Key fix: don't keep searching!
             }
         }
 
@@ -1019,7 +1018,8 @@ impl HNSWIndex {
         pool.push(search);
     }
     
-    /// Add reverse connection from neighbor to new node, with pruning if needed
+    /// Add reverse connection from neighbor to new node, maintaining SORTED order by distance
+    /// This is critical: UpperNode::from_zero takes the first M entries, so they must be the M closest
     fn add_reverse_connection(
         zero: &[RwLock<ZeroNode>],
         points: &[Vec<f32>],
@@ -1027,33 +1027,40 @@ impl HNSWIndex {
         neighbor: PointId,
     ) {
         let mut node = zero[neighbor.as_usize()].write();
+        let neighbor_point = &points[neighbor.as_usize()];
+        let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
+        
         let count = node.count();
         
-        if count < M0_MAX {
-            // Room available - just append
-            node.nearest[count] = new;
-        } else {
-            // Full - check if new is better than worst current neighbor
-            let neighbor_point = &points[neighbor.as_usize()];
-            let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
-            
-            // Find worst current neighbor
-            let mut worst_idx = 0;
-            let mut worst_dist = 0.0f32;
-            for (i, &pid) in node.nearest.iter().enumerate() {
-                if !pid.is_valid() { break; }
-                let d = Self::parallel_distance(neighbor_point, &points[pid.as_usize()]);
-                if d > worst_dist {
-                    worst_dist = d;
-                    worst_idx = i;
+        // Binary search for insertion position (sorted by distance, ascending)
+        let pos = {
+            let mut left = 0;
+            let mut right = count;
+            while left < right {
+                let mid = (left + right) / 2;
+                let mid_dist = Self::parallel_distance(neighbor_point, &points[node.nearest[mid].as_usize()]);
+                if mid_dist < new_dist {
+                    left = mid + 1;
+                } else {
+                    right = mid;
                 }
             }
-            
-            // Replace worst if new is better
-            if new_dist < worst_dist {
-                node.nearest[worst_idx] = new;
-            }
+            left
+        };
+        
+        // If position is beyond capacity, this node is worse than all current neighbors
+        if pos >= M0_MAX {
+            return;
         }
+        
+        // Shift elements right to make room, dropping the last if at capacity
+        let shift_end = count.min(M0_MAX - 1);
+        for i in (pos..shift_end).rev() {
+            node.nearest[i + 1] = node.nearest[i];
+        }
+        
+        // Insert at sorted position
+        node.nearest[pos] = new;
     }
     
     /// Convert parallel construction data to final HNSWIndex format
@@ -1067,29 +1074,35 @@ impl HNSWIndex {
         top: LayerId,
     ) -> Self {
         let n = points.len();
+        let num_layers = top.0 + 1;  // Total layers including layer 0
         let zero_final: Vec<ZeroNode> = zero.into_iter().map(|n| n.into_inner()).collect();
         
         // Build connections from fixed-array format
+        // IMPORTANT: All nodes must have connections at ALL layers for search to work
         let mut connections = Vec::with_capacity(n);
         for i in 0..n {
-            let mut node_connections = Vec::new();
+            let mut node_connections = Vec::with_capacity(num_layers);
             
-            // Layer 0: from zero layer
+            // Layer 0: from zero layer (M0 connections)
             let layer0: HashSet<usize> = zero_final[i]
                 .iter()
                 .map(|p| p.as_usize())
                 .collect();
-            node_connections.push(layer0);
+            node_connections.push(layer0.clone());
             
-            // Upper layers: from snapshots (if node exists in that layer)
+            // Upper layers: ONLY add connections where node actually existed in snapshot
+            // Nodes should NOT have fake connections at layers they don't belong to
+            // (This matches instant-distance's behavior where late nodes simply don't exist at upper layers)
             for layer in &layers {
                 if i < layer.len() {
+                    // Node exists in this snapshot - use its actual connections
                     let layer_conns: HashSet<usize> = layer[i]
                         .iter()
                         .map(|p| p.as_usize())
                         .collect();
                     node_connections.push(layer_conns);
                 }
+                // else: node doesn't exist at this layer - don't add fake connections!
             }
             
             connections.push(node_connections);
