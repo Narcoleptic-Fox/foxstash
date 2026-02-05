@@ -230,7 +230,9 @@ foxstash/
 
 ## Benchmarks
 
-### HNSW Performance (100k vectors, 128d, Recall@10)
+### HNSW Performance @ 100,000 Vectors
+
+*128 dimensions, Recall@10*
 
 | Library | Build Time | Search QPS | Recall |
 |---------|-----------|------------|--------|
@@ -244,7 +246,7 @@ foxstash/
 - **50% better recall** than hnswlib at similar build times
 - Best recall-to-speed ratio among tested libraries
 
-### Build Strategies
+### Build Strategies @ 100,000 Vectors
 
 | Strategy | Build Time | Search QPS | Recall | Use Case |
 |----------|-----------|------------|--------|----------|
