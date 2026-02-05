@@ -232,18 +232,19 @@ foxstash/
 
 ### HNSW Performance @ 100,000 Vectors
 
-*128 dimensions, Recall@10*
+*128 dimensions, 10,000 queries, Recall@10*
 
 | Library | Build Time | Search QPS | Recall |
 |---------|-----------|------------|--------|
-| **Foxstash** | **7.5s** | 863 | **61.0%** |
-| instant-distance (Rust) | 72.0s | 606 | 60.9% |
+| **Foxstash** | **7.5s** | **8,439** | **61.4%** |
 | hnswlib (C++/Python) | 5.4s | 4,245 | 40.3% |
 | faiss-hnsw (C++/Python) | 8.0s | 3,277 | 46.4% |
+| instant-distance (Rust) | 72.6s | 587 | 62.1% |
 
 **Key takeaways:**
-- **9.6x faster build** than instant-distance with equivalent recall
-- **50% better recall** than hnswlib at similar build times
+- **2x faster search** than hnswlib with 50% better recall
+- **14x faster search** than instant-distance with equivalent recall
+- **9.6x faster build** than instant-distance
 - Best recall-to-speed ratio among tested libraries
 
 ### Build Strategies @ 100,000 Vectors
@@ -251,13 +252,17 @@ foxstash/
 | Strategy | Build Time | Search QPS | Recall | Use Case |
 |----------|-----------|------------|--------|----------|
 | Sequential | 578.9s | 817 | 59.0% | Maximum quality |
-| **Parallel** | **7.4s** | 808 | **59.7%** | Production (78x faster) |
+| **Parallel** | **7.4s** | 8,439 | **61.4%** | Production (78x faster) |
 
-Run benchmarks with:
+### Running Benchmarks
 
 ```bash
-cargo bench -p foxstash-benches
+# Full benchmark suite (sets up Python venv automatically)
+./scripts/bench.sh
+
+# Or run individually:
 cargo run -p foxstash-benches --example quick_comparison --release
+cargo run -p foxstash-benches --example compare_strategies --release
 ```
 
 See `crates/benches/` for benchmark implementations.

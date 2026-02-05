@@ -93,10 +93,9 @@ fn main() {
     let fs_build_time = start.elapsed();
     println!("Build time: {:?}", fs_build_time);
     
+    // Use fast batch search with parallel execution
     let start = Instant::now();
-    for q in &query_vecs {
-        let _ = index.search(q, K);
-    }
+    let _ = index.search_batch_fast(&query_vecs, K);
     let fs_search_time = start.elapsed();
     let fs_qps = NUM_QUERIES as f64 / fs_search_time.as_secs_f64();
     println!("Search time: {:?} ({:.0} QPS)", fs_search_time, fs_qps);
