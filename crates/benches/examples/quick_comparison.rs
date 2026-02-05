@@ -5,8 +5,8 @@
 use instant_distance::{Builder, Search};
 use std::time::Instant;
 
-const NUM_VECTORS: usize = 100_000;
-const NUM_QUERIES: usize = 10_000;
+const NUM_VECTORS: usize = 10_000;
+const NUM_QUERIES: usize = 1_000;
 const DIM: usize = 128;
 const K: usize = 10;
 
@@ -16,14 +16,24 @@ fn generate_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     
     (0..count)
         .map(|i| {
-            (0..dim)
+            let mut vec: Vec<f32> = (0..dim)
                 .map(|j| {
                     let mut hasher = DefaultHasher::new();
                     (seed, i, j).hash(&mut hasher);
                     let h = hasher.finish();
-                    (h % 256) as f32
+                    // Center around 0 for better distribution
+                    ((h % 256) as f32 - 128.0)
                 })
-                .collect()
+                .collect();
+            
+            // Normalize to unit length (required for cosine similarity)
+            let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in &mut vec {
+                    *x /= norm;
+                }
+            }
+            vec
         })
         .collect()
 }
@@ -71,24 +81,15 @@ fn main() {
     let id_qps = NUM_QUERIES as f64 / id_search_time.as_secs_f64();
     println!("Search time: {:?} ({:.0} QPS)", id_search_time, id_qps);
     
-    // === Foxstash ===
-    println!("\n--- Foxstash ---");
-    use foxstash_core::index::hnsw::{HNSWConfig, HNSWIndex};
-    use foxstash_core::Document;
+    // === Foxstash Sequential ===
+    println!("\n--- Foxstash (sequential) ---");
+    use foxstash_core::index::{BuildStrategy, HNSWConfig, HNSWIndex};
     
-    let config = HNSWConfig::default();
-    let mut index = HNSWIndex::new(DIM, config);
+    let config = HNSWConfig::default()
+        .with_build_strategy(BuildStrategy::Sequential);
     
     let start = Instant::now();
-    for (i, vec) in base_vecs.iter().enumerate() {
-        let doc = Document {
-            id: i.to_string(),
-            content: String::new(),
-            embedding: vec.clone(),
-            metadata: None,
-        };
-        let _ = index.add(doc);
-    }
+    let index = HNSWIndex::build(base_vecs.clone(), config);
     let fs_build_time = start.elapsed();
     println!("Build time: {:?}", fs_build_time);
     
@@ -99,6 +100,42 @@ fn main() {
     let fs_search_time = start.elapsed();
     let fs_qps = NUM_QUERIES as f64 / fs_search_time.as_secs_f64();
     println!("Search time: {:?} ({:.0} QPS)", fs_search_time, fs_qps);
+    
+    // === Recall Check ===
+    println!("\n--- Recall Check (100 queries, brute-force ground truth) ---");
+    let recall_queries = 100;
+    let mut total_recall = 0.0;
+    
+    for i in 0..recall_queries {
+        let q = &query_vecs[i];
+        
+        // Brute-force ground truth using cosine similarity (same as Foxstash)
+        let mut similarities: Vec<(f32, usize)> = base_vecs
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                // Cosine similarity
+                let dot: f32 = q.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                let norm_q: f32 = q.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let norm_v: f32 = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let sim = if norm_q > 0.0 && norm_v > 0.0 { dot / (norm_q * norm_v) } else { 0.0 };
+                (sim, j)
+            })
+            .collect();
+        // Sort by similarity descending (highest first)
+        similarities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let ground_truth: std::collections::HashSet<usize> = similarities.iter().take(K).map(|(_, j)| *j).collect();
+        
+        // Foxstash results
+        let results = index.search(q, K).unwrap();
+        let foxstash_ids: std::collections::HashSet<usize> = results.iter().map(|r| r.id.parse().unwrap()).collect();
+        
+        let overlap = ground_truth.intersection(&foxstash_ids).count();
+        total_recall += overlap as f32 / K as f32;
+    }
+    
+    let avg_recall = total_recall / recall_queries as f32;
+    println!("Foxstash Recall@{}: {:.2}%", K, avg_recall * 100.0);
     
     // === Summary ===
     println!("\n=== SUMMARY ===");

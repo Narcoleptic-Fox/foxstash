@@ -911,6 +911,8 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             use_heuristic: wrapper.use_heuristic,
             extend_candidates: wrapper.extend_candidates,
             keep_pruned_connections: wrapper.keep_pruned_connections,
+            build_strategy: crate::index::BuildStrategy::default(),
+            seed: None,
         }
     }
 }
