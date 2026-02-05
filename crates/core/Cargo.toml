@@ -20,6 +20,10 @@ ort = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 lru = { workspace = true, optional = true }
 
+# Parallelism
+rayon = "1.10"
+parking_lot = "0.12"
+
 # SIMD dependencies
 pulp = "0.18"
 
