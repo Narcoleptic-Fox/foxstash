@@ -5,8 +5,8 @@
 use instant_distance::{Builder, Search};
 use std::time::Instant;
 
-const NUM_VECTORS: usize = 10_000;
-const NUM_QUERIES: usize = 1_000;
+const NUM_VECTORS: usize = 100_000;
+const NUM_QUERIES: usize = 10_000;
 const DIM: usize = 128;
 const K: usize = 10;
 
@@ -86,7 +86,7 @@ fn main() {
     use foxstash_core::index::{BuildStrategy, HNSWConfig, HNSWIndex};
     
     let config = HNSWConfig::default()
-        .with_build_strategy(BuildStrategy::Sequential);
+        .with_build_strategy(BuildStrategy::Parallel);
     
     let start = Instant::now();
     let index = HNSWIndex::build(base_vecs.clone(), config);
