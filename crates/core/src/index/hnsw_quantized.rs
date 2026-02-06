@@ -952,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_sq8_hnsw_basic() {
-        let mut index = SQ8HNSWIndex::for_normalized(128, QuantizedHNSWConfig::default());
+        let index = SQ8HNSWIndex::for_normalized(128, QuantizedHNSWConfig::default());
         assert_eq!(index.len(), 0);
         assert!(index.is_empty());
     }
@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_binary_hnsw_basic() {
-        let mut index = BinaryHNSWIndex::new(128, QuantizedHNSWConfig::default());
+        let index = BinaryHNSWIndex::new(128, QuantizedHNSWConfig::default());
         assert_eq!(index.len(), 0);
         assert!(index.is_empty());
     }

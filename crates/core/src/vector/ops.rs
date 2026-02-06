@@ -588,7 +588,7 @@ mod tests {
         let similarity = cosine_similarity(&a, &b).unwrap();
 
         // Should still be in valid range despite large values
-        assert!(similarity >= -1.0 && similarity <= 1.0);
+        assert!((-1.0..=1.0).contains(&similarity));
     }
 
     #[test]
@@ -599,6 +599,6 @@ mod tests {
         let similarity = cosine_similarity(&a, &b).unwrap();
 
         // Should still compute valid similarity
-        assert!(similarity >= -1.0 && similarity <= 1.0);
+        assert!((-1.0..=1.0).contains(&similarity));
     }
 }

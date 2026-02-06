@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn test_new_storage() {
         let dir = tempdir().unwrap();
-        let storage = FileStorage::new(dir.path()).unwrap();
+        let _storage = FileStorage::new(dir.path()).unwrap();
         assert!(dir.path().exists());
         assert!(dir.path().is_dir());
     }
@@ -977,7 +977,7 @@ mod tests {
     #[test]
     fn test_new_storage_with_codec() {
         let dir = tempdir().unwrap();
-        let storage = FileStorage::with_codec(dir.path(), Codec::Gzip).unwrap();
+        let _storage = FileStorage::with_codec(dir.path(), Codec::Gzip).unwrap();
         assert!(dir.path().exists());
     }
 
@@ -1210,6 +1210,7 @@ mod tests {
         let dir = tempdir().unwrap();
 
         // Test with different codecs
+        #[allow(unused_mut)]
         let mut codecs = vec![Codec::None, Codec::Gzip];
 
         #[cfg(feature = "zstd")]

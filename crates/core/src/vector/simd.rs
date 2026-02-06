@@ -506,7 +506,7 @@ mod tests {
         let scalar_result = cosine_similarity(&a, &b).unwrap();
 
         assert!((simd_result - scalar_result).abs() < EPSILON);
-        assert!(simd_result >= -1.0 && simd_result <= 1.0);
+        assert!((-1.0..=1.0).contains(&simd_result));
 
         // Test with small values
         let a = vec![1e-6; 384];
@@ -516,7 +516,7 @@ mod tests {
         let scalar_result = cosine_similarity(&a, &b).unwrap();
 
         assert!((simd_result - scalar_result).abs() < EPSILON);
-        assert!(simd_result >= -1.0 && simd_result <= 1.0);
+        assert!((-1.0..=1.0).contains(&simd_result));
     }
 
     #[test]

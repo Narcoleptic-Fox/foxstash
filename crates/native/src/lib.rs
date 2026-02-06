@@ -62,7 +62,7 @@ use std::ptr;
 // =============================================================================
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 /// Set the last error message for this thread

@@ -202,7 +202,7 @@ fn parse_header(data: &[u8]) -> Result<(Codec, usize), CompressionError> {
 pub fn best_codec() -> Codec {
     #[cfg(feature = "lz4")]
     {
-        return Codec::Lz4;
+        Codec::Lz4
     }
 
     #[cfg(all(feature = "zstd", not(feature = "lz4")))]

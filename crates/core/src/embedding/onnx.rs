@@ -228,8 +228,8 @@ impl OnnxEmbedder {
             // Pad to max_length
             let padding_length = max_length - ids.len();
             if padding_length > 0 {
-                input_ids.extend(std::iter::repeat(0).take(padding_length));
-                attention_mask.extend(std::iter::repeat(0).take(padding_length));
+                input_ids.extend(std::iter::repeat_n(0, padding_length));
+                attention_mask.extend(std::iter::repeat_n(0, padding_length));
             }
         }
 
@@ -367,7 +367,7 @@ fn mean_pooling(hidden_states: &Array2<f32>, attention_mask: &[i64]) -> Result<V
     for (i, &mask_value) in attention_mask.iter().enumerate() {
         if mask_value > 0 {
             let token_embedding = hidden_states.row(i);
-            summed = summed + &token_embedding;
+            summed = summed + token_embedding;
             mask_sum += 1.0;
         }
     }
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_embedding_dim() {
-        let mut embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")
+        let embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")
             .expect("Failed to create embedder");
 
         assert_eq!(

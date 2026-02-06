@@ -38,7 +38,8 @@ impl Ord for OrderedFloat {
 /// Reusable search context to avoid allocations during search
 /// Provides ~2-3x speedup over allocating new structures each query
 pub struct SearchContext {
-    /// Bitset for visited nodes (much faster than HashSet)
+    /// Bitset for visited nodes (reserved for future optimization)
+    #[allow(dead_code)]
     visited: Vec<u64>,
     /// Generation counter to avoid clearing visited bitset
     generation: u64,
@@ -75,7 +76,7 @@ impl SearchContext {
     fn is_visited(&self, node: usize) -> bool {
         self.node_generation
             .get(node)
-            .map_or(false, |&g| g == self.generation)
+            .is_some_and(|&g| g == self.generation)
     }
 
     /// Mark node as visited
@@ -340,7 +341,7 @@ impl HNSWIndex {
             })
             .collect();
 
-        let max_level = *levels.iter().max().unwrap_or(&0);
+        let _max_level = *levels.iter().max().unwrap_or(&0);
 
         // Sort by level descending
         let mut sorted_indices: Vec<usize> = (0..n).collect();
@@ -1225,7 +1226,7 @@ impl HNSWIndex {
             // After each batch, snapshot zero layer to create upper layer
             // layers[batch-1] = snapshot of zero[0..end] truncated to M neighbors
             if !batch.is_zero() {
-                (&zero[..end])
+                zero[..end]
                     .par_iter()
                     .map(|z| UpperNode::from_zero(&z.read()))
                     .collect_into_vec(&mut layers[batch.0 - 1]);
@@ -1238,6 +1239,7 @@ impl HNSWIndex {
 
     /// Insert a single node during parallel construction
     /// Always updates zero layer; searches use upper layer snapshots + zero layer
+    #[allow(clippy::too_many_arguments)]
     fn par_insert(
         new: PointId,
         target_layer: LayerId, // The batch/layer this node belongs to
@@ -1422,6 +1424,8 @@ impl HNSWIndex {
     }
 
     /// Insert a node into all its layers (from node's level down to 0)
+    /// Reserved for future parallel construction improvements
+    #[allow(dead_code)]
     fn parallel_insert_node(
         nodes: &[RwLock<ParallelNode>],
         node_id: usize,
@@ -1491,6 +1495,7 @@ impl HNSWIndex {
     }
 
     /// Search layer for single nearest neighbor (greedy)
+    #[allow(dead_code)]
     fn parallel_search_layer_single(
         nodes: &[RwLock<ParallelNode>],
         query: &[f32],
@@ -1529,6 +1534,7 @@ impl HNSWIndex {
     }
 
     /// Search layer for ef nearest neighbors (supports multiple entry points)
+    #[allow(dead_code)]
     fn parallel_search_layer(
         nodes: &[RwLock<ParallelNode>],
         query: &[f32],
@@ -1597,6 +1603,7 @@ impl HNSWIndex {
 
     /// Select best neighbors using heuristic selection (Algorithm 4 from HNSW paper)
     /// This ensures graph diversity and better connectivity
+    #[allow(dead_code)]
     fn parallel_select_neighbors(
         nodes: &[RwLock<ParallelNode>],
         query: &[f32],
@@ -1678,6 +1685,7 @@ impl HNSWIndex {
 }
 
 /// Node structure for parallel construction (legacy)
+#[allow(dead_code)]
 struct ParallelNode {
     id: String,
     embedding: Vec<f32>,
@@ -1725,6 +1733,7 @@ impl Default for ZeroNode {
     }
 }
 
+#[allow(dead_code)]
 impl ZeroNode {
     /// Count of valid neighbors
     fn count(&self) -> usize {
@@ -1803,6 +1812,7 @@ struct Visited {
     generation: u8,
 }
 
+#[allow(dead_code)]
 impl Visited {
     fn new(capacity: usize) -> Self {
         Self {
@@ -2203,7 +2213,7 @@ mod tests {
     fn test_search_exact_match() {
         let mut index = HNSWIndex::with_defaults(3);
 
-        let embedding = vec![0.5, 0.5, 0.7071];
+        let embedding = vec![0.5, 0.5, 0.7072];
         let doc = create_test_document("doc1", embedding.clone());
         index.add(doc).unwrap();
 
