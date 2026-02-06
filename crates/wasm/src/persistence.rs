@@ -37,8 +37,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    IdbDatabase, IdbOpenDbRequest, IdbTransaction,
-    IdbTransactionMode, IdbVersionChangeEvent,
+    IdbDatabase, IdbOpenDbRequest, IdbTransaction, IdbTransactionMode, IdbVersionChangeEvent,
 };
 
 const DB_NAME: &str = "foxstash-db";
@@ -78,8 +77,12 @@ pub struct SerializedHNSWConfig {
     pub keep_pruned_connections: bool,
 }
 
-fn default_use_heuristic() -> bool { true }
-fn default_keep_pruned() -> bool { true }
+fn default_use_heuristic() -> bool {
+    true
+}
+fn default_keep_pruned() -> bool {
+    true
+}
 
 /// Serializable representation of an HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,9 +205,7 @@ impl IndexedDBStore {
         // Create a readwrite transaction
         let transaction = db
             .transaction_with_str_and_mode(&self.store_name, IdbTransactionMode::Readwrite)
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to create transaction: {:?}", e))
-            })?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to create transaction: {:?}", e)))?;
 
         let store = transaction
             .object_store(&self.store_name)
@@ -254,9 +255,7 @@ impl IndexedDBStore {
 
         let transaction = db
             .transaction_with_str_and_mode(&self.store_name, IdbTransactionMode::Readonly)
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to create transaction: {:?}", e))
-            })?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to create transaction: {:?}", e)))?;
 
         let store = transaction
             .object_store(&self.store_name)
@@ -302,9 +301,7 @@ impl IndexedDBStore {
 
         let transaction = db
             .transaction_with_str_and_mode(&self.store_name, IdbTransactionMode::Readwrite)
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to create transaction: {:?}", e))
-            })?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to create transaction: {:?}", e)))?;
 
         let store = transaction
             .object_store(&self.store_name)
@@ -340,9 +337,7 @@ impl IndexedDBStore {
 
         let transaction = db
             .transaction_with_str_and_mode(&self.store_name, IdbTransactionMode::Readonly)
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to create transaction: {:?}", e))
-            })?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to create transaction: {:?}", e)))?;
 
         let store = transaction
             .object_store(&self.store_name)
@@ -392,9 +387,7 @@ impl IndexedDBStore {
 
         let transaction = db
             .transaction_with_str_and_mode(&self.store_name, IdbTransactionMode::Readwrite)
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to create transaction: {:?}", e))
-            })?;
+            .map_err(|e| JsValue::from_str(&format!("Failed to create transaction: {:?}", e)))?;
 
         let store = transaction
             .object_store(&self.store_name)
@@ -604,7 +597,9 @@ pub fn serialize_hnsw_index(
 }
 
 /// Deserializes a SerializedFlatIndex to FlatIndex
-pub fn deserialize_flat_index(data: SerializedFlatIndex) -> Result<foxstash_core::index::FlatIndex, String> {
+pub fn deserialize_flat_index(
+    data: SerializedFlatIndex,
+) -> Result<foxstash_core::index::FlatIndex, String> {
     let mut index = foxstash_core::index::FlatIndex::new(data.embedding_dim);
 
     for doc in data.documents {
@@ -615,7 +610,9 @@ pub fn deserialize_flat_index(data: SerializedFlatIndex) -> Result<foxstash_core
 }
 
 /// Deserializes a SerializedHNSWIndex to HNSWIndex
-pub fn deserialize_hnsw_index(data: SerializedHNSWIndex) -> Result<foxstash_core::index::HNSWIndex, String> {
+pub fn deserialize_hnsw_index(
+    data: SerializedHNSWIndex,
+) -> Result<foxstash_core::index::HNSWIndex, String> {
     use foxstash_core::index::HNSWConfig;
     use foxstash_core::Document;
 
@@ -819,10 +816,7 @@ mod wasm_tests {
         for i in 1..=3 {
             let persisted = create_persisted_index(format!("test-{}", i), serialized.clone(), 0);
             let js_value = to_js_value(&persisted).unwrap();
-            store
-                .save(&format!("key-{}", i), js_value)
-                .await
-                .unwrap();
+            store.save(&format!("key-{}", i), js_value).await.unwrap();
         }
 
         let keys = store.list_keys().await.unwrap();

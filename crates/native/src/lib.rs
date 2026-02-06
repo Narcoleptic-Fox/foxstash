@@ -48,14 +48,14 @@
 //! }
 //! ```
 
-use foxstash_core::{Document, SearchResult as CoreSearchResult};
 use foxstash_core::index::{FlatIndex, HNSWIndex};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
+use foxstash_core::{Document, SearchResult as CoreSearchResult};
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::ptr;
-use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
+use std::ptr;
 
 // =============================================================================
 // Thread-local Error Storage
@@ -69,9 +69,8 @@ thread_local! {
 fn set_last_error(err: String) {
     LAST_ERROR.with(|e| {
         // Ensure error string is valid C string
-        let err_cstring = CString::new(err).unwrap_or_else(|_| {
-            CString::new("Error message contains null bytes").unwrap()
-        });
+        let err_cstring = CString::new(err)
+            .unwrap_or_else(|_| CString::new("Error message contains null bytes").unwrap());
         *e.borrow_mut() = Some(err_cstring);
     });
 }
@@ -115,7 +114,8 @@ impl RagIndex for FlatIndex {
 
     fn save(&self, storage: &FileStorage, name: &str) -> Result<(), String> {
         let wrapper = FlatIndexWrapper::from_index(self);
-        storage.save_flat_index(name, &wrapper)
+        storage
+            .save_flat_index(name, &wrapper)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -140,7 +140,8 @@ impl RagIndex for HNSWIndex {
 
     fn save(&self, storage: &FileStorage, name: &str) -> Result<(), String> {
         let wrapper = HNSWIndexWrapper::from_index(self);
-        storage.save_hnsw_index(name, &wrapper)
+        storage
+            .save_hnsw_index(name, &wrapper)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -795,11 +796,9 @@ pub extern "C" fn rag_count(handle: *const RagHandle) -> usize {
         return 0;
     }
 
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        unsafe {
-            let handle = &*handle;
-            handle.index.len()
-        }
+    let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        let handle = &*handle;
+        handle.index.len()
     }));
 
     result.unwrap_or(0)
@@ -831,12 +830,10 @@ pub extern "C" fn rag_clear(handle: *mut RagHandle) -> i32 {
         return -1;
     }
 
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        unsafe {
-            let handle = &mut *handle;
-            handle.index.clear();
-            0
-        }
+    let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        let handle = &mut *handle;
+        handle.index.clear();
+        0
     }));
 
     match result {
@@ -873,11 +870,9 @@ pub extern "C" fn rag_clear(handle: *mut RagHandle) -> i32 {
 /// ```
 #[no_mangle]
 pub extern "C" fn rag_last_error() -> *const c_char {
-    LAST_ERROR.with(|e| {
-        match e.borrow().as_ref() {
-            Some(err) => err.as_ptr(),
-            None => ptr::null(),
-        }
+    LAST_ERROR.with(|e| match e.borrow().as_ref() {
+        Some(err) => err.as_ptr(),
+        None => ptr::null(),
     })
 }
 

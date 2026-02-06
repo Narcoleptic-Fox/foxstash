@@ -16,7 +16,7 @@ const K: usize = 10;
 fn generate_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
     (0..count)
         .map(|i| {
             (0..dim)
@@ -50,18 +50,18 @@ impl instant_distance::Point for Point {
 fn bench_instant_distance(c: &mut Criterion) {
     let mut group = c.benchmark_group("instant_distance");
     group.sample_size(10); // Fewer samples for slower benchmarks
-    
+
     // Generate data
     println!("Generating {} vectors...", NUM_VECTORS);
     let base_vecs = generate_vectors(NUM_VECTORS, DIM, 42);
     let query_vecs = generate_vectors(NUM_QUERIES, DIM, 123);
-    
+
     let points: Vec<Point> = base_vecs.iter().map(|v| Point(v.clone())).collect();
     let queries: Vec<Point> = query_vecs.iter().map(|v| Point(v.clone())).collect();
-    
+
     // Values are just indices
     let values: Vec<usize> = (0..NUM_VECTORS).collect();
-    
+
     // Build benchmark
     group.bench_function("build_100k", |b| {
         b.iter(|| {
@@ -69,13 +69,13 @@ fn bench_instant_distance(c: &mut Criterion) {
             black_box(hnsw)
         })
     });
-    
+
     // Build once for search benchmarks
     println!("Building instant-distance index...");
     let start = Instant::now();
     let hnsw = Builder::default().build(points.clone(), values.clone());
     println!("Build time: {:?}", start.elapsed());
-    
+
     // Search benchmark
     group.throughput(Throughput::Elements(NUM_QUERIES as u64));
     group.bench_function("search_100k_10nn", |b| {
@@ -87,22 +87,22 @@ fn bench_instant_distance(c: &mut Criterion) {
             }
         })
     });
-    
+
     group.finish();
 }
 
 fn bench_foxstash(c: &mut Criterion) {
     use foxstash_core::index::hnsw::{HNSWConfig, HNSWIndex};
     use foxstash_core::Document;
-    
+
     let mut group = c.benchmark_group("foxstash");
     group.sample_size(10);
-    
+
     // Generate data
     println!("Generating {} vectors...", NUM_VECTORS);
     let base_vecs = generate_vectors(NUM_VECTORS, DIM, 42);
     let query_vecs = generate_vectors(NUM_QUERIES, DIM, 123);
-    
+
     // Build benchmark
     group.bench_function("build_100k", |b| {
         b.iter(|| {
@@ -120,7 +120,7 @@ fn bench_foxstash(c: &mut Criterion) {
             black_box(index)
         })
     });
-    
+
     // Build once for search benchmarks
     println!("Building Foxstash index...");
     let config = HNSWConfig::default();
@@ -136,7 +136,7 @@ fn bench_foxstash(c: &mut Criterion) {
         let _ = index.add(doc);
     }
     println!("Build time: {:?}", start.elapsed());
-    
+
     // Search benchmark
     group.throughput(Throughput::Elements(NUM_QUERIES as u64));
     group.bench_function("search_100k_10nn", |b| {
@@ -147,7 +147,7 @@ fn bench_foxstash(c: &mut Criterion) {
             }
         })
     });
-    
+
     group.finish();
 }
 
