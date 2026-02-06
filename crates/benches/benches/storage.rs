@@ -36,14 +36,12 @@
 //! cargo bench -p foxstash-benches file_storage
 //! ```
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
-use foxstash_core::{Document, Result};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
-use rand::{Rng, SeedableRng};
+use foxstash_core::{Document, Result};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::time::Duration;
 
 // ============================================================================
@@ -118,12 +116,7 @@ mod data_gen {
     /// on best-case scenarios.
     pub fn repeated_pattern(size: usize) -> Vec<u8> {
         let pattern = b"The quick brown fox jumps over the lazy dog. ";
-        pattern
-            .iter()
-            .cycle()
-            .take(size)
-            .copied()
-            .collect()
+        pattern.iter().cycle().take(size).copied().collect()
     }
 
     /// Generate a test document with specified content size
@@ -142,9 +135,7 @@ mod data_gen {
         };
 
         // Generate random embedding
-        let embedding: Vec<f32> = (0..dim)
-            .map(|_| rng.gen::<f32>() * 2.0 - 1.0)
-            .collect();
+        let embedding: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
 
         Document {
             id: id.to_string(),
@@ -162,12 +153,7 @@ mod data_gen {
         let mut index = FlatIndex::new(dim);
 
         for i in 0..doc_count {
-            let doc = test_document(
-                &format!("doc_{}", i),
-                100,
-                dim,
-                seed + i as u64,
-            );
+            let doc = test_document(&format!("doc_{}", i), 100, dim, seed + i as u64);
             index.add(doc).unwrap();
         }
 
@@ -179,12 +165,7 @@ mod data_gen {
         let mut index = HNSWIndex::with_defaults(dim);
 
         for i in 0..doc_count {
-            let doc = test_document(
-                &format!("doc_{}", i),
-                100,
-                dim,
-                seed + i as u64,
-            );
+            let doc = test_document(&format!("doc_{}", i), 100, dim, seed + i as u64);
             index.add(doc).unwrap();
         }
 
@@ -261,21 +242,19 @@ fn benchmark_compression_codecs(c: &mut Criterion) {
         ("repeated", data_gen::repeated_pattern(size)),
     ];
 
-    for codec in [MockCodec::None, MockCodec::Gzip, MockCodec::Lz4, MockCodec::Zstd] {
+    for codec in [
+        MockCodec::None,
+        MockCodec::Gzip,
+        MockCodec::Lz4,
+        MockCodec::Zstd,
+    ] {
         for (data_type, data) in &test_data {
             // Benchmark compression
             group.throughput(Throughput::Bytes(data.len() as u64));
             group.bench_with_input(
-                BenchmarkId::new(
-                    format!("{}_compress", codec.name()),
-                    data_type,
-                ),
+                BenchmarkId::new(format!("{}_compress", codec.name()), data_type),
                 data,
-                |b, data| {
-                    b.iter(|| {
-                        codec.compress(black_box(data)).unwrap()
-                    })
-                },
+                |b, data| b.iter(|| codec.compress(black_box(data)).unwrap()),
             );
 
             // Pre-compress data for decompression benchmark
@@ -284,15 +263,10 @@ fn benchmark_compression_codecs(c: &mut Criterion) {
             // Benchmark decompression
             group.throughput(Throughput::Bytes(compressed.len() as u64));
             group.bench_with_input(
-                BenchmarkId::new(
-                    format!("{}_decompress", codec.name()),
-                    data_type,
-                ),
+                BenchmarkId::new(format!("{}_decompress", codec.name()), data_type),
                 &compressed,
                 |b, compressed_data| {
-                    b.iter(|| {
-                        codec.decompress(black_box(compressed_data)).unwrap()
-                    })
+                    b.iter(|| codec.decompress(black_box(compressed_data)).unwrap())
                 },
             );
 
@@ -326,15 +300,9 @@ fn benchmark_compression_sizes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(data.len() as u64));
 
         for codec in [MockCodec::Lz4, MockCodec::Zstd, MockCodec::Gzip] {
-            group.bench_with_input(
-                BenchmarkId::new(codec.name(), size),
-                &data,
-                |b, data| {
-                    b.iter(|| {
-                        codec.compress(black_box(data)).unwrap()
-                    })
-                },
-            );
+            group.bench_with_input(BenchmarkId::new(codec.name(), size), &data, |b, data| {
+                b.iter(|| codec.compress(black_box(data)).unwrap())
+            });
         }
     }
 
@@ -357,21 +325,13 @@ fn benchmark_serialization(c: &mut Criterion) {
     let dim = 384;
 
     // Document serialization - different sizes
-    for (size_name, content_size) in [
-        ("small", 100),
-        ("medium", 1_000),
-        ("large", 10_000),
-    ] {
+    for (size_name, content_size) in [("small", 100), ("medium", 1_000), ("large", 10_000)] {
         let doc = data_gen::test_document("doc_1", content_size, dim, 999);
 
         group.bench_with_input(
             BenchmarkId::new("serialize_document", size_name),
             &doc,
-            |b, doc| {
-                b.iter(|| {
-                    bincode::serialize(black_box(doc)).unwrap()
-                })
-            },
+            |b, doc| b.iter(|| bincode::serialize(black_box(doc)).unwrap()),
         );
 
         let serialized = bincode::serialize(&doc).unwrap();
@@ -384,11 +344,7 @@ fn benchmark_serialization(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("deserialize_document", size_name),
             &serialized,
-            |b, data| {
-                b.iter(|| {
-                    bincode::deserialize::<Document>(black_box(data)).unwrap()
-                })
-            },
+            |b, data| b.iter(|| bincode::deserialize::<Document>(black_box(data)).unwrap()),
         );
     }
 
@@ -604,26 +560,22 @@ fn benchmark_batch_operations(c: &mut Criterion) {
             .collect();
 
         // Benchmark batch save
-        group.bench_with_input(
-            BenchmarkId::new("save_batch", count),
-            &docs,
-            |b, docs| {
-                b.iter_batched(
-                    || tempfile::tempdir().unwrap(),
-                    |temp_dir| {
-                        // Save each document
-                        for (i, doc) in docs.iter().enumerate() {
-                            let serialized = bincode::serialize(black_box(doc)).unwrap();
-                            let compressed = MockCodec::Lz4.compress(&serialized).unwrap();
-                            let path = temp_dir.path().join(format!("doc_{}.bin", i));
-                            std::fs::write(path, compressed).unwrap();
-                        }
-                        temp_dir
-                    },
-                    criterion::BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("save_batch", count), &docs, |b, docs| {
+            b.iter_batched(
+                || tempfile::tempdir().unwrap(),
+                |temp_dir| {
+                    // Save each document
+                    for (i, doc) in docs.iter().enumerate() {
+                        let serialized = bincode::serialize(black_box(doc)).unwrap();
+                        let compressed = MockCodec::Lz4.compress(&serialized).unwrap();
+                        let path = temp_dir.path().join(format!("doc_{}.bin", i));
+                        std::fs::write(path, compressed).unwrap();
+                    }
+                    temp_dir
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
 
         // Prepare files for load benchmark
         let temp_dir = tempfile::tempdir().unwrap();
@@ -685,8 +637,15 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 (
                     tempfile::tempdir().unwrap(),
                     (0..100)
-                        .map(|i| data_gen::test_document(&format!("doc_{}", i), 500, dim, 6000 + i as u64))
-                        .collect::<Vec<_>>()
+                        .map(|i| {
+                            data_gen::test_document(
+                                &format!("doc_{}", i),
+                                500,
+                                dim,
+                                6000 + i as u64,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
             },
             |(temp_dir, docs)| {
@@ -756,7 +715,14 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 std::fs::write(&path, compressed).unwrap();
 
                 let new_docs: Vec<Document> = (0..10)
-                    .map(|i| data_gen::test_document(&format!("new_doc_{}", i), 500, dim, 9000 + i as u64))
+                    .map(|i| {
+                        data_gen::test_document(
+                            &format!("new_doc_{}", i),
+                            500,
+                            dim,
+                            9000 + i as u64,
+                        )
+                    })
                     .collect();
 
                 (temp_dir, path, new_docs)

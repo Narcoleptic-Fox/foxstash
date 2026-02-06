@@ -73,7 +73,9 @@ impl SearchContext {
     /// Check if node was visited in current search
     #[inline]
     fn is_visited(&self, node: usize) -> bool {
-        self.node_generation.get(node).map_or(false, |&g| g == self.generation)
+        self.node_generation
+            .get(node)
+            .map_or(false, |&g| g == self.generation)
     }
 
     /// Mark node as visited
@@ -147,7 +149,7 @@ pub struct HNSWConfig {
 
 impl Default for HNSWConfig {
     fn default() -> Self {
-        let m = 32;  // Match instant-distance for good recall
+        let m = 32; // Match instant-distance for good recall
         Self {
             m,
             m0: m * 2,
@@ -213,7 +215,7 @@ impl HNSWConfig {
 }
 
 /// HNSW index for efficient similarity search
-/// 
+///
 /// Uses Struct-of-Arrays (SoA) layout for better cache locality:
 /// - Hot path: embeddings stored contiguously for SIMD-friendly access
 /// - Cold path: document metadata stored separately
@@ -222,16 +224,16 @@ pub struct HNSWIndex {
     embedding_dim: usize,
     /// Configuration parameters
     config: HNSWConfig,
-    
+
     // === HOT PATH (accessed during every distance computation) ===
     /// All embeddings stored contiguously: embeddings[i * dim .. (i+1) * dim]
     embeddings: Vec<f32>,
-    
+
     // === GRAPH STRUCTURE ===
     /// Connections for each node at each layer: connections[node_id][layer] -> neighbors
     /// Uses Vec<u32> instead of HashSet for cache-friendly traversal (4-5x faster search)
     connections: Vec<Vec<Vec<u32>>>,
-    
+
     // === COLD PATH (only accessed when returning results) ===
     /// Document IDs
     ids: Vec<String>,
@@ -239,7 +241,7 @@ pub struct HNSWIndex {
     contents: Vec<String>,
     /// Document metadata
     metadata: Vec<Option<serde_json::Value>>,
-    
+
     /// Entry point (node index with highest layer)
     entry_point: Option<usize>,
     /// Maximum layer in the index
@@ -299,7 +301,7 @@ impl HNSWIndex {
         if embeddings.is_empty() {
             return Self::new(0, config);
         }
-        
+
         let n = embeddings.len();
         let strategy = match config.build_strategy {
             BuildStrategy::Auto => {
@@ -312,22 +314,24 @@ impl HNSWIndex {
             }
             other => other,
         };
-        
+
         match strategy {
             BuildStrategy::Sequential => Self::build_sequential(embeddings, config),
-            BuildStrategy::Parallel | BuildStrategy::Auto => Self::build_parallel(embeddings, config),
+            BuildStrategy::Parallel | BuildStrategy::Auto => {
+                Self::build_parallel(embeddings, config)
+            }
         }
     }
-    
+
     /// Build using sequential insertion (high recall, slower)
     fn build_sequential(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         let embedding_dim = embeddings[0].len();
         let n = embeddings.len();
-        
+
         let seed = config.seed.unwrap_or_else(rand::random);
         let mut rng = StdRng::seed_from_u64(seed);
         let ml = config.ml;
-        
+
         // Pre-generate all node levels
         let levels: Vec<usize> = (0..n)
             .map(|_| {
@@ -335,55 +339,55 @@ impl HNSWIndex {
                 (-r.ln() * ml).floor() as usize
             })
             .collect();
-        
+
         let max_level = *levels.iter().max().unwrap_or(&0);
-        
+
         // Sort by level descending
         let mut sorted_indices: Vec<usize> = (0..n).collect();
         sorted_indices.sort_by(|&a, &b| levels[b].cmp(&levels[a]));
-        
+
         // Create index
         let mut index = Self::new(embedding_dim, config);
-        
+
         // Pre-allocate
         index.embeddings.reserve(n * embedding_dim);
         index.connections.reserve(n);
         index.ids.reserve(n);
         index.contents.reserve(n);
         index.metadata.reserve(n);
-        
+
         // Add nodes in sorted order
         for &i in &sorted_indices {
             let level = levels[i];
             let node_id = index.len();
-            
+
             // Create connections (using Vec<u32> for cache-friendly traversal)
             let mut node_connections: Vec<Vec<u32>> = Vec::with_capacity(level + 1);
             for _ in 0..=level {
                 node_connections.push(Vec::new());
             }
-            
+
             // Add to storage
             index.embeddings.extend_from_slice(&embeddings[i]);
             index.connections.push(node_connections);
             index.ids.push(i.to_string());
             index.contents.push(String::new());
             index.metadata.push(None);
-            
+
             if index.entry_point.is_none() {
                 index.entry_point = Some(node_id);
                 index.max_layer = level;
                 continue;
             }
-            
+
             index.insert_node(node_id, level);
-            
+
             if level > index.max_layer {
                 index.max_layer = level;
                 index.entry_point = Some(node_id);
             }
         }
-        
+
         index
     }
 
@@ -457,7 +461,7 @@ impl HNSWIndex {
     }
 
     /// Add just an embedding vector (faster than add() for bulk operations)
-    /// 
+    ///
     /// This method is optimized for benchmarks and bulk data loading where
     /// you only need to store embeddings without document content.
     ///
@@ -573,7 +577,7 @@ impl HNSWIndex {
     /// Returns error if any query dimension doesn't match index dimension
     pub fn search_batch(&self, queries: &[Vec<f32>], k: usize) -> Result<Vec<Vec<SearchResult>>> {
         use rayon::prelude::*;
-        
+
         queries
             .par_iter()
             .map(|query| self.search(query, k))
@@ -581,14 +585,14 @@ impl HNSWIndex {
     }
 
     /// Creates a reusable search context for faster repeated searches
-    /// 
+    ///
     /// Use with `search_with_context` for ~2-3x speedup when doing many queries
     pub fn create_search_context(&self) -> SearchContext {
         SearchContext::new(self.len())
     }
 
     /// Fast search using a reusable context (avoids allocations)
-    /// 
+    ///
     /// ~2-3x faster than `search()` when doing many queries.
     /// Create context once with `create_search_context()`, reuse for all queries.
     pub fn search_with_context(
@@ -642,21 +646,27 @@ impl HNSWIndex {
     }
 
     /// Fast batch search using reusable contexts
-    pub fn search_batch_fast(&self, queries: &[Vec<f32>], k: usize) -> Result<Vec<Vec<SearchResult>>> {
+    pub fn search_batch_fast(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+    ) -> Result<Vec<Vec<SearchResult>>> {
         use rayon::prelude::*;
         use std::cell::RefCell;
-        
+
         // Thread-local search contexts
         thread_local! {
             static CTX: RefCell<Option<SearchContext>> = const { RefCell::new(None) };
         }
-        
+
         queries
             .par_iter()
             .map(|query| {
                 CTX.with(|ctx| {
                     let mut ctx_ref = ctx.borrow_mut();
-                    if ctx_ref.is_none() || ctx_ref.as_ref().unwrap().node_generation.len() < self.len() {
+                    if ctx_ref.is_none()
+                        || ctx_ref.as_ref().unwrap().node_generation.len() < self.len()
+                    {
                         *ctx_ref = Some(SearchContext::new(self.len()));
                     }
                     self.search_with_context(query, k, ctx_ref.as_mut().unwrap())
@@ -752,7 +762,12 @@ impl HNSWIndex {
 
         // Insert into layers from top to bottom
         for layer in (0..=node_level).rev() {
-            current_nearest = self.search_layer(&node_embedding, &current_nearest, self.config.ef_construction, layer);
+            current_nearest = self.search_layer(
+                &node_embedding,
+                &current_nearest,
+                self.config.ef_construction,
+                layer,
+            );
 
             // Determine M for this layer
             let m = if layer == 0 {
@@ -800,7 +815,8 @@ impl HNSWIndex {
                             layer,
                         );
 
-                        self.connections[neighbor_id][layer] = pruned.into_iter().map(|x| x as u32).collect();
+                        self.connections[neighbor_id][layer] =
+                            pruned.into_iter().map(|x| x as u32).collect();
                     }
                 }
             }
@@ -920,22 +936,25 @@ impl HNSWIndex {
             if layer < self.connections[current_id].len() {
                 let neighbors = &self.connections[current_id][layer];
                 let n_neighbors = neighbors.len();
-                
+
                 for (i, &neighbor_u32) in neighbors.iter().enumerate() {
                     let neighbor_id = neighbor_u32 as usize;
-                    
+
                     // Prefetch next neighbor's embedding while processing current
                     if i + 1 < n_neighbors {
                         let next_id = neighbors[i + 1] as usize;
-                        let next_ptr = self.embeddings.as_ptr().wrapping_add(next_id * self.embedding_dim);
+                        let next_ptr = self
+                            .embeddings
+                            .as_ptr()
+                            .wrapping_add(next_id * self.embedding_dim);
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T0}>(
-                                next_ptr as *const i8
+                            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                                next_ptr as *const i8,
                             );
                         }
                     }
-                    
+
                     if !ctx.is_visited(neighbor_id) {
                         ctx.mark_visited(neighbor_id);
 
@@ -962,7 +981,8 @@ impl HNSWIndex {
         }
 
         // Extract and return node IDs sorted by distance
-        let mut results: Vec<(f32, usize)> = ctx.best
+        let mut results: Vec<(f32, usize)> = ctx
+            .best
             .drain()
             .map(|(OrderedFloat(dist), id)| (dist, id))
             .collect();
@@ -1111,7 +1131,7 @@ impl HNSWIndex {
         assert!(!embeddings.is_empty(), "Cannot build from empty embeddings");
         let embedding_dim = embeddings[0].len();
         let n = embeddings.len();
-        
+
         if n == 1 {
             return Self::build_single(embeddings, config);
         }
@@ -1140,9 +1160,7 @@ impl HNSWIndex {
 
         // Shuffle points randomly for insertion order
         assert!(n < u32::MAX as usize);
-        let mut shuffled: Vec<(u32, usize)> = (0..n)
-            .map(|i| (rng.gen::<u32>(), i))
-            .collect();
+        let mut shuffled: Vec<(u32, usize)> = (0..n).map(|i| (rng.gen::<u32>(), i)).collect();
         shuffled.sort_unstable_by_key(|&(r, _)| r);
 
         // Reorder embeddings according to shuffle
@@ -1161,9 +1179,8 @@ impl HNSWIndex {
         }
 
         // Zero layer: all nodes, M*2 connections each (the LIVE data)
-        let zero: Vec<RwLock<ZeroNode>> = (0..n)
-            .map(|_| RwLock::new(ZeroNode::default()))
-            .collect();
+        let zero: Vec<RwLock<ZeroNode>> =
+            (0..n).map(|_| RwLock::new(ZeroNode::default())).collect();
 
         // Upper layers: snapshots copied after each batch (READ-ONLY during search)
         let mut layers: Vec<Vec<UpperNode>> = vec![Vec::new(); top.0];
@@ -1174,19 +1191,33 @@ impl HNSWIndex {
         // Process batches from top to bottom
         for (batch, range) in ranges {
             let end = range.end;
-            
+
             if batch.0 == top.0 {
                 // Top batch: insert sequentially (forms the backbone)
                 for i in range {
                     Self::par_insert(
-                        PointId(i as u32), batch, &zero, &layers, &points, &pool, ef_construction, top
+                        PointId(i as u32),
+                        batch,
+                        &zero,
+                        &layers,
+                        &points,
+                        &pool,
+                        ef_construction,
+                        top,
                     );
                 }
             } else {
                 // Lower batches: insert in parallel (safe because upper layers are snapshots)
                 range.into_par_iter().for_each(|i| {
                     Self::par_insert(
-                        PointId(i as u32), batch, &zero, &layers, &points, &pool, ef_construction, top
+                        PointId(i as u32),
+                        batch,
+                        &zero,
+                        &layers,
+                        &points,
+                        &pool,
+                        ef_construction,
+                        top,
                     );
                 });
             }
@@ -1204,12 +1235,12 @@ impl HNSWIndex {
         // Convert to final index format
         Self::convert_parallel_to_index(zero, layers, points, shuffled, embedding_dim, config, top)
     }
-    
+
     /// Insert a single node during parallel construction
     /// Always updates zero layer; searches use upper layer snapshots + zero layer
     fn par_insert(
         new: PointId,
-        target_layer: LayerId,  // The batch/layer this node belongs to
+        target_layer: LayerId, // The batch/layer this node belongs to
         zero: &[RwLock<ZeroNode>],
         layers: &[Vec<UpperNode>],
         points: &[Vec<f32>],
@@ -1219,10 +1250,10 @@ impl HNSWIndex {
     ) {
         let mut search = pool.pop();
         search.visited.reserve(points.len());
-        
+
         let point = &points[new.as_usize()];
         search.reset();
-        
+
         // Start search from entry point (always node 0)
         search.push(PointId(0), point, points);
 
@@ -1230,8 +1261,12 @@ impl HNSWIndex {
         for cur in top.descend() {
             // Use ef=1 for greedy descent ABOVE target layer
             // Use ef_construction at target layer and below
-            search.ef = if cur.0 <= target_layer.0 { ef_construction } else { 1 };
-            
+            search.ef = if cur.0 <= target_layer.0 {
+                ef_construction
+            } else {
+                1
+            };
+
             if cur.0 > target_layer.0 {
                 // Above target layer: search upper layer snapshot, then cull
                 if cur.0 <= layers.len() && !layers[cur.0 - 1].is_empty() {
@@ -1242,13 +1277,13 @@ impl HNSWIndex {
             } else {
                 // At or below target layer: search zero layer and BREAK
                 search.search_zero(point, zero, points, M0_MAX);
-                break;  // Key fix: don't keep searching!
+                break; // Key fix: don't keep searching!
             }
         }
 
         // Get best candidates from search
         let found = search.select_simple();
-        
+
         // Add connections: new node → neighbors (in zero layer)
         {
             let mut node = zero[new.as_usize()].write();
@@ -1264,7 +1299,7 @@ impl HNSWIndex {
 
         pool.push(search);
     }
-    
+
     /// Add reverse connection from neighbor to new node, maintaining SORTED order by distance
     /// This is critical: UpperNode::from_zero takes the first M entries, so they must be the M closest
     fn add_reverse_connection(
@@ -1276,16 +1311,17 @@ impl HNSWIndex {
         let mut node = zero[neighbor.as_usize()].write();
         let neighbor_point = &points[neighbor.as_usize()];
         let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
-        
+
         let count = node.count();
-        
+
         // Binary search for insertion position (sorted by distance, ascending)
         let pos = {
             let mut left = 0;
             let mut right = count;
             while left < right {
                 let mid = (left + right) / 2;
-                let mid_dist = Self::parallel_distance(neighbor_point, &points[node.nearest[mid].as_usize()]);
+                let mid_dist =
+                    Self::parallel_distance(neighbor_point, &points[node.nearest[mid].as_usize()]);
                 if mid_dist < new_dist {
                     left = mid + 1;
                 } else {
@@ -1294,22 +1330,22 @@ impl HNSWIndex {
             }
             left
         };
-        
+
         // If position is beyond capacity, this node is worse than all current neighbors
         if pos >= M0_MAX {
             return;
         }
-        
+
         // Shift elements right to make room, dropping the last if at capacity
         let shift_end = count.min(M0_MAX - 1);
         for i in (pos..shift_end).rev() {
             node.nearest[i + 1] = node.nearest[i];
         }
-        
+
         // Insert at sorted position
         node.nearest[pos] = new;
     }
-    
+
     /// Convert parallel construction data to final HNSWIndex format
     fn convert_parallel_to_index(
         zero: Vec<RwLock<ZeroNode>>,
@@ -1321,37 +1357,32 @@ impl HNSWIndex {
         top: LayerId,
     ) -> Self {
         let n = points.len();
-        let num_layers = top.0 + 1;  // Total layers including layer 0
+        let num_layers = top.0 + 1; // Total layers including layer 0
         let zero_final: Vec<ZeroNode> = zero.into_iter().map(|n| n.into_inner()).collect();
-        
+
         // Build connections from fixed-array format
         // Uses Vec<u32> for cache-friendly traversal (4-5x faster than HashSet)
         let mut connections: Vec<Vec<Vec<u32>>> = Vec::with_capacity(n);
         for i in 0..n {
             let mut node_connections: Vec<Vec<u32>> = Vec::with_capacity(num_layers);
-            
+
             // Layer 0: from zero layer (M0 connections)
-            let layer0: Vec<u32> = zero_final[i]
-                .iter()
-                .map(|p| p.as_usize() as u32)
-                .collect();
+            let layer0: Vec<u32> = zero_final[i].iter().map(|p| p.as_usize() as u32).collect();
             node_connections.push(layer0);
-            
+
             // Upper layers: ONLY add connections where node actually existed in snapshot
             // Nodes should NOT have fake connections at layers they don't belong to
             // (This matches instant-distance's behavior where late nodes simply don't exist at upper layers)
             for layer in &layers {
                 if i < layer.len() {
                     // Node exists in this snapshot - use its actual connections
-                    let layer_conns: Vec<u32> = layer[i]
-                        .iter()
-                        .map(|p| p.as_usize() as u32)
-                        .collect();
+                    let layer_conns: Vec<u32> =
+                        layer[i].iter().map(|p| p.as_usize() as u32).collect();
                     node_connections.push(layer_conns);
                 }
                 // else: node doesn't exist at this layer - don't add fake connections!
             }
-            
+
             connections.push(node_connections);
         }
 
@@ -1373,7 +1404,7 @@ impl HNSWIndex {
             max_layer: top.0,
         }
     }
-    
+
     /// Build single-node index (trivial case)
     fn build_single(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         let embedding_dim = embeddings[0].len();
@@ -1413,12 +1444,13 @@ impl HNSWIndex {
         for layer in (0..=node_level).rev() {
             // Search for neighbors at this layer (using multiple entry points!)
             let ef = config.ef_construction;
-            let neighbors = Self::parallel_search_layer(nodes, &node_embedding, &current_nearest, ef, layer);
+            let neighbors =
+                Self::parallel_search_layer(nodes, &node_embedding, &current_nearest, ef, layer);
 
             // Select M best neighbors (simple: just take closest M)
             let m = if layer == 0 { config.m0 } else { config.m };
             let selected: Vec<usize> = neighbors.iter().take(m).copied().collect();
-            
+
             // Use ALL search results as entry points for next layer (not just selected!)
             current_nearest = neighbors;
 
@@ -1443,16 +1475,18 @@ impl HNSWIndex {
                         // Prune if over capacity
                         if neighbor.connections[layer].len() > m {
                             let neighbor_emb = neighbor.embedding.clone();
-                            let conns: Vec<usize> = neighbor.connections[layer].iter().copied().collect();
+                            let conns: Vec<usize> =
+                                neighbor.connections[layer].iter().copied().collect();
                             drop(neighbor);
 
-                            let pruned = Self::parallel_select_neighbors(nodes, &neighbor_emb, &conns, m);
-                            nodes[neighbor_id].write().connections[layer] = pruned.into_iter().collect();
+                            let pruned =
+                                Self::parallel_select_neighbors(nodes, &neighbor_emb, &conns, m);
+                            nodes[neighbor_id].write().connections[layer] =
+                                pruned.into_iter().collect();
                         }
                     }
                 }
             }
-
         }
     }
 
@@ -1518,7 +1552,10 @@ impl HNSWIndex {
         while let Some(Reverse((OrderedFloat(c_dist), current))) = candidates.pop() {
             // Only exit early if we have enough candidates AND current is worse than worst
             if best.len() >= ef {
-                let worst_best = best.peek().map(|(OrderedFloat(d), _)| *d).unwrap_or(f32::MAX);
+                let worst_best = best
+                    .peek()
+                    .map(|(OrderedFloat(d), _)| *d)
+                    .unwrap_or(f32::MAX);
                 if c_dist > worst_best {
                     break;
                 }
@@ -1536,7 +1573,10 @@ impl HNSWIndex {
             for neighbor in neighbors {
                 if visited.insert(neighbor) {
                     let dist = Self::parallel_distance(query, &nodes[neighbor].read().embedding);
-                    let worst = best.peek().map(|(OrderedFloat(d), _)| *d).unwrap_or(f32::MAX);
+                    let worst = best
+                        .peek()
+                        .map(|(OrderedFloat(d), _)| *d)
+                        .unwrap_or(f32::MAX);
 
                     if dist < worst || best.len() < ef {
                         candidates.push(Reverse((OrderedFloat(dist), neighbor)));
@@ -1580,7 +1620,7 @@ impl HNSWIndex {
         // Heuristic selection: ensure diversity by checking if candidate
         // is closer to query than to any already-selected neighbor
         let mut selected: Vec<usize> = Vec::with_capacity(m);
-        
+
         for (dist_to_query, candidate_id) in scored {
             if selected.len() >= m {
                 break;
@@ -1618,7 +1658,7 @@ impl HNSWIndex {
                 .collect();
             let mut sorted = scored;
             sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            
+
             for (_, id) in sorted {
                 if selected.len() >= m {
                     break;
@@ -1664,7 +1704,7 @@ impl PointId {
     fn as_usize(self) -> usize {
         self.0 as usize
     }
-    
+
     fn is_valid(self) -> bool {
         self.0 != INVALID
     }
@@ -1690,27 +1730,29 @@ impl ZeroNode {
     fn count(&self) -> usize {
         self.nearest.iter().take_while(|p| p.is_valid()).count()
     }
-    
+
     /// Insert a neighbor, maintaining sorted order by distance
     fn insert(&mut self, pid: PointId, distance: f32, points: &[Vec<f32>], query: &[f32]) {
         // Find insertion point (keep sorted by distance)
         let count = self.count();
         if count >= M0_MAX {
             // Check if better than worst
-            let worst_dist = HNSWIndex::parallel_distance(query, &points[self.nearest[M0_MAX - 1].as_usize()]);
+            let worst_dist =
+                HNSWIndex::parallel_distance(query, &points[self.nearest[M0_MAX - 1].as_usize()]);
             if distance >= worst_dist {
                 return;
             }
         }
-        
+
         // Binary search for insertion point
         let pos = self.nearest[..count.min(M0_MAX)]
             .binary_search_by(|probe| {
                 let d = HNSWIndex::parallel_distance(query, &points[probe.as_usize()]);
-                d.partial_cmp(&distance).unwrap_or(std::cmp::Ordering::Equal)
+                d.partial_cmp(&distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap_or_else(|i| i);
-        
+
         if pos < M0_MAX {
             // Shift elements and insert
             for i in (pos..count.min(M0_MAX - 1)).rev() {
@@ -1719,7 +1761,7 @@ impl ZeroNode {
             self.nearest[pos] = pid;
         }
     }
-    
+
     /// Iterate over valid neighbors
     fn iter(&self) -> impl Iterator<Item = PointId> + '_ {
         self.nearest.iter().copied().take_while(|p| p.is_valid())
@@ -1749,7 +1791,7 @@ impl UpperNode {
         }
         node
     }
-    
+
     fn iter(&self) -> impl Iterator<Item = PointId> + '_ {
         self.nearest.iter().copied().take_while(|p| p.is_valid())
     }
@@ -1768,7 +1810,7 @@ impl Visited {
             generation: 1,
         }
     }
-    
+
     fn clear(&mut self) {
         if self.generation == 255 {
             self.store.fill(0);
@@ -1777,7 +1819,7 @@ impl Visited {
             self.generation += 1;
         }
     }
-    
+
     fn insert(&mut self, pid: PointId) -> bool {
         let idx = pid.as_usize();
         if self.store[idx] == self.generation {
@@ -1787,11 +1829,11 @@ impl Visited {
             true
         }
     }
-    
+
     fn contains(&self, pid: PointId) -> bool {
         self.store[pid.as_usize()] == self.generation
     }
-    
+
     fn reserve(&mut self, capacity: usize) {
         if self.store.len() < capacity {
             self.store.resize(capacity, 0);
@@ -1817,7 +1859,8 @@ impl PartialOrd for Candidate {
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Sort by distance, then by pid for stability
-        self.distance.partial_cmp(&other.distance)
+        self.distance
+            .partial_cmp(&other.distance)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| self.pid.cmp(&other.pid))
     }
@@ -1844,13 +1887,13 @@ impl Search {
             ef: 1,
         }
     }
-    
+
     fn reset(&mut self) {
         self.candidates.clear();
         self.nearest.clear();
         self.visited.clear();
     }
-    
+
     fn push(&mut self, pid: PointId, point: &[f32], points: &[Vec<f32>]) {
         let distance = HNSWIndex::parallel_distance(point, &points[pid.as_usize()]);
         let candidate = Candidate { distance, pid };
@@ -1858,7 +1901,7 @@ impl Search {
         self.nearest.push(candidate);
         self.visited.insert(pid);
     }
-    
+
     /// After searching a layer, prepare for the next layer down
     fn cull(&mut self) {
         self.candidates.clear();
@@ -1870,32 +1913,49 @@ impl Search {
             self.visited.insert(c.pid);
         }
     }
-    
+
     /// Search within a layer (generic over layer type)
-    fn search_zero(&mut self, point: &[f32], layer: &[RwLock<ZeroNode>], points: &[Vec<f32>], num: usize) {
+    fn search_zero(
+        &mut self,
+        point: &[f32],
+        layer: &[RwLock<ZeroNode>],
+        points: &[Vec<f32>],
+        num: usize,
+    ) {
         while let Some(Reverse(candidate)) = self.candidates.pop() {
             if let Some(furthest) = self.nearest.last() {
                 if candidate.distance > furthest.distance && self.nearest.len() >= self.ef {
                     break;
                 }
             }
-            
+
             // Explore neighbors
             let node = layer[candidate.pid.as_usize()].read();
             for neighbor_pid in node.iter() {
                 if self.visited.insert(neighbor_pid) {
-                    let distance = HNSWIndex::parallel_distance(point, &points[neighbor_pid.as_usize()]);
-                    let new_candidate = Candidate { distance, pid: neighbor_pid };
-                    
+                    let distance =
+                        HNSWIndex::parallel_distance(point, &points[neighbor_pid.as_usize()]);
+                    let new_candidate = Candidate {
+                        distance,
+                        pid: neighbor_pid,
+                    };
+
                     // Add to candidates if potentially useful
-                    let dominated = self.nearest.len() >= self.ef 
-                        && self.nearest.last().map(|f| distance > f.distance).unwrap_or(false);
-                    
+                    let dominated = self.nearest.len() >= self.ef
+                        && self
+                            .nearest
+                            .last()
+                            .map(|f| distance > f.distance)
+                            .unwrap_or(false);
+
                     if !dominated {
                         self.candidates.push(Reverse(new_candidate));
-                        
+
                         // Insert into nearest (sorted)
-                        let pos = self.nearest.binary_search(&new_candidate).unwrap_or_else(|i| i);
+                        let pos = self
+                            .nearest
+                            .binary_search(&new_candidate)
+                            .unwrap_or_else(|i| i);
                         if pos < self.ef {
                             self.nearest.insert(pos, new_candidate);
                             if self.nearest.len() > self.ef {
@@ -1908,36 +1968,53 @@ impl Search {
         }
         self.nearest.truncate(num);
     }
-    
-    fn search_upper(&mut self, point: &[f32], layer: &[UpperNode], points: &[Vec<f32>], num: usize) {
+
+    fn search_upper(
+        &mut self,
+        point: &[f32],
+        layer: &[UpperNode],
+        points: &[Vec<f32>],
+        num: usize,
+    ) {
         if layer.is_empty() {
             return;
         }
-        
+
         while let Some(Reverse(candidate)) = self.candidates.pop() {
             if let Some(furthest) = self.nearest.last() {
                 if candidate.distance > furthest.distance && self.nearest.len() >= self.ef {
                     break;
                 }
             }
-            
+
             // Safety: skip if candidate is beyond current layer snapshot
             if candidate.pid.as_usize() >= layer.len() {
                 continue;
             }
-            
+
             let node = &layer[candidate.pid.as_usize()];
             for neighbor_pid in node.iter() {
                 if self.visited.insert(neighbor_pid) {
-                    let distance = HNSWIndex::parallel_distance(point, &points[neighbor_pid.as_usize()]);
-                    let new_candidate = Candidate { distance, pid: neighbor_pid };
-                    
-                    let dominated = self.nearest.len() >= self.ef 
-                        && self.nearest.last().map(|f| distance > f.distance).unwrap_or(false);
-                    
+                    let distance =
+                        HNSWIndex::parallel_distance(point, &points[neighbor_pid.as_usize()]);
+                    let new_candidate = Candidate {
+                        distance,
+                        pid: neighbor_pid,
+                    };
+
+                    let dominated = self.nearest.len() >= self.ef
+                        && self
+                            .nearest
+                            .last()
+                            .map(|f| distance > f.distance)
+                            .unwrap_or(false);
+
                     if !dominated {
                         self.candidates.push(Reverse(new_candidate));
-                        let pos = self.nearest.binary_search(&new_candidate).unwrap_or_else(|i| i);
+                        let pos = self
+                            .nearest
+                            .binary_search(&new_candidate)
+                            .unwrap_or_else(|i| i);
                         if pos < self.ef {
                             self.nearest.insert(pos, new_candidate);
                             if self.nearest.len() > self.ef {
@@ -1950,7 +2027,7 @@ impl Search {
         }
         self.nearest.truncate(num);
     }
-    
+
     /// Get best candidates (sorted by distance)
     fn select_simple(&self) -> &[Candidate] {
         &self.nearest
@@ -1970,11 +2047,14 @@ impl SearchPool {
             capacity,
         }
     }
-    
+
     fn pop(&self) -> Search {
-        self.pool.lock().pop().unwrap_or_else(|| Search::new(self.capacity))
+        self.pool
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Search::new(self.capacity))
     }
-    
+
     fn push(&self, mut search: Search) {
         search.reset();
         self.pool.lock().push(search);
@@ -1989,7 +2069,7 @@ impl LayerId {
     fn is_zero(self) -> bool {
         self.0 == 0
     }
-    
+
     /// Iterate from this layer down to 0
     fn descend(self) -> impl Iterator<Item = LayerId> {
         (0..=self.0).rev().map(LayerId)
@@ -2018,11 +2098,11 @@ mod tests {
     #[test]
     fn test_hnsw_config_default() {
         let config = HNSWConfig::default();
-        assert_eq!(config.m, 16);
-        assert_eq!(config.m0, 32);
-        assert_eq!(config.ef_construction, 200);
-        assert_eq!(config.ef_search, 50);
-        assert!((config.ml - 0.36).abs() < 0.01);
+        assert_eq!(config.m, 32); // Changed from 16 to match instant-distance
+        assert_eq!(config.m0, 64); // m * 2
+        assert_eq!(config.ef_construction, 100);
+        assert_eq!(config.ef_search, 100);
+        assert!((config.ml - (1.0 / 32_f32.ln())).abs() < 0.01);
         assert!(config.use_heuristic); // Heuristic enabled by default
         assert!(!config.extend_candidates);
         assert!(config.keep_pruned_connections);

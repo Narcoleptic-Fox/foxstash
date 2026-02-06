@@ -28,11 +28,11 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
-use rand::{Rng, SeedableRng};
+use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 // ============================================================================
 // Helper Functions
@@ -88,23 +88,17 @@ fn benchmark_vector_ops(c: &mut Criterion) {
 
     // Benchmark cosine similarity
     group.bench_function("cosine_similarity_384d", |b| {
-        b.iter(|| {
-            cosine_similarity(black_box(&vec_a), black_box(&vec_b)).unwrap()
-        })
+        b.iter(|| cosine_similarity(black_box(&vec_a), black_box(&vec_b)).unwrap())
     });
 
     // Benchmark L2 distance
     group.bench_function("l2_distance_384d", |b| {
-        b.iter(|| {
-            l2_distance(black_box(&vec_a), black_box(&vec_b)).unwrap()
-        })
+        b.iter(|| l2_distance(black_box(&vec_a), black_box(&vec_b)).unwrap())
     });
 
     // Benchmark dot product
     group.bench_function("dot_product_384d", |b| {
-        b.iter(|| {
-            dot_product(black_box(&vec_a), black_box(&vec_b)).unwrap()
-        })
+        b.iter(|| dot_product(black_box(&vec_a), black_box(&vec_b)).unwrap())
     });
 
     // Benchmark normalization (in-place operation)
@@ -122,9 +116,7 @@ fn benchmark_vector_ops(c: &mut Criterion) {
     let vec_b_small = generate_random_embedding(dim_small, 4);
 
     group.bench_function("cosine_similarity_128d", |b| {
-        b.iter(|| {
-            cosine_similarity(black_box(&vec_a_small), black_box(&vec_b_small)).unwrap()
-        })
+        b.iter(|| cosine_similarity(black_box(&vec_a_small), black_box(&vec_b_small)).unwrap())
     });
 
     group.bench_function("normalize_128d", |b| {
@@ -184,9 +176,7 @@ fn benchmark_flat_index(c: &mut Criterion) {
                 let query = generate_random_embedding(dim, 9999);
 
                 // Benchmark search
-                b.iter(|| {
-                    index.search(black_box(&query), black_box(5)).unwrap()
-                })
+                b.iter(|| index.search(black_box(&query), black_box(5)).unwrap())
             },
         );
 
@@ -202,9 +192,7 @@ fn benchmark_flat_index(c: &mut Criterion) {
                 }
                 let query = generate_random_embedding(dim, 9999);
 
-                b.iter(|| {
-                    index.search(black_box(&query), black_box(10)).unwrap()
-                })
+                b.iter(|| index.search(black_box(&query), black_box(10)).unwrap())
             },
         );
 
@@ -278,9 +266,7 @@ fn benchmark_hnsw_index(c: &mut Criterion) {
                 let query = generate_random_embedding(dim, 9999);
 
                 // Benchmark search
-                b.iter(|| {
-                    index.search(black_box(&query), black_box(5)).unwrap()
-                })
+                b.iter(|| index.search(black_box(&query), black_box(5)).unwrap())
             },
         );
 
@@ -296,9 +282,7 @@ fn benchmark_hnsw_index(c: &mut Criterion) {
                 }
                 let query = generate_random_embedding(dim, 9999);
 
-                b.iter(|| {
-                    index.search(black_box(&query), black_box(10)).unwrap()
-                })
+                b.iter(|| index.search(black_box(&query), black_box(10)).unwrap())
             },
         );
 
@@ -314,9 +298,7 @@ fn benchmark_hnsw_index(c: &mut Criterion) {
                 }
                 let query = generate_random_embedding(dim, 9999);
 
-                b.iter(|| {
-                    index.search(black_box(&query), black_box(20)).unwrap()
-                })
+                b.iter(|| index.search(black_box(&query), black_box(20)).unwrap())
             },
         );
     }

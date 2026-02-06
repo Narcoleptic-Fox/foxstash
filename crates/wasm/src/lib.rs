@@ -26,8 +26,11 @@
 //! const results = rag.search(new Float32Array(384), 5);
 //! ```
 
+use foxstash_core::{
+    index::{FlatIndex, HNSWIndex},
+    Document, SearchResult,
+};
 use wasm_bindgen::prelude::*;
-use foxstash_core::{Document, SearchResult, index::{FlatIndex, HNSWIndex}};
 
 pub mod persistence;
 
@@ -107,8 +110,10 @@ impl JsDocument {
         let metadata: Option<serde_json::Value> = if metadata.is_null() || metadata.is_undefined() {
             None
         } else {
-            Some(serde_wasm_bindgen::from_value(metadata)
-                .map_err(|e| JsValue::from_str(&format!("Failed to parse metadata: {}", e)))?)
+            Some(
+                serde_wasm_bindgen::from_value(metadata)
+                    .map_err(|e| JsValue::from_str(&format!("Failed to parse metadata: {}", e)))?,
+            )
         };
 
         Ok(JsDocument {
@@ -591,7 +596,11 @@ impl LocalRAG {
     /// console.log("Index saved!");
     /// ```
     #[wasm_bindgen]
-    pub async fn save_to_db(&self, store: &persistence::IndexedDBStore, key: &str) -> Result<(), JsValue> {
+    pub async fn save_to_db(
+        &self,
+        store: &persistence::IndexedDBStore,
+        key: &str,
+    ) -> Result<(), JsValue> {
         let data = self.to_json()?;
         store.save(key, data).await
     }
@@ -615,7 +624,10 @@ impl LocalRAG {
     /// console.log(`Loaded index with ${rag.document_count()} documents`);
     /// ```
     #[wasm_bindgen]
-    pub async fn load_from_db(store: &persistence::IndexedDBStore, key: &str) -> Result<LocalRAG, JsValue> {
+    pub async fn load_from_db(
+        store: &persistence::IndexedDBStore,
+        key: &str,
+    ) -> Result<LocalRAG, JsValue> {
         let data = store.load(key).await?;
         Self::from_json(data)
     }
@@ -658,7 +670,12 @@ mod tests {
 
         // Create metadata as a JavaScript object
         let metadata = js_sys::Object::new();
-        js_sys::Reflect::set(&metadata, &JsValue::from_str("key"), &JsValue::from_str("value")).unwrap();
+        js_sys::Reflect::set(
+            &metadata,
+            &JsValue::from_str("key"),
+            &JsValue::from_str("value"),
+        )
+        .unwrap();
 
         let doc = JsDocument::new(
             "test_id".to_string(),
@@ -700,7 +717,8 @@ mod tests {
             "test content".to_string(),
             embedding,
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = rag.add_document(doc);
         assert!(result.is_ok());
@@ -717,7 +735,8 @@ mod tests {
             "test content".to_string(),
             embedding,
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = rag.add_document(doc);
         assert!(result.is_err());
@@ -746,7 +765,8 @@ mod tests {
             "test content".to_string(),
             embedding.clone(),
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         rag.add_document(doc).unwrap();
 
@@ -772,7 +792,8 @@ mod tests {
             "test content".to_string(),
             embedding,
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         rag.add_document(doc).unwrap();
 
@@ -793,7 +814,8 @@ mod tests {
             "test content".to_string(),
             embedding,
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         rag.add_document(doc).unwrap();
         assert_eq!(rag.document_count(), 1);
@@ -823,7 +845,8 @@ mod tests {
                 format!("content {}", i),
                 embedding,
                 JsValue::NULL,
-            ).unwrap();
+            )
+            .unwrap();
 
             rag.add_document(doc).unwrap();
         }
@@ -853,7 +876,8 @@ mod tests {
                 format!("content {}", id),
                 embedding,
                 JsValue::NULL,
-            ).unwrap();
+            )
+            .unwrap();
 
             rag.add_document(doc).unwrap();
         }
@@ -883,7 +907,8 @@ mod tests {
             "test content".to_string(),
             embedding.clone(),
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         rag.add_document(doc).unwrap();
         assert_eq!(rag.document_count(), 1);
@@ -904,7 +929,8 @@ mod tests {
             "test content".to_string(),
             embedding,
             JsValue::NULL,
-        ).unwrap();
+        )
+        .unwrap();
 
         rag.add_document(doc).unwrap();
 

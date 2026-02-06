@@ -27,11 +27,11 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use foxstash_core::index::{FlatIndex, HNSWConfig, HNSWIndex};
+use foxstash_core::storage::{Codec, FileStorage};
 use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};
-use foxstash_core::index::{FlatIndex, HNSWIndex, HNSWConfig};
-use foxstash_core::storage::{FileStorage, Codec};
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -120,42 +120,34 @@ fn benchmark_index_construction(c: &mut Criterion) {
 
         // Benchmark HNSW construction
         group.throughput(Throughput::Elements(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("hnsw", size),
-            &documents,
-            |b, docs| {
-                b.iter(|| {
-                    let config = HNSWConfig {
-                        m: 16,
-                        m0: 32,
-                        ef_construction: 200,
-                        ef_search: 50,
-                        ml: 1.0 / 16.0_f32.ln(),
-                    };
-                    let mut index = HNSWIndex::new(EMBEDDING_DIM, config);
-                    for doc in docs {
-                        index.add(black_box(doc.clone())).unwrap();
-                    }
-                    black_box(index)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("hnsw", size), &documents, |b, docs| {
+            b.iter(|| {
+                let config = HNSWConfig {
+                    m: 16,
+                    m0: 32,
+                    ef_construction: 200,
+                    ef_search: 50,
+                    ml: 1.0 / 16.0_f32.ln(),
+                };
+                let mut index = HNSWIndex::new(EMBEDDING_DIM, config);
+                for doc in docs {
+                    index.add(black_box(doc.clone())).unwrap();
+                }
+                black_box(index)
+            })
+        });
 
         // Benchmark Flat construction
         group.throughput(Throughput::Elements(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("flat", size),
-            &documents,
-            |b, docs| {
-                b.iter(|| {
-                    let mut index = FlatIndex::new(EMBEDDING_DIM);
-                    for doc in docs {
-                        index.add(black_box(doc.clone())).unwrap();
-                    }
-                    black_box(index)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("flat", size), &documents, |b, docs| {
+            b.iter(|| {
+                let mut index = FlatIndex::new(EMBEDDING_DIM);
+                for doc in docs {
+                    index.add(black_box(doc.clone())).unwrap();
+                }
+                black_box(index)
+            })
+        });
     }
 
     group.finish();
@@ -229,9 +221,7 @@ fn benchmark_vector_operations(c: &mut Criterion) {
             BenchmarkId::new("cosine_similarity", dim),
             &(&vec_a, &vec_b),
             |b, (a, b_vec)| {
-                b.iter(|| {
-                    black_box(cosine_similarity(black_box(a), black_box(b_vec)).unwrap())
-                })
+                b.iter(|| black_box(cosine_similarity(black_box(a), black_box(b_vec)).unwrap()))
             },
         );
 
@@ -240,9 +230,7 @@ fn benchmark_vector_operations(c: &mut Criterion) {
             BenchmarkId::new("l2_distance", dim),
             &(&vec_a, &vec_b),
             |b, (a, b_vec)| {
-                b.iter(|| {
-                    black_box(l2_distance(black_box(a), black_box(b_vec)).unwrap())
-                })
+                b.iter(|| black_box(l2_distance(black_box(a), black_box(b_vec)).unwrap()))
             },
         );
 
@@ -251,24 +239,18 @@ fn benchmark_vector_operations(c: &mut Criterion) {
             BenchmarkId::new("dot_product", dim),
             &(&vec_a, &vec_b),
             |b, (a, b_vec)| {
-                b.iter(|| {
-                    black_box(dot_product(black_box(a), black_box(b_vec)).unwrap())
-                })
+                b.iter(|| black_box(dot_product(black_box(a), black_box(b_vec)).unwrap()))
             },
         );
 
         // Benchmark normalization
-        group.bench_with_input(
-            BenchmarkId::new("normalize", dim),
-            &vec_a,
-            |b, a| {
-                b.iter(|| {
-                    let mut v = a.clone();
-                    normalize(black_box(&mut v));
-                    black_box(v)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("normalize", dim), &vec_a, |b, a| {
+            b.iter(|| {
+                let mut v = a.clone();
+                normalize(black_box(&mut v));
+                black_box(v)
+            })
+        });
     }
 
     group.finish();
@@ -293,11 +275,7 @@ fn benchmark_serialization(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("document_json_serialize", size),
             doc,
-            |b, doc| {
-                b.iter(|| {
-                    black_box(serde_json::to_vec(black_box(doc)).unwrap())
-                })
-            },
+            |b, doc| b.iter(|| black_box(serde_json::to_vec(black_box(doc)).unwrap())),
         );
 
         // Benchmark document deserialization (JSON)
@@ -305,9 +283,7 @@ fn benchmark_serialization(c: &mut Criterion) {
             BenchmarkId::new("document_json_deserialize", size),
             &serialized_json,
             |b, data| {
-                b.iter(|| {
-                    black_box(serde_json::from_slice::<Document>(black_box(data)).unwrap())
-                })
+                b.iter(|| black_box(serde_json::from_slice::<Document>(black_box(data)).unwrap()))
             },
         );
 
@@ -318,11 +294,7 @@ fn benchmark_serialization(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("document_bincode_serialize", size),
             doc,
-            |b, doc| {
-                b.iter(|| {
-                    black_box(bincode::serialize(black_box(doc)).unwrap())
-                })
-            },
+            |b, doc| b.iter(|| black_box(bincode::serialize(black_box(doc)).unwrap())),
         );
 
         // Benchmark document deserialization (bincode)
@@ -330,9 +302,7 @@ fn benchmark_serialization(c: &mut Criterion) {
             BenchmarkId::new("document_bincode_deserialize", size),
             &serialized_bincode,
             |b, data| {
-                b.iter(|| {
-                    black_box(bincode::deserialize::<Document>(black_box(data)).unwrap())
-                })
+                b.iter(|| black_box(bincode::deserialize::<Document>(black_box(data)).unwrap()))
             },
         );
     }
@@ -389,11 +359,7 @@ fn benchmark_storage(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(format!("load_document_{}", codec_name), size),
                 &storage,
-                |b, storage| {
-                    b.iter(|| {
-                        black_box(storage.load_document("test_doc").unwrap())
-                    })
-                },
+                |b, storage| b.iter(|| black_box(storage.load_document("test_doc").unwrap())),
             );
         }
     }
