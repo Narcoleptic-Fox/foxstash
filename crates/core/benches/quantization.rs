@@ -266,7 +266,7 @@ fn bench_memory_comparison(c: &mut Criterion) {
     // Memory comparison (printed during benchmark)
     let full_size = count * dim * 4;
     let sq8_size = count * dim;
-    let binary_size = count * ((dim + 7) / 8);
+    let binary_size = count * dim.div_ceil(8);
     let pq_size = count * 8;
 
     println!(
