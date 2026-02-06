@@ -36,12 +36,11 @@ impl Ord for OrderedFloat {
 }
 
 /// Reusable search context to avoid allocations during search
-/// Provides ~2-3x speedup over allocating new structures each query
+/// 
+/// Provides ~2-3x speedup over allocating new structures each query.
+/// Uses generation-based visited tracking for O(1) reset between searches.
 pub struct SearchContext {
-    /// Bitset for visited nodes (reserved for future optimization)
-    #[allow(dead_code)]
-    visited: Vec<u64>,
-    /// Generation counter to avoid clearing visited bitset
+    /// Generation counter for O(1) visited reset
     generation: u64,
     /// Per-node generation to check if visited in current search
     node_generation: Vec<u64>,
@@ -55,7 +54,6 @@ impl SearchContext {
     /// Create a new search context for an index with `n` nodes
     pub fn new(n: usize) -> Self {
         Self {
-            visited: vec![0; (n + 63) / 64],
             generation: 1,
             node_generation: vec![0; n],
             candidates: BinaryHeap::with_capacity(256),
@@ -1472,42 +1470,10 @@ impl Default for ZeroNode {
     }
 }
 
-#[allow(dead_code)]
 impl ZeroNode {
     /// Count of valid neighbors
     fn count(&self) -> usize {
         self.nearest.iter().take_while(|p| p.is_valid()).count()
-    }
-
-    /// Insert a neighbor, maintaining sorted order by distance
-    fn insert(&mut self, pid: PointId, distance: f32, points: &[Vec<f32>], query: &[f32]) {
-        // Find insertion point (keep sorted by distance)
-        let count = self.count();
-        if count >= M0_MAX {
-            // Check if better than worst
-            let worst_dist =
-                HNSWIndex::parallel_distance(query, &points[self.nearest[M0_MAX - 1].as_usize()]);
-            if distance >= worst_dist {
-                return;
-            }
-        }
-
-        // Binary search for insertion point
-        let pos = self.nearest[..count.min(M0_MAX)]
-            .binary_search_by(|probe| {
-                let d = HNSWIndex::parallel_distance(query, &points[probe.as_usize()]);
-                d.partial_cmp(&distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap_or_else(|i| i);
-
-        if pos < M0_MAX {
-            // Shift elements and insert
-            for i in (pos..count.min(M0_MAX - 1)).rev() {
-                self.nearest[i + 1] = self.nearest[i];
-            }
-            self.nearest[pos] = pid;
-        }
     }
 
     /// Iterate over valid neighbors
@@ -1551,7 +1517,6 @@ struct Visited {
     generation: u8,
 }
 
-#[allow(dead_code)]
 impl Visited {
     fn new(capacity: usize) -> Self {
         Self {
@@ -1577,10 +1542,6 @@ impl Visited {
             self.store[idx] = self.generation;
             true
         }
-    }
-
-    fn contains(&self, pid: PointId) -> bool {
-        self.store[pid.as_usize()] == self.generation
     }
 
     fn reserve(&mut self, capacity: usize) {
