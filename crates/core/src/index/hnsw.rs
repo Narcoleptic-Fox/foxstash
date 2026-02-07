@@ -36,7 +36,7 @@ impl Ord for OrderedFloat {
 }
 
 /// Reusable search context to avoid allocations during search
-/// 
+///
 /// Provides ~2-3x speedup over allocating new structures each query.
 /// Uses generation-based visited tracking for O(1) reset between searches.
 pub struct SearchContext {
@@ -1420,7 +1420,6 @@ impl HNSWIndex {
             max_layer: 0,
         }
     }
-
 
     /// Distance function for parallel construction (SIMD accelerated)
     #[inline]
