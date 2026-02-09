@@ -21,18 +21,29 @@
 //!
 //! For large datasets, use the streaming module for memory-efficient batch ingestion:
 //!
-//! ```ignore
+//! ```
 //! use foxstash_core::index::streaming::{BatchBuilder, BatchConfig};
+//! use foxstash_core::index::HNSWIndex;
+//! use foxstash_core::Document;
+//!
+//! let mut index = HNSWIndex::with_defaults(4);
 //!
 //! let config = BatchConfig::default()
 //!     .with_batch_size(1000)
 //!     .with_progress(|p| println!("Progress: {}/{}", p.completed, p.total.unwrap_or(0)));
 //!
+//! let documents = vec![
+//!     Document { id: "a".into(), content: "alpha".into(), embedding: vec![1.0, 0.0, 0.0, 0.0], metadata: None },
+//!     Document { id: "b".into(), content: "beta".into(),  embedding: vec![0.0, 1.0, 0.0, 0.0], metadata: None },
+//!     Document { id: "c".into(), content: "gamma".into(), embedding: vec![0.0, 0.0, 1.0, 0.0], metadata: None },
+//! ];
+//!
 //! let mut builder = BatchBuilder::new(&mut index, config);
 //! for doc in documents {
-//!     builder.add(doc)?;
+//!     builder.add(doc).unwrap();
 //! }
 //! let result = builder.finish();
+//! assert_eq!(result.documents_indexed, 3);
 //! ```
 
 pub mod flat;

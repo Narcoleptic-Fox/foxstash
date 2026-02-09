@@ -19,32 +19,55 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use foxstash_core::storage::incremental::{IncrementalStorage, IncrementalConfig};
+//! ```no_run
+//! use foxstash_core::storage::incremental::{
+//!     IncrementalStorage, IncrementalConfig, IndexMetadata, RecoveryHelper,
+//! };
+//! use foxstash_core::storage::incremental::WalOperation;
 //! use foxstash_core::index::HNSWIndex;
 //! use foxstash_core::Document;
 //!
-//! // Create incremental storage
-//! let config = IncrementalConfig::default()
-//!     .with_wal_sync_interval(100)    // Sync WAL every 100 ops
-//!     .with_checkpoint_threshold(10000); // Checkpoint every 10K ops
+//! fn main() -> Result<(), foxstash_core::RagError> {
+//!     // Create incremental storage
+//!     let config = IncrementalConfig::default()
+//!         .with_wal_sync_interval(100)
+//!         .with_checkpoint_threshold(10_000);
 //!
-//! let mut storage = IncrementalStorage::new("/tmp/index_storage", config)?;
+//!     let mut storage = IncrementalStorage::new("/tmp/index_storage", config)?;
+//!     let mut index = HNSWIndex::with_defaults(128);
 //!
-//! // Load or create index
-//! let mut index = storage.load_or_create::<HNSWIndex>(384)?;
-//!
-//! // Add documents - automatically logged to WAL
-//! for doc in documents {
+//!     // Add documents -- log to WAL, then apply to index
+//!     let doc = Document {
+//!         id: "doc1".into(),
+//!         content: "Hello".into(),
+//!         embedding: vec![0.1; 128],
+//!         metadata: None,
+//!     };
 //!     storage.log_add(&doc)?;
 //!     index.add(doc)?;
+//!
+//!     // Checkpoint when threshold is reached
+//!     if storage.needs_checkpoint() {
+//!         let meta = IndexMetadata {
+//!             document_count: index.len(),
+//!             embedding_dim: 128,
+//!             index_type: "hnsw".into(),
+//!         };
+//!         storage.checkpoint(&index.get_all_documents(), meta)?;
+//!     }
+//!
+//!     // Recovery: load last checkpoint, then replay WAL
+//!     let helper = RecoveryHelper::new(&storage);
+//!     helper.replay_wal(|op| {
+//!         match op {
+//!             WalOperation::Add(doc) => { index.add(doc.clone())?; }
+//!             WalOperation::Clear => { index.clear(); }
+//!             _ => {}
+//!         }
+//!         Ok(())
+//!     })?;
+//!     Ok(())
 //! }
-//!
-//! // Explicit checkpoint (or automatic based on threshold)
-//! storage.checkpoint(&index)?;
-//!
-//! // Recovery after crash - replays WAL automatically
-//! let index = storage.recover::<HNSWIndex>()?;
 //! ```
 
 #![cfg(not(target_arch = "wasm32"))]

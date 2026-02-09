@@ -10,25 +10,40 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```no_run
 //! use foxstash_core::index::hnsw_pq::{PQHNSWIndex, PQHNSWConfig};
 //! use foxstash_core::vector::product_quantize::PQConfig;
 //! use foxstash_core::Document;
 //!
-//! // Configure PQ: 8 subvectors, 256 centroids each
-//! let pq_config = PQConfig::new(384, 8, 8);
+//! fn main() -> Result<(), foxstash_core::RagError> {
+//!     let dim = 64;
 //!
-//! // Train PQ on sample vectors
-//! let training_data = load_sample_vectors();
-//! let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default())?;
+//!     // Configure PQ: 8 subvectors, 256 centroids each
+//!     let pq_config = PQConfig::new(dim, 8, 8).with_seed(42).with_kmeans_iterations(10);
 //!
-//! // Add documents
-//! for doc in documents {
-//!     index.add(doc)?;
+//!     // Train PQ on sample vectors (at least num_centroids vectors needed)
+//!     let training_data: Vec<Vec<f32>> = (0..300)
+//!         .map(|i| (0..dim).map(|d| ((i * d) as f32).sin()).collect())
+//!         .collect();
+//!     let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default())?;
+//!
+//!     // Add documents
+//!     for i in 0..10 {
+//!         let doc = Document {
+//!             id: format!("doc{}", i),
+//!             content: format!("Content {}", i),
+//!             embedding: training_data[i].clone(),
+//!             metadata: None,
+//!         };
+//!         index.add(doc)?;
+//!     }
+//!
+//!     // Search (uses ADC for accurate results)
+//!     let query = vec![0.1; dim];
+//!     let results = index.search(&query, 5)?;
+//!     assert!(results.len() <= 5);
+//!     Ok(())
 //! }
-//!
-//! // Search (uses ADC for accurate results)
-//! let results = index.search(&query, 10)?;
 //! ```
 
 use crate::vector::product_quantize::{PQCode, PQConfig, PQDistanceCache, ProductQuantizer};

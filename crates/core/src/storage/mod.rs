@@ -13,20 +13,36 @@
 //! For large indexes with frequent updates, use `IncrementalStorage` to avoid
 //! rewriting the entire index on each change:
 //!
-//! ```ignore
-//! use foxstash_core::storage::incremental::{IncrementalStorage, IncrementalConfig};
+//! ```no_run
+//! use foxstash_core::storage::incremental::{IncrementalStorage, IncrementalConfig, IndexMetadata};
+//! use foxstash_core::Document;
 //!
-//! let config = IncrementalConfig::default()
-//!     .with_checkpoint_threshold(10_000);
+//! fn main() -> Result<(), foxstash_core::RagError> {
+//!     let config = IncrementalConfig::default()
+//!         .with_checkpoint_threshold(10_000);
 //!
-//! let mut storage = IncrementalStorage::new("/tmp/index", config)?;
+//!     let mut storage = IncrementalStorage::new("/tmp/index", config)?;
 //!
-//! // Log changes to WAL (fast append-only)
-//! storage.log_add(&document)?;
+//!     // Log changes to WAL (fast append-only)
+//!     let document = Document {
+//!         id: "doc1".into(),
+//!         content: "Hello".into(),
+//!         embedding: vec![0.1; 128],
+//!         metadata: None,
+//!     };
+//!     storage.log_add(&document)?;
 //!
-//! // Periodic checkpoint (full snapshot)
-//! if storage.needs_checkpoint() {
-//!     storage.checkpoint(&index, metadata)?;
+//!     // Periodic checkpoint (full snapshot)
+//!     let index_data: Vec<String> = vec!["doc1".into()];
+//!     let metadata = IndexMetadata {
+//!         document_count: 1,
+//!         embedding_dim: 128,
+//!         index_type: "hnsw".into(),
+//!     };
+//!     if storage.needs_checkpoint() {
+//!         storage.checkpoint(&index_data, metadata)?;
+//!     }
+//!     Ok(())
 //! }
 //! ```
 
