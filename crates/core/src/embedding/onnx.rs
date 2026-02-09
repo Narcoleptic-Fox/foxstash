@@ -3,19 +3,44 @@
 //! This module provides high-performance embedding generation using ONNX Runtime.
 //! It supports models like MiniLM-L6-v2 which produce 384-dimensional embeddings.
 //!
+//! # Runtime Library Loading
+//!
+//! The `onnx` feature uses `ort`'s `load-dynamic` mode, which loads the ONNX Runtime
+//! shared library at runtime instead of linking it at compile time. This avoids
+//! MSVC CRT conflicts (LNK2005) on Windows where the static ONNX Runtime library
+//! uses `/MT` while Rust defaults to `/MD`.
+//!
+//! Before creating an [`OnnxEmbedder`], the ONNX Runtime library must be locatable.
+//! There are two ways to configure this:
+//!
+//! 1. **Environment variable**: Set `ORT_DYLIB_PATH` to the path of
+//!    `onnxruntime.dll` (Windows), `libonnxruntime.so` (Linux), or
+//!    `libonnxruntime.dylib` (macOS).
+//!
+//! 2. **Programmatic init**: Call [`OnnxEmbedder::init_from`] with the library path
+//!    before creating any embedder instances.
+//!
+//! If neither is set, `ort` will attempt to find the library in standard system paths.
+//!
 //! # Example
 //!
 //! ```no_run
+//! # fn main() -> Result<(), foxstash_core::RagError> {
 //! use foxstash_core::embedding::OnnxEmbedder;
 //!
-//! let embedder = OnnxEmbedder::new(
+//! // Option A: Set ORT_DYLIB_PATH env var before running, or
+//! // Option B: Initialize from a specific path:
+//! OnnxEmbedder::init_from("path/to/onnxruntime.dll")?;
+//!
+//! let mut embedder = OnnxEmbedder::new(
 //!     "models/model.onnx",
 //!     "models/tokenizer.json"
 //! )?;
 //!
 //! let embedding = embedder.embed("Hello, world!")?;
 //! assert_eq!(embedding.len(), 384);
-//! # Ok::<(), foxstash_core::RagError>(())
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::{RagError, Result};
@@ -47,6 +72,46 @@ pub struct OnnxEmbedder {
 }
 
 impl OnnxEmbedder {
+    /// Initialize the ONNX Runtime from a specific shared library path.
+    ///
+    /// This must be called before creating any [`OnnxEmbedder`] instances when the
+    /// `ORT_DYLIB_PATH` environment variable is not set. It loads the ONNX Runtime
+    /// shared library from the given path.
+    ///
+    /// This is a no-op if the runtime has already been initialized (e.g., by a
+    /// previous call to this method or by the `ORT_DYLIB_PATH` env var).
+    ///
+    /// # Arguments
+    ///
+    /// * `lib_path` - Path to the ONNX Runtime shared library
+    ///   - Windows: `onnxruntime.dll`
+    ///   - Linux: `libonnxruntime.so`
+    ///   - macOS: `libonnxruntime.dylib`
+    ///
+    /// # Errors
+    ///
+    /// Returns `RagError::EmbeddingError` if the library cannot be loaded.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use foxstash_core::embedding::OnnxEmbedder;
+    ///
+    /// OnnxEmbedder::init_from("path/to/onnxruntime.dll")?;
+    /// # Ok::<(), foxstash_core::RagError>(())
+    /// ```
+    pub fn init_from(lib_path: impl AsRef<Path>) -> Result<()> {
+        let builder = ort::init_from(lib_path.as_ref().to_string_lossy().as_ref()).map_err(|e| {
+            RagError::EmbeddingError(format!(
+                "Failed to initialize ONNX Runtime from {:?}: {}",
+                lib_path.as_ref(),
+                e
+            ))
+        })?;
+        builder.commit();
+        Ok(())
+    }
+
     /// Create a new ONNX embedder
     ///
     /// # Arguments
@@ -60,6 +125,8 @@ impl OnnxEmbedder {
     /// - Model file cannot be loaded
     /// - Tokenizer file cannot be loaded
     /// - ONNX Runtime initialization fails
+    /// - ONNX Runtime shared library is not found (set `ORT_DYLIB_PATH` or call
+    ///   [`OnnxEmbedder::init_from`] first)
     ///
     /// # Example
     ///
@@ -135,15 +202,17 @@ impl OnnxEmbedder {
     /// # Example
     ///
     /// ```no_run
+    /// # fn main() -> Result<(), foxstash_core::RagError> {
     /// # use foxstash_core::embedding::OnnxEmbedder;
-    /// # let embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")?;
+    /// # let mut embedder = OnnxEmbedder::new("models/model.onnx", "models/tokenizer.json")?;
     /// let embedding = embedder.embed("Machine learning is fascinating")?;
     /// assert_eq!(embedding.len(), 384);
     ///
     /// // Verify normalization (should be close to 1.0)
     /// let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
     /// assert!((norm - 1.0).abs() < 1e-5);
-    /// # Ok::<(), foxstash_core::RagError>(())
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         let embeddings = self.embed_batch(&[text])?;

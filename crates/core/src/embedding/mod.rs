@@ -11,10 +11,10 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "onnx")]
-//! # {
+//! # fn onnx_example() -> Result<(), foxstash_core::RagError> {
 //! use foxstash_core::embedding::OnnxEmbedder;
 //!
-//! let embedder = OnnxEmbedder::new(
+//! let mut embedder = OnnxEmbedder::new(
 //!     "models/model.onnx",
 //!     "models/tokenizer.json"
 //! )?;
@@ -26,7 +26,7 @@
 //! // Batch embedding
 //! let embeddings = embedder.embed_batch(&["First text", "Second text"])?;
 //! assert_eq!(embeddings.len(), 2);
-//! # Ok::<(), foxstash_core::RagError>(())
+//! # Ok(())
 //! # }
 //! ```
 
