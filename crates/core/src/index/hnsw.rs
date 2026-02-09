@@ -291,10 +291,23 @@ impl HNSWIndex {
     /// A new HNSWIndex built from the embeddings
     ///
     /// # Example
-    /// ```ignore
+    /// ```
+    /// use foxstash_core::index::{HNSWIndex, HNSWConfig, BuildStrategy};
+    ///
+    /// // Create a small set of 4-dimensional embeddings
+    /// let embeddings = vec![
+    ///     vec![1.0, 0.0, 0.0, 0.0],
+    ///     vec![0.0, 1.0, 0.0, 0.0],
+    ///     vec![0.0, 0.0, 1.0, 0.0],
+    ///     vec![0.0, 0.0, 0.0, 1.0],
+    ///     vec![0.5, 0.5, 0.0, 0.0],
+    /// ];
+    ///
     /// let config = HNSWConfig::default()
-    ///     .with_build_strategy(BuildStrategy::Parallel);
+    ///     .with_build_strategy(BuildStrategy::Parallel)
+    ///     .with_seed(42);
     /// let index = HNSWIndex::build(embeddings, config);
+    /// assert_eq!(index.len(), 5);
     /// ```
     pub fn build(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         if embeddings.is_empty() {

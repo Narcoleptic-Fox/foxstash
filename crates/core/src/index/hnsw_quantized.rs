@@ -13,12 +13,29 @@
 //! For best quality/speed tradeoff, use binary quantization for initial candidate
 //! retrieval, then rerank with SQ8 or full precision:
 //!
-//! ```ignore
-//! // 1. Fast initial search with binary (32x compressed)
-//! let candidates = binary_index.search(&query, 100)?;
+//! ```
+//! use foxstash_core::index::hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig};
+//! use foxstash_core::Document;
 //!
-//! // 2. Rerank top candidates with SQ8 or full precision
-//! let results = rerank_with_sq8(&candidates, &query, 10);
+//! // Build a binary index that also stores full-precision vectors
+//! let dim = 8;
+//! let mut index = BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
+//!
+//! for i in 0..5 {
+//!     let doc = Document {
+//!         id: format!("doc{}", i),
+//!         content: format!("Content {}", i),
+//!         embedding: vec![i as f32 * 0.1; dim],
+//!         metadata: None,
+//!     };
+//!     index.add_with_full_precision(doc).unwrap();
+//! }
+//!
+//! let query = vec![0.3; dim];
+//!
+//! // Two-phase: binary filter (100 candidates) -> full-precision rerank (top 2)
+//! let results = index.search_and_rerank(&query, 100, 2).unwrap();
+//! assert!(results.len() <= 2);
 //! ```
 //!
 //! # Memory Comparison (1M vectors × 384 dims)

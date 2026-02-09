@@ -35,13 +35,21 @@
 //!
 //! # Example: Streaming Search
 //!
-//! ```ignore
-//! use foxstash_core::index::streaming::StreamingSearch;
+//! ```
+//! use foxstash_core::index::streaming::SearchResultIterator;
+//! use foxstash_core::SearchResult;
 //!
-//! // Get results as an iterator - doesn't allocate all results upfront
-//! let search = StreamingSearch::new(&index, &query, 1000);
+//! // Wrap pre-computed results in a lazy iterator
+//! let results = vec![
+//!     SearchResult { id: "a".into(), content: "alpha".into(), score: 0.95, metadata: None },
+//!     SearchResult { id: "b".into(), content: "beta".into(),  score: 0.80, metadata: None },
+//!     SearchResult { id: "c".into(), content: "gamma".into(), score: 0.60, metadata: None },
+//! ];
 //!
-//! for result in search.take(10) {
+//! let mut iter = SearchResultIterator::new(results);
+//!
+//! // Consume only the first two results (early termination)
+//! for result in iter.take(2) {
 //!     println!("{}: {:.4}", result.id, result.score);
 //! }
 //! ```
