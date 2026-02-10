@@ -248,7 +248,7 @@ impl SQ8HNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
 
         Ok(results)
@@ -296,7 +296,7 @@ impl SQ8HNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
 
         Ok(results)
@@ -454,7 +454,7 @@ impl SQ8HNSWIndex {
             .into_iter()
             .map(|(OrderedFloat(dist), id)| (dist, id))
             .collect();
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
         results.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -474,7 +474,7 @@ impl SQ8HNSWIndex {
             })
             .collect();
 
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
     }
@@ -657,7 +657,7 @@ impl BinaryHNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
 
         Ok(results)
@@ -728,7 +728,7 @@ impl BinaryHNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
 
         Ok(results)
@@ -891,7 +891,7 @@ impl BinaryHNSWIndex {
             .into_iter()
             .map(|(OrderedFloat(dist), id)| (dist, id))
             .collect();
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
         results.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -911,7 +911,7 @@ impl BinaryHNSWIndex {
             })
             .collect();
 
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
     }
@@ -928,13 +928,13 @@ impl Eq for OrderedFloat {}
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -1155,7 +1155,7 @@ mod tests {
                 (i, similarity)
             })
             .collect();
-        ground_truth.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ground_truth.sort_by(|a, b| b.1.total_cmp(&a.1));
         let ground_truth_top_k: std::collections::HashSet<_> =
             ground_truth[..k].iter().map(|(i, _)| *i).collect();
 
@@ -1189,6 +1189,33 @@ mod tests {
             "Binary recall too low: {}/{}",
             binary_recall,
             k
+        );
+    }
+
+    #[test]
+    fn test_quantized_search_with_nan_query_does_not_panic() {
+        let dim = 8;
+
+        let mut sq8 = SQ8HNSWIndex::for_normalized(dim, QuantizedHNSWConfig::default());
+        sq8.add(create_test_document("sq8_doc", vec![0.1; dim])).unwrap();
+
+        let mut binary = BinaryHNSWIndex::new(dim, QuantizedHNSWConfig::default());
+        binary
+            .add(create_test_document("bin_doc", vec![0.2; dim]))
+            .unwrap();
+
+        let query = vec![f32::NAN; dim];
+
+        let sq8_outcome = std::panic::catch_unwind(|| sq8.search(&query, 1));
+        assert!(
+            sq8_outcome.is_ok(),
+            "SQ8 search panicked when query contains NaN"
+        );
+
+        let binary_outcome = std::panic::catch_unwind(|| binary.search(&query, 1));
+        assert!(
+            binary_outcome.is_ok(),
+            "Binary search panicked when query contains NaN"
         );
     }
 }
