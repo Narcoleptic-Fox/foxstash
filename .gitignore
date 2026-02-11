@@ -7,3 +7,4 @@ Cargo.lock
 *.bin
 /models/
 benchmarks/python/venv/
+.bench-venv/
