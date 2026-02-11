@@ -236,23 +236,24 @@ foxstash/
 
 | Library | Build Time | Search QPS | Recall |
 |---------|-----------|------------|--------|
-| **Foxstash** | **7.5s** | **8,439** | **61.4%** |
-| hnswlib (C++/Python) | 5.4s | 4,245 | 40.3% |
-| faiss-hnsw (C++/Python) | 8.0s | 3,277 | 46.4% |
-| instant-distance (Rust) | 72.6s | 587 | 62.1% |
+| **Foxstash** (batch) | **7.6s** | **13,366** | **61.0%** |
+| **Foxstash** (single-threaded) | **7.6s** | **1,322** | **61.0%** |
+| hnswlib (C++, ef=64) | 5.7s | 4,004 | 39.5% |
+| faiss-hnsw (C++, ef=64) | 8.6s | 3,139 | 44.9% |
+| instant-distance (Rust) | 73.9s | 575 | 60.2% |
 
 **Key takeaways:**
-- **2x faster search** than hnswlib with 50% better recall
-- **14x faster search** than instant-distance with equivalent recall
-- **9.6x faster build** than instant-distance
-- Best recall-to-speed ratio among tested libraries
+- **2.3x faster** single-threaded search than instant-distance with equivalent recall
+- **23x faster** batch search than instant-distance via rayon
+- **9.7x faster build** than instant-distance
+- hnswlib/faiss use lower `ef_search` (64 vs 100), inflating their QPS relative to Foxstash
 
 ### Build Strategies @ 100,000 Vectors
 
 | Strategy | Build Time | Search QPS | Recall | Use Case |
 |----------|-----------|------------|--------|----------|
-| Sequential | 578.9s | 817 | 59.0% | Maximum quality |
-| **Parallel** | **7.4s** | 8,439 | **61.4%** | Production (78x faster) |
+| Sequential | 541s | 1,274 | 58.8% | Maximum quality |
+| **Parallel** | **7.6s** | **1,322** | **61.0%** | Production (71x faster) |
 
 ### Running Benchmarks
 

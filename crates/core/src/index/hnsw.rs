@@ -93,7 +93,6 @@ impl BitsetVisited {
     fn clear(&mut self) {
         self.bits.fill(0);
     }
-
 }
 
 /// Reusable search context to avoid allocations during search
@@ -517,8 +516,7 @@ impl HNSWIndex {
                 let neighbors = &self.connections[i][0];
                 let count = neighbors.len().min(m0);
                 let start = i * m0;
-                self.connections_l0[start..start + count]
-                    .copy_from_slice(&neighbors[..count]);
+                self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
                 self.connections_l0_count[i] = count as u8;
             }
         }
@@ -527,7 +525,8 @@ impl HNSWIndex {
     /// Extend flat L0 cache to accommodate a new node (for incremental add).
     fn extend_l0_cache_for_new_node(&mut self) {
         let m0 = self.config.m0;
-        self.connections_l0.resize(self.connections_l0.len() + m0, 0);
+        self.connections_l0
+            .resize(self.connections_l0.len() + m0, 0);
         self.connections_l0_count.push(0);
     }
 
@@ -715,14 +714,12 @@ impl HNSWIndex {
 
         // Search from top layer to layer 1
         for layer in (1..=self.max_layer).rev() {
-            current_nearest =
-                self.search_layer(query, &current_nearest, 1, layer, ctx, query_norm);
+            current_nearest = self.search_layer(query, &current_nearest, 1, layer, ctx, query_norm);
         }
 
         // Search layer 0 with ef_search candidates
         let ef = self.config.ef_search.max(k);
-        current_nearest =
-            self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
+        current_nearest = self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
 
         // Convert to SearchResults (cold path — distances already computed above)
         let mut results: Vec<SearchResult> = current_nearest
@@ -765,9 +762,7 @@ impl HNSWIndex {
             .map(|query| {
                 CTX.with(|ctx| {
                     let mut ctx_ref = ctx.borrow_mut();
-                    if ctx_ref.is_none()
-                        || ctx_ref.as_ref().unwrap().capacity < self.len()
-                    {
+                    if ctx_ref.is_none() || ctx_ref.as_ref().unwrap().capacity < self.len() {
                         *ctx_ref = Some(SearchContext::new(self.len()));
                     }
                     self.search_with_context(query, k, ctx_ref.as_mut().unwrap())
@@ -863,8 +858,14 @@ impl HNSWIndex {
 
         // Search for nearest neighbors from top to target layer + 1
         for layer in (node_level + 1..=self.max_layer).rev() {
-            current_nearest =
-                self.search_layer(&node_embedding, &current_nearest, 1, layer, &mut ctx, query_norm);
+            current_nearest = self.search_layer(
+                &node_embedding,
+                &current_nearest,
+                1,
+                layer,
+                &mut ctx,
+                query_norm,
+            );
         }
 
         // Insert into layers from top to bottom
@@ -1005,20 +1006,12 @@ impl HNSWIndex {
                             prefetch_embedding(ahead_ptr, CACHE_LINES_PER_EMBEDDING);
 
                             // Prefetch the visited bitset word for the lookahead neighbor
-                            let bitset_ptr = ctx
-                                .visited
-                                .bits
-                                .as_ptr()
-                                .wrapping_add(ahead_id >> 6)
-                                as *const u8;
+                            let bitset_ptr =
+                                ctx.visited.bits.as_ptr().wrapping_add(ahead_id >> 6) as *const u8;
                             prefetch_read(bitset_ptr);
 
                             // Prefetch the norm for the lookahead neighbor
-                            let norm_ptr = self
-                                .norms
-                                .as_ptr()
-                                .wrapping_add(ahead_id)
-                                as *const u8;
+                            let norm_ptr = self.norms.as_ptr().wrapping_add(ahead_id) as *const u8;
                             prefetch_read(norm_ptr);
                         }
                     }
