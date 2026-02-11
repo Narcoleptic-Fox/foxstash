@@ -1,0 +1,2 @@
+Version: 1.11.2
+Arguments: ['C:\\Program Files (x86)\\pipx\\.cache\\5e67f2a773c5449\\Scripts\\delvewheel', 'repair', '-v', '-w', 'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cibw-run-lckizddx\\cp312-win_amd64\\repaired_wheel', 'C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cibw-run-lckizddx\\cp312-win_amd64\\built_wheel\\faiss_cpu-1.13.2-cp312-cp312-win_amd64.whl']

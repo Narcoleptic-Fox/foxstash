@@ -56,6 +56,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
+use std::sync::{Mutex, RwLock};
 
 // =============================================================================
 // Thread-local Error Storage
@@ -87,7 +88,7 @@ fn clear_last_error() {
 // =============================================================================
 
 /// Trait for unified index operations
-trait RagIndex: Send {
+trait RagIndex: Send + Sync {
     fn add(&mut self, document: Document) -> Result<(), String>;
     fn search(&self, query: &[f32], k: usize) -> Result<Vec<CoreSearchResult>, String>;
     fn len(&self) -> usize;
@@ -149,8 +150,8 @@ impl RagIndex for HNSWIndex {
 
 /// Opaque handle to RAG index
 pub struct RagHandle {
-    index: Box<dyn RagIndex>,
-    storage: Option<FileStorage>,
+    index: RwLock<Box<dyn RagIndex>>,
+    storage: Mutex<Option<FileStorage>>,
     embedding_dim: usize,
 }
 
@@ -213,8 +214,8 @@ pub extern "C" fn rag_create(embedding_dim: usize, use_hnsw: i32) -> *mut RagHan
         };
 
         let handle = RagHandle {
-            index,
-            storage: None,
+            index: RwLock::new(index),
+            storage: Mutex::new(None),
             embedding_dim,
         };
 
@@ -326,7 +327,7 @@ pub extern "C" fn rag_add_document(
         }
 
         unsafe {
-            let handle = &mut *handle;
+            let handle = &*handle;
 
             // Validate embedding dimension
             if embedding_len != handle.embedding_dim {
@@ -366,7 +367,15 @@ pub extern "C" fn rag_add_document(
             };
 
             // Add to index
-            match handle.index.add(document) {
+            let mut index = match handle.index.write() {
+                Ok(lock) => lock,
+                Err(_) => {
+                    set_last_error("Index lock poisoned".to_string());
+                    return -1;
+                }
+            };
+
+            match index.add(document) {
                 Ok(_) => 0,
                 Err(e) => {
                     set_last_error(format!("Failed to add document: {}", e));
@@ -475,7 +484,15 @@ pub extern "C" fn rag_search(
             let query_vec = std::slice::from_raw_parts(query, query_len);
 
             // Perform search
-            let results = match handle.index.search(query_vec, k) {
+            let index = match handle.index.read() {
+                Ok(lock) => lock,
+                Err(_) => {
+                    set_last_error("Index lock poisoned".to_string());
+                    return -1;
+                }
+            };
+
+            let results = match index.search(query_vec, k) {
                 Ok(r) => r,
                 Err(e) => {
                     set_last_error(format!("Search failed: {}", e));
@@ -608,7 +625,7 @@ pub extern "C" fn rag_save(handle: *mut RagHandle, path: *const c_char) -> i32 {
         }
 
         unsafe {
-            let handle = &mut *handle;
+            let handle = &*handle;
 
             // Convert path to Rust string
             let path_str = match CStr::from_ptr(path).to_str() {
@@ -620,25 +637,43 @@ pub extern "C" fn rag_save(handle: *mut RagHandle, path: *const c_char) -> i32 {
             };
 
             // Create or get storage
-            let storage = match &handle.storage {
+            let mut storage_guard = match handle.storage.lock() {
+                Ok(lock) => lock,
+                Err(_) => {
+                    set_last_error("Storage lock poisoned".to_string());
+                    return -1;
+                }
+            };
+
+            if storage_guard.is_none() {
+                // Create new storage
+                match FileStorage::new(path_str) {
+                    Ok(s) => *storage_guard = Some(s),
+                    Err(e) => {
+                        set_last_error(format!("Failed to create storage: {}", e));
+                        return -1;
+                    }
+                };
+            }
+
+            let storage = match storage_guard.as_ref() {
                 Some(s) => s,
                 None => {
-                    // Create new storage
-                    match FileStorage::new(path_str) {
-                        Ok(s) => {
-                            handle.storage = Some(s);
-                            handle.storage.as_ref().unwrap()
-                        }
-                        Err(e) => {
-                            set_last_error(format!("Failed to create storage: {}", e));
-                            return -1;
-                        }
-                    }
+                    set_last_error("Storage not initialized".to_string());
+                    return -1;
                 }
             };
 
             // Save index
-            match handle.index.save(storage, "index") {
+            let index = match handle.index.read() {
+                Ok(lock) => lock,
+                Err(_) => {
+                    set_last_error("Index lock poisoned".to_string());
+                    return -1;
+                }
+            };
+
+            match index.save(storage, "index") {
                 Ok(_) => 0,
                 Err(e) => {
                     set_last_error(format!("Failed to save index: {}", e));
@@ -718,8 +753,8 @@ pub extern "C" fn rag_load(path: *const c_char, use_hnsw: i32) -> *mut RagHandle
                         Ok(index) => {
                             let embedding_dim = index.embedding_dim();
                             let handle = RagHandle {
-                                index: Box::new(index),
-                                storage: Some(storage),
+                                index: RwLock::new(Box::new(index)),
+                                storage: Mutex::new(Some(storage)),
                                 embedding_dim,
                             };
                             Box::into_raw(Box::new(handle))
@@ -741,8 +776,8 @@ pub extern "C" fn rag_load(path: *const c_char, use_hnsw: i32) -> *mut RagHandle
                         Ok(index) => {
                             let embedding_dim = index.embedding_dim();
                             let handle = RagHandle {
-                                index: Box::new(index),
-                                storage: Some(storage),
+                                index: RwLock::new(Box::new(index)),
+                                storage: Mutex::new(Some(storage)),
                                 embedding_dim,
                             };
                             Box::into_raw(Box::new(handle))
@@ -798,7 +833,11 @@ pub extern "C" fn rag_count(handle: *const RagHandle) -> usize {
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
         let handle = &*handle;
-        handle.index.len()
+        let index = match handle.index.read() {
+            Ok(lock) => lock,
+            Err(_) => return 0,
+        };
+        index.len()
     }));
 
     result.unwrap_or(0)
@@ -831,8 +870,15 @@ pub extern "C" fn rag_clear(handle: *mut RagHandle) -> i32 {
     }
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
-        let handle = &mut *handle;
-        handle.index.clear();
+        let handle = &*handle;
+        let mut index = match handle.index.write() {
+            Ok(lock) => lock,
+            Err(_) => {
+                set_last_error("Index lock poisoned".to_string());
+                return -1;
+            }
+        };
+        index.clear();
         0
     }));
 
@@ -1241,5 +1287,11 @@ mod tests {
         assert_eq!(rag_count(handle), 100);
 
         rag_destroy(handle);
+    }
+
+    #[test]
+    fn test_rag_handle_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RagHandle>();
     }
 }

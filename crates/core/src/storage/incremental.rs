@@ -726,11 +726,11 @@ impl IncrementalStorage {
     }
 
     fn cleanup_old_checkpoints(&self, current_id: u64) -> Result<()> {
-        if self.config.keep_checkpoints == 0 {
-            return Ok(());
-        }
-
-        let cutoff = current_id.saturating_sub(self.config.keep_checkpoints as u64);
+        let cutoff = if self.config.keep_checkpoints == 0 {
+            current_id.saturating_sub(1)
+        } else {
+            current_id.saturating_sub(self.config.keep_checkpoints as u64)
+        };
 
         for entry in fs::read_dir(&self.base_path)
             .map_err(|e| RagError::StorageError(format!("Failed to read dir: {}", e)))?
@@ -746,7 +746,7 @@ impl IncrementalStorage {
                     .and_then(|s| s.split('.').next())
                 {
                     if let Ok(id) = id_str.parse::<u64>() {
-                        if id < cutoff {
+                        if id <= cutoff {
                             let _ = fs::remove_file(entry.path());
                         }
                     }
@@ -1050,5 +1050,79 @@ mod tests {
             let entries = storage.get_wal_entries().unwrap();
             assert_eq!(entries.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_keep_checkpoints_zero_prunes_old_checkpoints() {
+        let dir = TempDir::new().unwrap();
+        let mut storage = IncrementalStorage::new(
+            dir.path(),
+            IncrementalConfig::default().with_keep_checkpoints(0),
+        )
+        .unwrap();
+
+        let data = vec!["doc".to_string()];
+        for checkpoint_no in 0..3 {
+            storage
+                .checkpoint(
+                    &data,
+                    IndexMetadata {
+                        document_count: 1,
+                        embedding_dim: 128,
+                        index_type: format!("test_{}", checkpoint_no),
+                    },
+                )
+                .unwrap();
+        }
+
+        let checkpoint_bins: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("checkpoint_") && name.ends_with(".bin"))
+            .collect();
+
+        assert_eq!(
+            checkpoint_bins.len(),
+            1,
+            "keep_checkpoints=0 should keep only current checkpoint"
+        );
+    }
+
+    #[test]
+    fn test_keep_checkpoints_exact_retention_count() {
+        let dir = TempDir::new().unwrap();
+        let mut storage = IncrementalStorage::new(
+            dir.path(),
+            IncrementalConfig::default().with_keep_checkpoints(2),
+        )
+        .unwrap();
+
+        let data = vec!["doc".to_string()];
+        for checkpoint_no in 0..5 {
+            storage
+                .checkpoint(
+                    &data,
+                    IndexMetadata {
+                        document_count: 1,
+                        embedding_dim: 128,
+                        index_type: format!("test_{}", checkpoint_no),
+                    },
+                )
+                .unwrap();
+        }
+
+        let checkpoint_bins: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("checkpoint_") && name.ends_with(".bin"))
+            .collect();
+
+        assert_eq!(
+            checkpoint_bins.len(),
+            2,
+            "retention should keep exactly keep_checkpoints checkpoint files"
+        );
     }
 }

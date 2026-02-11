@@ -52,7 +52,7 @@ use crate::{Document, RagError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STORAGE_VERSION: u32 = 1;
@@ -239,6 +239,8 @@ impl FileStorage {
     /// # }
     /// ```
     pub fn save_document(&self, id: &str, document: &Document) -> Result<CompressionStats> {
+        Self::validate_item_name(id)?;
+
         // Use JSON serialization for documents because they contain serde_json::Value metadata
         let serialized = serde_json::to_vec(document)
             .map_err(|e| RagError::StorageError(format!("JSON serialization failed: {}", e)))?;
@@ -302,6 +304,8 @@ impl FileStorage {
     /// # }
     /// ```
     pub fn load_document(&self, id: &str) -> Result<Document> {
+        Self::validate_item_name(id)?;
+
         // Check if item exists
         if !self.exists(id) {
             return Err(RagError::StorageError(format!(
@@ -365,6 +369,7 @@ impl FileStorage {
         name: &str,
         index: &FlatIndexWrapper,
     ) -> Result<CompressionStats> {
+        Self::validate_item_name(name)?;
         self.save_with_metadata(name, index, "flat_index")
     }
 
@@ -382,6 +387,7 @@ impl FileStorage {
     ///
     /// Returns error if index doesn't exist or deserialization fails.
     pub fn load_flat_index(&self, name: &str) -> Result<FlatIndexWrapper> {
+        Self::validate_item_name(name)?;
         self.load_with_metadata(name)
     }
 
@@ -404,6 +410,7 @@ impl FileStorage {
         name: &str,
         index: &HNSWIndexWrapper,
     ) -> Result<CompressionStats> {
+        Self::validate_item_name(name)?;
         self.save_with_metadata(name, index, "hnsw_index")
     }
 
@@ -421,6 +428,7 @@ impl FileStorage {
     ///
     /// Returns error if index doesn't exist or deserialization fails.
     pub fn load_hnsw_index(&self, name: &str) -> Result<HNSWIndexWrapper> {
+        Self::validate_item_name(name)?;
         self.load_with_metadata(name)
     }
 
@@ -451,6 +459,8 @@ impl FileStorage {
     /// # }
     /// ```
     pub fn delete(&self, name: &str) -> Result<()> {
+        Self::validate_item_name(name)?;
+
         let data_path = self.item_path(name);
         let meta_path = self.metadata_path(name);
 
@@ -553,6 +563,8 @@ impl FileStorage {
     /// # }
     /// ```
     pub fn get_metadata(&self, name: &str) -> Result<StorageMetadata> {
+        Self::validate_item_name(name)?;
+
         let meta_path = self.metadata_path(name);
 
         if !meta_path.exists() {
@@ -679,10 +691,40 @@ impl FileStorage {
     /// # }
     /// ```
     pub fn exists(&self, name: &str) -> bool {
+        if Self::is_invalid_item_name(name) {
+            return false;
+        }
         self.item_path(name).exists() && self.metadata_path(name).exists()
     }
 
     // Internal helper methods
+
+    fn is_invalid_item_name(name: &str) -> bool {
+        if name.is_empty() {
+            return true;
+        }
+
+        let path = Path::new(name);
+        if path.is_absolute() {
+            return true;
+        }
+
+        let mut components = path.components();
+        match components.next() {
+            Some(Component::Normal(_)) => components.next().is_some(),
+            _ => true,
+        }
+    }
+
+    fn validate_item_name(name: &str) -> Result<()> {
+        if Self::is_invalid_item_name(name) {
+            return Err(RagError::StorageError(format!(
+                "Invalid item name: '{}'. Names must be a single path segment",
+                name
+            )));
+        }
+        Ok(())
+    }
 
     /// Get path for item data file
     fn item_path(&self, name: &str) -> PathBuf {
@@ -1311,5 +1353,15 @@ mod tests {
         assert_eq!(loaded.id, large_doc.id);
         assert_eq!(loaded.embedding.len(), 10000);
         assert_eq!(loaded.content.len(), 100000);
+    }
+
+    #[test]
+    fn test_rejects_path_traversal_item_names() {
+        let dir = tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).unwrap();
+        let doc = create_test_document("doc1");
+
+        let result = storage.save_document("../outside", &doc);
+        assert!(result.is_err(), "path traversal names should be rejected");
     }
 }

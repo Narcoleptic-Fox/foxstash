@@ -51,13 +51,13 @@ impl Eq for OrderedFloat {}
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -379,6 +379,17 @@ impl HNSWIndex {
     pub fn build(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         if embeddings.is_empty() {
             return Self::new(0, config);
+        }
+
+        let expected_dim = embeddings[0].len();
+        for (i, embedding) in embeddings.iter().enumerate() {
+            assert!(
+                embedding.len() == expected_dim,
+                "All embeddings must have the same dimension: expected {}, got {} at index {}",
+                expected_dim,
+                embedding.len(),
+                i
+            );
         }
 
         let n = embeddings.len();
@@ -737,7 +748,7 @@ impl HNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
 
         Ok(results)
@@ -1052,7 +1063,7 @@ impl HNSWIndex {
             .map(|(OrderedFloat(dist), id)| (dist, id))
             .collect();
 
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
         results.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -1108,7 +1119,7 @@ impl HNSWIndex {
                 (dist, id)
             })
             .collect();
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         // Select neighbors using the heuristic
         let mut selected: Vec<usize> = Vec::with_capacity(m);
@@ -1167,7 +1178,7 @@ impl HNSWIndex {
             })
             .collect();
 
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
     }
@@ -1665,8 +1676,7 @@ impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Sort by distance, then by pid for stability
         self.distance
-            .partial_cmp(&other.distance)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&other.distance)
             .then_with(|| self.pid.cmp(&other.pid))
     }
 }
@@ -2161,5 +2171,33 @@ mod tests {
         let metadata = results[0].metadata.as_ref().unwrap();
         assert_eq!(metadata["category"], "test");
         assert_eq!(metadata["priority"], 5);
+    }
+
+    #[test]
+    fn test_search_with_nan_query_does_not_panic() {
+        let mut index = HNSWIndex::with_defaults(3);
+        index
+            .add(create_test_document("doc1", vec![1.0, 0.0, 0.0]))
+            .unwrap();
+        index
+            .add(create_test_document("doc2", vec![0.0, 1.0, 0.0]))
+            .unwrap();
+
+        let query = vec![f32::NAN, 0.0, 0.0];
+        let outcome = std::panic::catch_unwind(|| index.search(&query, 2));
+
+        assert!(
+            outcome.is_ok(),
+            "search panicked when query contains NaN"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "All embeddings must have the same dimension")]
+    fn test_build_rejects_mismatched_dimensions() {
+        let _ = HNSWIndex::build(
+            vec![vec![1.0, 0.0, 0.0], vec![1.0, 0.0]],
+            HNSWConfig::default(),
+        );
     }
 }
