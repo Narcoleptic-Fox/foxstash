@@ -517,7 +517,7 @@ impl PQHNSWIndex {
             .into_iter()
             .map(|(OrderedFloat(dist), id)| (dist, id))
             .collect();
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
         results.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -577,7 +577,7 @@ impl PQHNSWIndex {
             .into_iter()
             .map(|(OrderedFloat(dist), id)| (dist, id))
             .collect();
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
         results.into_iter().map(|(_, id)| id).collect()
     }
 
@@ -590,7 +590,7 @@ impl PQHNSWIndex {
             })
             .collect();
 
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
     }
@@ -626,7 +626,7 @@ impl PQHNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
         results
     }
@@ -652,7 +652,7 @@ impl PQHNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
         results
     }
@@ -679,7 +679,7 @@ impl PQHNSWIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
         results
     }
@@ -693,13 +693,13 @@ impl Eq for OrderedFloat {}
 
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -903,5 +903,27 @@ mod tests {
         // ADC should generally give better results
         let adc_results = index.search(&query, 10).unwrap();
         assert_eq!(adc_results.len(), 10);
+    }
+
+    #[test]
+    fn test_pq_search_with_nan_query_does_not_panic() {
+        let dim = 64;
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(7)
+            .with_kmeans_iterations(5);
+        let training_data = generate_random_vectors(256, dim, 11);
+
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+        index
+            .add(create_test_document(
+                "doc1",
+                generate_random_vectors(1, dim, 99)[0].clone(),
+            ))
+            .unwrap();
+
+        let query = vec![f32::NAN; dim];
+        let outcome = std::panic::catch_unwind(|| index.search(&query, 1));
+        assert!(outcome.is_ok(), "PQ search panicked when query contains NaN");
     }
 }
