@@ -12,23 +12,23 @@ Comparative benchmarks against industry-standard ANN libraries.
 
 | Library | Build | Search Mode | Search QPS | Recall@10 |
 |---------|-------|-------------|------------|-----------|
-| **Foxstash** | parallel | batch (rayon) | **12,948** | 59.8% |
-| **Foxstash** | parallel | single-threaded (ctx reuse) | **1,238** | 59.8% |
-| **Foxstash** | sequential | single-threaded (ctx reuse) | 1,234 | 56.9% |
-| instant-distance | default | single-threaded (ctx reuse) | 539 | 58.0% |
+| **Foxstash** | parallel | batch (rayon) | **13,366** | 61.0% |
+| **Foxstash** | parallel | single-threaded (ctx reuse) | **1,322** | 61.0% |
+| **Foxstash** | sequential | single-threaded (ctx reuse) | 1,274 | 58.8% |
+| instant-distance | default | single-threaded (ctx reuse) | 575 | 60.2% |
 
-Build times: Foxstash parallel **7.7s**, Foxstash sequential 589s, instant-distance 75.2s
+Build times: Foxstash parallel **7.6s**, Foxstash sequential 541s, instant-distance 73.9s
 
 ### Analysis
 
-- **Single-threaded search:** Foxstash is **2.3x faster** than instant-distance (1,238 vs 539 QPS)
-- **Batch search:** Foxstash is **24x faster** than instant-distance (12,948 vs 539 QPS)
-- **Build Performance:** Foxstash parallel build is **9.8x faster** than instant-distance
-- **Recall:** Comparable (59.8% Foxstash vs 58.0% instant-distance with same synthetic data)
+- **Single-threaded search:** Foxstash is **2.3x faster** than instant-distance (1,322 vs 575 QPS)
+- **Batch search:** Foxstash is **23x faster** than instant-distance (13,366 vs 575 QPS)
+- **Build Performance:** Foxstash parallel build is **9.7x faster** than instant-distance
+- **Recall:** Comparable (61.0% Foxstash vs 60.2% instant-distance with same synthetic data)
 
 ### Search Optimizations (v0.3)
 
-The single-threaded QPS improvement from ~800 to ~1,240 comes from:
+The single-threaded QPS improvement from ~800 to ~1,320 comes from:
 
 1. **Fused cosine distance** — single SIMD dispatch + single pass (was 4 dispatch calls, 3 passes)
 2. **Precomputed norms** — stored at insert time, eliminates per-query recomputation
@@ -36,13 +36,14 @@ The single-threaded QPS improvement from ~800 to ~1,240 comes from:
 4. **Deeper prefetching** — 2 neighbors ahead, 3 cache lines per embedding, cross-platform
 5. **Batch distance + deferred heap** — compute/memory separation for better ILP
 6. **Flat layer 0 connections** — single-indirection array (was triple-indirection Vec<Vec<Vec>>)
+7. **Unified search path** — single optimized `search_layer` used by both search and index construction
 
 ## Python Ecosystem Comparison (100K vectors)
 
 | Library | Build Time | Search QPS | Recall@10 |
 |---------|------------|------------|-----------|
-| hnswlib | 5.74s | 4,110 | 39.5% |
-| faiss-hnsw | 8.63s | 3,131 | 44.9% |
+| hnswlib | 5.70s | 4,004 | 39.5% |
+| faiss-hnsw | 8.64s | 3,139 | 44.9% |
 
 > **Note:** Python benchmarks use `ef_search=64` vs Foxstash `ef_search=100`.
 > Lower ef_search increases QPS but reduces recall. An apples-to-apples comparison
@@ -52,11 +53,11 @@ The single-threaded QPS improvement from ~800 to ~1,240 comes from:
 
 | Library | Search QPS | vs Foxstash (1T) |
 |---------|------------|------------------|
-| **Foxstash** (batch) | **12,948** | — |
-| **Foxstash** (1T) | **1,238** | — |
-| hnswlib (C++, ef=64) | 4,110 | 3.3x faster* |
-| faiss-hnsw (C++, ef=64) | 3,131 | 2.5x faster* |
-| instant-distance (Rust) | 539 | 2.3x slower |
+| **Foxstash** (batch) | **13,366** | — |
+| **Foxstash** (1T) | **1,322** | — |
+| hnswlib (C++, ef=64) | 4,004 | 3.0x faster* |
+| faiss-hnsw (C++, ef=64) | 3,139 | 2.4x faster* |
+| instant-distance (Rust) | 575 | 2.3x slower |
 
 *hnswlib/faiss use lower ef_search (64 vs 100), inflating their QPS relative to Foxstash.
 
@@ -72,9 +73,9 @@ higher recall than these synthetic benchmarks.
 
 ### Foxstash Advantages
 
-- **Search speed** — 2.3x faster than instant-distance single-threaded, 24x with rayon
-- **Build speed** — 9.8x faster than instant-distance
-- **Comparable recall** — 59.8% vs 58.0% at same parameters
+- **Search speed** — 2.3x faster than instant-distance single-threaded, 23x with rayon
+- **Build speed** — 9.7x faster than instant-distance
+- **Comparable recall** — 61.0% vs 60.2% at same parameters
 - **Quantization options** — SQ8 (4x), Binary (32x), PQ (192x) compression
 - **WASM support** — Same code runs in browser
 - **Streaming ingestion** — Batch processing with progress callbacks

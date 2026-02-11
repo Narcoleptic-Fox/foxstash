@@ -11,9 +11,8 @@
 //! - Concurrent parallel search
 
 use foxstash_core::index::{
-    BatchBuilder, BatchConfig, BinaryHNSWIndex, FlatIndex, FilteredSearchBuilder, HNSWIndex,
-    PQHNSWConfig, PQHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex, SearchPage,
-    SearchResultIterator,
+    BatchBuilder, BatchConfig, BinaryHNSWIndex, FilteredSearchBuilder, FlatIndex, HNSWIndex,
+    PQHNSWConfig, PQHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex, SearchPage, SearchResultIterator,
 };
 use foxstash_core::storage::compression::{self, Codec};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
@@ -73,11 +72,7 @@ fn make_doc_with_metadata(
 }
 
 /// Compute brute-force ground truth top-k using FlatIndex as the oracle.
-fn brute_force_top_k(
-    documents: &[Document],
-    query: &[f32],
-    k: usize,
-) -> Vec<SearchResult> {
+fn brute_force_top_k(documents: &[Document], query: &[f32], k: usize) -> Vec<SearchResult> {
     let dim = query.len();
     let mut flat = FlatIndex::new(dim);
     for doc in documents {
@@ -168,7 +163,10 @@ mod document_lifecycle {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "meta_doc");
 
-        let result_meta = results[0].metadata.as_ref().expect("metadata should be present");
+        let result_meta = results[0]
+            .metadata
+            .as_ref()
+            .expect("metadata should be present");
         assert_eq!(result_meta["source"], "unit_test");
         assert_eq!(result_meta["category"], "integration");
         assert_eq!(result_meta["priority"], 42);
@@ -192,7 +190,10 @@ mod document_lifecycle {
         let query = deterministic_embedding(dim, 0);
         let results = index.search(&query, 1).unwrap();
 
-        assert_eq!(results[0].content, "This is the original content that should be preserved");
+        assert_eq!(
+            results[0].content,
+            "This is the original content that should be preserved"
+        );
     }
 
     #[test]
@@ -265,7 +266,10 @@ mod index_persistence {
 
         assert_eq!(original_results.len(), loaded_results.len());
         for (orig, loaded_r) in original_results.iter().zip(loaded_results.iter()) {
-            assert_eq!(orig.id, loaded_r.id, "Result IDs should match after roundtrip");
+            assert_eq!(
+                orig.id, loaded_r.id,
+                "Result IDs should match after roundtrip"
+            );
             assert!(
                 (orig.score - loaded_r.score).abs() < 1e-5,
                 "Scores should match after roundtrip"
@@ -426,7 +430,12 @@ mod quantized_accuracy {
         // All should return k results
         assert_eq!(hnsw_results.len(), k, "HNSW should return {} results", k);
         assert_eq!(sq8_results.len(), k, "SQ8 should return {} results", k);
-        assert_eq!(binary_results.len(), k, "Binary should return {} results", k);
+        assert_eq!(
+            binary_results.len(),
+            k,
+            "Binary should return {} results",
+            k
+        );
 
         // All results should be sorted by score descending
         for (name, results) in [
@@ -437,7 +446,8 @@ mod quantized_accuracy {
             for window in results.windows(2) {
                 assert!(
                     window[0].score >= window[1].score,
-                    "{} results not sorted", name
+                    "{} results not sorted",
+                    name
                 );
             }
         }
@@ -473,10 +483,7 @@ mod quantized_accuracy {
 
         // Results should be sorted by score descending
         for window in results.windows(2) {
-            assert!(
-                window[0].score >= window[1].score,
-                "PQ results not sorted"
-            );
+            assert!(window[0].score >= window[1].score, "PQ results not sorted");
         }
     }
 
@@ -562,7 +569,11 @@ mod incremental_persistence {
 
         // Verify integrity checksums
         for entry in &entries {
-            assert!(entry.verify(), "WAL entry {} failed integrity check", entry.seq);
+            assert!(
+                entry.verify(),
+                "WAL entry {} failed integrity check",
+                entry.seq
+            );
         }
     }
 
@@ -673,10 +684,16 @@ mod incremental_persistence {
         let dim = 4;
         storage.log_add(&make_doc("a", dim, 0)).unwrap();
         storage.log_add(&make_doc("b", dim, 1)).unwrap();
-        assert!(!storage.needs_checkpoint(), "Should not need checkpoint at 2 ops");
+        assert!(
+            !storage.needs_checkpoint(),
+            "Should not need checkpoint at 2 ops"
+        );
 
         storage.log_add(&make_doc("c", dim, 2)).unwrap();
-        assert!(storage.needs_checkpoint(), "Should need checkpoint at 3 ops");
+        assert!(
+            storage.needs_checkpoint(),
+            "Should need checkpoint at 3 ops"
+        );
     }
 }
 
@@ -870,7 +887,10 @@ mod batch_and_streaming {
         builder.add(make_doc("good_2", dim, 1)).unwrap();
 
         let result = builder.finish();
-        assert_eq!(result.documents_indexed, 2, "Only 2 good docs should be indexed");
+        assert_eq!(
+            result.documents_indexed, 2,
+            "Only 2 good docs should be indexed"
+        );
         assert!(result.has_errors(), "Should have 1 error");
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].0, "bad_1");
@@ -981,7 +1001,10 @@ mod edge_cases {
         let index = HNSWIndex::with_defaults(16);
         let query = deterministic_embedding(16, 0);
         let results = index.search(&query, 10).unwrap();
-        assert!(results.is_empty(), "Search on empty index should return no results");
+        assert!(
+            results.is_empty(),
+            "Search on empty index should return no results"
+        );
     }
 
     #[test]
@@ -992,9 +1015,16 @@ mod edge_cases {
 
         let query = deterministic_embedding(dim, 0);
         let results = index.search(&query, 5).unwrap();
-        assert_eq!(results.len(), 1, "Should return 1 result from single-doc index");
+        assert_eq!(
+            results.len(),
+            1,
+            "Should return 1 result from single-doc index"
+        );
         assert_eq!(results[0].id, "only_doc");
-        assert!(results[0].score > 0.99, "Exact match should have score ~1.0");
+        assert!(
+            results[0].score > 0.99,
+            "Exact match should have score ~1.0"
+        );
     }
 
     #[test]
@@ -1073,7 +1103,10 @@ mod edge_cases {
 
         let query = deterministic_embedding(dim, 1);
         let results = index.search(&query, 1).unwrap();
-        assert_eq!(results[0].content, "Replaced", "Should have the second version");
+        assert_eq!(
+            results[0].content, "Replaced",
+            "Should have the second version"
+        );
     }
 
     #[test]
@@ -1121,7 +1154,11 @@ mod edge_cases {
         // Search with zero query
         let zero_query = vec![0.0; dim];
         let results = index.search(&zero_query, 2).unwrap();
-        assert_eq!(results.len(), 2, "Should still return results for zero query");
+        assert_eq!(
+            results.len(),
+            2,
+            "Should still return results for zero query"
+        );
 
         // Search with non-zero query
         let query = deterministic_embedding(dim, 1);
@@ -1141,7 +1178,10 @@ mod edge_cases {
             embedding: vec![0.0; 8],
             metadata: None,
         };
-        assert!(index.add(bad_doc).is_err(), "Should reject mismatched dimension");
+        assert!(
+            index.add(bad_doc).is_err(),
+            "Should reject mismatched dimension"
+        );
 
         // Wrong dimension in search
         let bad_query = vec![0.0; 8];
@@ -1243,7 +1283,11 @@ mod concurrent_access {
 
         let batch_results = index.search_batch(&queries, 5).unwrap();
 
-        assert_eq!(batch_results.len(), 10, "Should return results for all 10 queries");
+        assert_eq!(
+            batch_results.len(),
+            10,
+            "Should return results for all 10 queries"
+        );
         for (i, results) in batch_results.iter().enumerate() {
             assert_eq!(results.len(), 5, "Query {} should return 5 results", i);
             for window in results.windows(2) {
@@ -1269,7 +1313,12 @@ mod concurrent_access {
 
         assert_eq!(batch_results.len(), 10);
         for (i, results) in batch_results.iter().enumerate() {
-            assert_eq!(results.len(), 5, "Fast batch query {} should return 5 results", i);
+            assert_eq!(
+                results.len(),
+                5,
+                "Fast batch query {} should return 5 results",
+                i
+            );
         }
     }
 
@@ -1369,5 +1418,8 @@ fn full_pipeline_create_index_persist_load_search() {
 
     // Step 7: Verify metadata survived the full pipeline
     let top_result = &results[0];
-    assert!(top_result.metadata.is_some(), "Metadata should survive persistence");
+    assert!(
+        top_result.metadata.is_some(),
+        "Metadata should survive persistence"
+    );
 }

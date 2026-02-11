@@ -101,13 +101,14 @@ impl OnnxEmbedder {
     /// # Ok::<(), foxstash_core::RagError>(())
     /// ```
     pub fn init_from(lib_path: impl AsRef<Path>) -> Result<()> {
-        let builder = ort::init_from(lib_path.as_ref().to_string_lossy().as_ref()).map_err(|e| {
-            RagError::EmbeddingError(format!(
-                "Failed to initialize ONNX Runtime from {:?}: {}",
-                lib_path.as_ref(),
-                e
-            ))
-        })?;
+        let builder =
+            ort::init_from(lib_path.as_ref().to_string_lossy().as_ref()).map_err(|e| {
+                RagError::EmbeddingError(format!(
+                    "Failed to initialize ONNX Runtime from {:?}: {}",
+                    lib_path.as_ref(),
+                    e
+                ))
+            })?;
         builder.commit();
         Ok(())
     }

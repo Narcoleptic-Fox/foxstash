@@ -668,7 +668,11 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let norm_a = norm_simd(&a);
         let dist = cosine_distance_prenorm(&a, &a, norm_a);
-        assert!(dist.abs() < EPSILON, "Identical vectors should have distance ~0, got {}", dist);
+        assert!(
+            dist.abs() < EPSILON,
+            "Identical vectors should have distance ~0, got {}",
+            dist
+        );
     }
 
     #[test]
@@ -677,6 +681,10 @@ mod tests {
         let b: Vec<f32> = a.iter().map(|x| -x).collect();
         let norm_b = norm_simd(&b);
         let dist = cosine_distance_prenorm(&a, &b, norm_b);
-        assert!((dist - 2.0).abs() < EPSILON, "Opposite vectors should have distance ~2, got {}", dist);
+        assert!(
+            (dist - 2.0).abs() < EPSILON,
+            "Opposite vectors should have distance ~2, got {}",
+            dist
+        );
     }
 }
