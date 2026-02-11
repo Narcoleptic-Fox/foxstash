@@ -1,0 +1,12 @@
+# Normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Ensure shell scripts use LF even on Windows checkout
+*.sh text eol=lf
+
+# Binary files
+*.onnx binary
+*.bin binary
+*.png binary
+*.jpg binary
+*.wasm binary
