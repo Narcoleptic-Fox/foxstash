@@ -27,7 +27,8 @@ unsafe fn prefetch_read(ptr: *const u8) {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        std::arch::aarch64::_prefetch(ptr as *const i8, 0, 3); // read, L1
+        // Use inline asm instead of std::arch::aarch64::_prefetch which is unstable
+        std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -2212,10 +2213,7 @@ mod tests {
         let query = vec![f32::NAN, 0.0, 0.0];
         let outcome = std::panic::catch_unwind(|| index.search(&query, 2));
 
-        assert!(
-            outcome.is_ok(),
-            "search panicked when query contains NaN"
-        );
+        assert!(outcome.is_ok(), "search panicked when query contains NaN");
     }
 
     #[test]
