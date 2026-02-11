@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 const NUM_VECTORS: usize = 100_000;
+const NUM_QUERIES: usize = 1_000;
 const DIM: usize = 128;
 const K: usize = 10;
 
@@ -32,6 +33,7 @@ fn generate_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 fn measure_recall(index: &HNSWIndex, queries: &[Vec<f32>], base: &[Vec<f32>], k: usize) -> f32 {
+    let mut ctx = index.create_search_context();
     let mut total = 0.0;
     for q in queries.iter().take(100) {
         let mut distances: Vec<(f32, usize)> = base
@@ -50,7 +52,7 @@ fn measure_recall(index: &HNSWIndex, queries: &[Vec<f32>], base: &[Vec<f32>], k:
         distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let truth: HashSet<usize> = distances.iter().take(k).map(|(_, j)| *j).collect();
 
-        let results = index.search(q, k).unwrap();
+        let results = index.search_with_context(q, k, &mut ctx).unwrap();
         let found: HashSet<usize> = results.iter().map(|r| r.id.parse().unwrap()).collect();
         total += truth.intersection(&found).count() as f32 / k as f32;
     }
@@ -59,10 +61,13 @@ fn measure_recall(index: &HNSWIndex, queries: &[Vec<f32>], base: &[Vec<f32>], k:
 
 fn main() {
     println!("=== Foxstash Build Strategy Comparison ===");
-    println!("Dataset: {} vectors, {}d\n", NUM_VECTORS, DIM);
+    println!(
+        "Dataset: {} vectors, {}d, {} queries, top-{}\n",
+        NUM_VECTORS, DIM, NUM_QUERIES, K
+    );
 
     let base = generate_vectors(NUM_VECTORS, DIM, 42);
-    let queries = generate_vectors(1000, DIM, 123);
+    let queries = generate_vectors(NUM_QUERIES, DIM, 123);
 
     for (name, strategy) in [
         ("Sequential", BuildStrategy::Sequential),
@@ -74,12 +79,14 @@ fn main() {
         let index = HNSWIndex::build(base.clone(), config);
         let build_time = start.elapsed();
 
+        // Single-threaded search with context reuse (fair comparison)
+        let mut ctx = index.create_search_context();
         let start = Instant::now();
         for q in &queries {
-            let _ = index.search(q, K);
+            let _ = index.search_with_context(q, K, &mut ctx);
         }
         let search_time = start.elapsed();
-        let qps = 1000.0 / search_time.as_secs_f64();
+        let qps = NUM_QUERIES as f64 / search_time.as_secs_f64();
 
         let recall = measure_recall(&index, &queries, &base, K);
 

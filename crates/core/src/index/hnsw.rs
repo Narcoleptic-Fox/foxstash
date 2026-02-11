@@ -17,6 +17,32 @@ use rayon::prelude::*;
 use std::cmp::{max, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 
+/// Cross-platform cache line prefetch (read hint).
+/// x86_64: _mm_prefetch T0, aarch64: PLDL1KEEP, other: no-op.
+#[inline(always)]
+unsafe fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::aarch64::_prefetch(ptr as *const i8, 0, 3); // read, L1
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// Prefetch multiple cache lines starting at `ptr` (64 bytes per line).
+#[inline(always)]
+unsafe fn prefetch_embedding(ptr: *const u8, cache_lines: usize) {
+    for i in 0..cache_lines {
+        prefetch_read(ptr.add(i * 64));
+    }
+}
+
 /// Wrapper for f32 that implements Ord for use in BinaryHeap
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OrderedFloat(f32);
@@ -35,15 +61,50 @@ impl Ord for OrderedFloat {
     }
 }
 
+/// Packed bitset for visited node tracking.
+///
+/// 1 bit per node = 12.5 KB for 100K nodes (fits L1 cache).
+/// Replaces the previous generation-based Vec<u64> (800 KB, spills to L2/L3).
+struct BitsetVisited {
+    bits: Vec<u64>,
+}
+
+impl BitsetVisited {
+    fn new(n: usize) -> Self {
+        Self {
+            bits: vec![0u64; (n + 63) / 64],
+        }
+    }
+
+    #[inline(always)]
+    fn is_visited(&self, node: usize) -> bool {
+        let word = unsafe { *self.bits.get_unchecked(node >> 6) };
+        word & (1u64 << (node & 63)) != 0
+    }
+
+    #[inline(always)]
+    fn mark_visited(&mut self, node: usize) {
+        unsafe {
+            *self.bits.get_unchecked_mut(node >> 6) |= 1u64 << (node & 63);
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.bits.fill(0);
+    }
+
+}
+
 /// Reusable search context to avoid allocations during search
 ///
 /// Provides ~2-3x speedup over allocating new structures each query.
-/// Uses generation-based visited tracking for O(1) reset between searches.
+/// Uses packed bitset for cache-friendly visited tracking (~12.5 KB for 100K nodes).
 pub struct SearchContext {
-    /// Generation counter for O(1) visited reset
-    generation: u64,
-    /// Per-node generation to check if visited in current search
-    node_generation: Vec<u64>,
+    /// Packed bitset for visited tracking (fits L1 cache)
+    visited: BitsetVisited,
+    /// Number of nodes this context supports
+    capacity: usize,
     /// Reusable min-heap for candidates
     candidates: BinaryHeap<Reverse<(OrderedFloat, usize)>>,
     /// Reusable max-heap for best results
@@ -54,35 +115,31 @@ impl SearchContext {
     /// Create a new search context for an index with `n` nodes
     pub fn new(n: usize) -> Self {
         Self {
-            generation: 1,
-            node_generation: vec![0; n],
+            visited: BitsetVisited::new(n),
+            capacity: n,
             candidates: BinaryHeap::with_capacity(256),
             best: BinaryHeap::with_capacity(256),
         }
     }
 
-    /// Reset for a new search (O(1) operation using generation counter)
+    /// Reset for a new search — clears bitset (~12.5 KB memset for 100K nodes)
     #[inline]
     fn reset(&mut self) {
-        self.generation += 1;
+        self.visited.clear();
         self.candidates.clear();
         self.best.clear();
     }
 
     /// Check if node was visited in current search
-    #[inline]
+    #[inline(always)]
     fn is_visited(&self, node: usize) -> bool {
-        self.node_generation
-            .get(node)
-            .is_some_and(|&g| g == self.generation)
+        self.visited.is_visited(node)
     }
 
     /// Mark node as visited
-    #[inline]
+    #[inline(always)]
     fn mark_visited(&mut self, node: usize) {
-        if node < self.node_generation.len() {
-            self.node_generation[node] = self.generation;
-        }
+        self.visited.mark_visited(node);
     }
 }
 
@@ -227,11 +284,19 @@ pub struct HNSWIndex {
     // === HOT PATH (accessed during every distance computation) ===
     /// All embeddings stored contiguously: embeddings[i * dim .. (i+1) * dim]
     embeddings: Vec<f32>,
+    /// Precomputed L2 norms for each vector (avoids recomputing per distance call)
+    norms: Vec<f32>,
 
     // === GRAPH STRUCTURE ===
     /// Connections for each node at each layer: connections[node_id][layer] -> neighbors
     /// Uses Vec<u32> instead of HashSet for cache-friendly traversal (4-5x faster search)
     connections: Vec<Vec<Vec<u32>>>,
+
+    /// Flat layer 0 connection cache: `node_id * m0 + i` → neighbor_id.
+    /// Eliminates triple-indirection for the hot search path (layer 0 = 99% of search time).
+    connections_l0: Vec<u32>,
+    /// Actual neighbor count per node at layer 0
+    connections_l0_count: Vec<u8>,
 
     // === COLD PATH (only accessed when returning results) ===
     /// Document IDs
@@ -258,7 +323,10 @@ impl HNSWIndex {
             embedding_dim,
             config,
             embeddings: Vec::new(),
+            norms: Vec::new(),
             connections: Vec::new(),
+            connections_l0: Vec::new(),
+            connections_l0_count: Vec::new(),
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -363,6 +431,7 @@ impl HNSWIndex {
 
         // Pre-allocate
         index.embeddings.reserve(n * embedding_dim);
+        index.norms.reserve(n);
         index.connections.reserve(n);
         index.ids.reserve(n);
         index.contents.reserve(n);
@@ -380,7 +449,9 @@ impl HNSWIndex {
             }
 
             // Add to storage
+            let norm = crate::vector::simd::norm_simd(&embeddings[i]);
             index.embeddings.extend_from_slice(&embeddings[i]);
+            index.norms.push(norm);
             index.connections.push(node_connections);
             index.ids.push(i.to_string());
             index.contents.push(String::new());
@@ -400,6 +471,7 @@ impl HNSWIndex {
             }
         }
 
+        index.build_l0_cache();
         index
     }
 
@@ -421,6 +493,42 @@ impl HNSWIndex {
         let start = node_id * self.embedding_dim;
         let end = start + self.embedding_dim;
         &self.embeddings[start..end]
+    }
+
+    /// Get layer 0 neighbors from the flat cache (single indirection).
+    #[inline(always)]
+    fn get_neighbors_l0(&self, node_id: usize) -> &[u32] {
+        let m0 = self.config.m0;
+        let start = node_id * m0;
+        let count = self.connections_l0_count[node_id] as usize;
+        &self.connections_l0[start..start + count]
+    }
+
+    /// Build flat layer 0 cache from the nested `connections` structure.
+    /// Called once after index construction for fast search-time access.
+    fn build_l0_cache(&mut self) {
+        let n = self.len();
+        let m0 = self.config.m0;
+        self.connections_l0 = vec![0u32; n * m0];
+        self.connections_l0_count = vec![0u8; n];
+
+        for i in 0..n {
+            if !self.connections[i].is_empty() {
+                let neighbors = &self.connections[i][0];
+                let count = neighbors.len().min(m0);
+                let start = i * m0;
+                self.connections_l0[start..start + count]
+                    .copy_from_slice(&neighbors[..count]);
+                self.connections_l0_count[i] = count as u8;
+            }
+        }
+    }
+
+    /// Extend flat L0 cache to accommodate a new node (for incremental add).
+    fn extend_l0_cache_for_new_node(&mut self) {
+        let m0 = self.config.m0;
+        self.connections_l0.resize(self.connections_l0.len() + m0, 0);
+        self.connections_l0_count.push(0);
     }
 
     /// Adds a document to the index
@@ -448,11 +556,16 @@ impl HNSWIndex {
         }
 
         // Add to SoA storage
+        let norm = crate::vector::simd::norm_simd(&document.embedding);
         self.embeddings.extend_from_slice(&document.embedding);
+        self.norms.push(norm);
         self.connections.push(node_connections);
         self.ids.push(document.id);
         self.contents.push(document.content);
         self.metadata.push(document.metadata);
+
+        // Extend flat L0 cache for the new node
+        self.extend_l0_cache_for_new_node();
 
         // If this is the first node, make it the entry point
         if self.entry_point.is_none() {
@@ -462,6 +575,9 @@ impl HNSWIndex {
         }
 
         self.insert_node(node_id, node_level);
+
+        // Rebuild L0 cache (insert_node modifies bidirectional connections)
+        self.build_l0_cache();
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -501,11 +617,16 @@ impl HNSWIndex {
         }
 
         // Add to SoA storage
+        let norm = crate::vector::simd::norm_simd(&embedding);
         self.embeddings.extend_from_slice(&embedding);
+        self.norms.push(norm);
         self.connections.push(node_connections);
         self.ids.push(id);
         self.contents.push(String::new());
         self.metadata.push(None);
+
+        // Extend flat L0 cache for the new node
+        self.extend_l0_cache_for_new_node();
 
         // If this is the first node, make it the entry point
         if self.entry_point.is_none() {
@@ -515,6 +636,9 @@ impl HNSWIndex {
         }
 
         self.insert_node(node_id, node_level);
+
+        // Rebuild L0 cache (insert_node modifies bidirectional connections)
+        self.build_l0_cache();
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -534,49 +658,8 @@ impl HNSWIndex {
     /// # Errors
     /// Returns error if query dimension doesn't match index dimension
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        if query.len() != self.embedding_dim {
-            return Err(crate::RagError::DimensionMismatch {
-                expected: self.embedding_dim,
-                actual: query.len(),
-            });
-        }
-
-        if self.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let entry_point = self.entry_point.unwrap();
-        let mut current_nearest = vec![entry_point];
-
-        // Search from top layer to layer 1
-        for layer in (1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(query, &current_nearest, 1, layer);
-        }
-
-        // Search layer 0 with ef_search candidates
-        let ef = self.config.ef_search.max(k);
-        current_nearest = self.search_layer(query, &current_nearest, ef, 0);
-
-        // Convert to SearchResults and return top k (cold path - access document data)
-        let mut results: Vec<SearchResult> = current_nearest
-            .iter()
-            .map(|&node_id| {
-                let embedding = self.get_embedding(node_id);
-                let score = crate::vector::simd::cosine_similarity_simd(query, embedding);
-                SearchResult {
-                    id: self.ids[node_id].clone(),
-                    content: self.contents[node_id].clone(),
-                    score,
-                    metadata: self.metadata[node_id].clone(),
-                }
-            })
-            .collect();
-
-        // Sort by score descending and take top k
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-        results.truncate(k);
-
-        Ok(results)
+        let mut ctx = SearchContext::new(self.len());
+        self.search_with_context(query, k, &mut ctx)
     }
 
     /// Searches for k nearest neighbors for multiple queries in parallel
@@ -624,24 +707,30 @@ impl HNSWIndex {
             return Ok(Vec::new());
         }
 
+        // Precompute query norm once for fused distance
+        let query_norm = crate::vector::simd::norm_simd(query);
+
         let entry_point = self.entry_point.unwrap();
         let mut current_nearest = vec![entry_point];
 
         // Search from top layer to layer 1
         for layer in (1..=self.max_layer).rev() {
-            current_nearest = self.search_layer_fast(query, &current_nearest, 1, layer, ctx);
+            current_nearest =
+                self.search_layer(query, &current_nearest, 1, layer, ctx, query_norm);
         }
 
         // Search layer 0 with ef_search candidates
         let ef = self.config.ef_search.max(k);
-        current_nearest = self.search_layer_fast(query, &current_nearest, ef, 0, ctx);
+        current_nearest =
+            self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
 
-        // Convert to SearchResults
+        // Convert to SearchResults (cold path — distances already computed above)
         let mut results: Vec<SearchResult> = current_nearest
             .iter()
             .map(|&node_id| {
-                let embedding = self.get_embedding(node_id);
-                let score = crate::vector::simd::cosine_similarity_simd(query, embedding);
+                // Use fused distance for final scoring too
+                let dist = self.distance_to_node(query, node_id, query_norm);
+                let score = 1.0 - dist;
                 SearchResult {
                     id: self.ids[node_id].clone(),
                     content: self.contents[node_id].clone(),
@@ -677,7 +766,7 @@ impl HNSWIndex {
                 CTX.with(|ctx| {
                     let mut ctx_ref = ctx.borrow_mut();
                     if ctx_ref.is_none()
-                        || ctx_ref.as_ref().unwrap().node_generation.len() < self.len()
+                        || ctx_ref.as_ref().unwrap().capacity < self.len()
                     {
                         *ctx_ref = Some(SearchContext::new(self.len()));
                     }
@@ -690,7 +779,10 @@ impl HNSWIndex {
     /// Clears all documents from the index
     pub fn clear(&mut self) {
         self.embeddings.clear();
+        self.norms.clear();
         self.connections.clear();
+        self.connections_l0.clear();
+        self.connections_l0_count.clear();
         self.ids.clear();
         self.contents.clear();
         self.metadata.clear();
@@ -766,10 +858,13 @@ impl HNSWIndex {
 
         // Get embedding once (hot path optimization)
         let node_embedding = self.get_embedding(node_id).to_vec();
+        let query_norm = crate::vector::simd::norm_simd(&node_embedding);
+        let mut ctx = SearchContext::new(self.len());
 
         // Search for nearest neighbors from top to target layer + 1
         for layer in (node_level + 1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(&node_embedding, &current_nearest, 1, layer);
+            current_nearest =
+                self.search_layer(&node_embedding, &current_nearest, 1, layer, &mut ctx, query_norm);
         }
 
         // Insert into layers from top to bottom
@@ -779,6 +874,8 @@ impl HNSWIndex {
                 &current_nearest,
                 self.config.ef_construction,
                 layer,
+                &mut ctx,
+                query_norm,
             );
 
             // Determine M for this layer
@@ -835,16 +932,9 @@ impl HNSWIndex {
         }
     }
 
-    /// Searches a specific layer for nearest neighbors
+    /// Searches a specific layer for nearest neighbors.
     ///
-    /// # Arguments
-    /// * `query` - Query embedding
-    /// * `entry_points` - Starting points for search
-    /// * `ef` - Number of nearest neighbors to find
-    /// * `layer` - Layer to search
-    ///
-    /// # Returns
-    /// Vector of node IDs sorted by distance (closest first)
+    /// Uses reusable context, fused SIMD distance, prefetching, and batch heap updates.
     #[inline]
     fn search_layer(
         &self,
@@ -852,83 +942,14 @@ impl HNSWIndex {
         entry_points: &[usize],
         ef: usize,
         layer: usize,
-    ) -> Vec<usize> {
-        let mut visited = HashSet::new();
-        let mut candidates = BinaryHeap::new(); // Min-heap by distance
-        let mut best = BinaryHeap::new(); // Max-heap by distance
-
-        // Initialize with entry points
-        for &ep in entry_points {
-            let dist = self.distance(query, self.get_embedding(ep));
-            candidates.push(Reverse((OrderedFloat(dist), ep)));
-            best.push((OrderedFloat(dist), ep));
-            visited.insert(ep);
-        }
-
-        while let Some(Reverse((current_dist, current_id))) = candidates.pop() {
-            // If current is farther than the ef-th nearest, we're done
-            if best.len() >= ef {
-                if let Some(&(furthest_dist, _)) = best.peek() {
-                    if current_dist > furthest_dist {
-                        break;
-                    }
-                }
-            }
-
-            // Check all neighbors at this layer
-            if layer < self.connections[current_id].len() {
-                for &neighbor_u32 in &self.connections[current_id][layer] {
-                    let neighbor_id = neighbor_u32 as usize;
-                    if !visited.contains(&neighbor_id) {
-                        visited.insert(neighbor_id);
-
-                        let dist = self.distance(query, self.get_embedding(neighbor_id));
-                        let dist_ord = OrderedFloat(dist);
-
-                        if best.len() < ef {
-                            candidates.push(Reverse((dist_ord, neighbor_id)));
-                            best.push((dist_ord, neighbor_id));
-                        } else if let Some(&(furthest_dist, _)) = best.peek() {
-                            if dist_ord < furthest_dist {
-                                candidates.push(Reverse((dist_ord, neighbor_id)));
-                                best.push((dist_ord, neighbor_id));
-
-                                // Keep only ef elements
-                                if best.len() > ef {
-                                    best.pop();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Extract and return node IDs sorted by distance
-        let mut results: Vec<(f32, usize)> = best
-            .into_iter()
-            .map(|(OrderedFloat(dist), id)| (dist, id))
-            .collect();
-
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        results.into_iter().map(|(_, id)| id).collect()
-    }
-
-    /// Fast layer search using reusable context (avoids allocations)
-    #[inline]
-    fn search_layer_fast(
-        &self,
-        query: &[f32],
-        entry_points: &[usize],
-        ef: usize,
-        layer: usize,
         ctx: &mut SearchContext,
+        query_norm: f32,
     ) -> Vec<usize> {
         ctx.reset();
 
         // Initialize with entry points
         for &ep in entry_points {
-            let dist = self.distance(query, self.get_embedding(ep));
+            let dist = self.distance_to_node(query, ep, query_norm);
             ctx.candidates.push(Reverse((OrderedFloat(dist), ep)));
             ctx.best.push((OrderedFloat(dist), ep));
             ctx.mark_visited(ep);
@@ -944,47 +965,86 @@ impl HNSWIndex {
                 }
             }
 
-            // Check all neighbors at this layer
-            if layer < self.connections[current_id].len() {
-                let neighbors = &self.connections[current_id][layer];
+            // Get neighbors: use flat L0 cache for layer 0, nested structure for upper layers
+            let neighbors_l0_slice;
+            let neighbors: &[u32] = if layer == 0 && !self.connections_l0.is_empty() {
+                neighbors_l0_slice = self.get_neighbors_l0(current_id);
+                neighbors_l0_slice
+            } else if layer < self.connections[current_id].len() {
+                &self.connections[current_id][layer]
+            } else {
+                &[]
+            };
+
+            if !neighbors.is_empty() {
                 let n_neighbors = neighbors.len();
+
+                // 128d * 4 bytes = 512 bytes = 8 cache lines; prefetch first 3 (192 bytes)
+                const PREFETCH_AHEAD: usize = 2;
+                const CACHE_LINES_PER_EMBEDDING: usize = 3;
+
+                // Phase 1: Compute distances for all unvisited neighbors into stack buffer.
+                // This separates compute from heap ops for better ILP and fewer branch
+                // mispredictions.
+                let mut batch_buf: [(f32, usize); 64] = [(0.0, 0); 64];
+                let mut batch_count = 0usize;
 
                 for (i, &neighbor_u32) in neighbors.iter().enumerate() {
                     let neighbor_id = neighbor_u32 as usize;
 
-                    // Prefetch next neighbor's embedding while processing current
-                    if i + 1 < n_neighbors {
-                        let next_id = neighbors[i + 1] as usize;
-                        let next_ptr = self
-                            .embeddings
-                            .as_ptr()
-                            .wrapping_add(next_id * self.embedding_dim);
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                                next_ptr as *const i8,
-                            );
+                    // Prefetch embeddings 2 neighbors ahead (multiple cache lines)
+                    unsafe {
+                        let lookahead = i + PREFETCH_AHEAD;
+                        if lookahead < n_neighbors {
+                            let ahead_id = neighbors[lookahead] as usize;
+                            let ahead_ptr = self
+                                .embeddings
+                                .as_ptr()
+                                .wrapping_add(ahead_id * self.embedding_dim)
+                                as *const u8;
+                            prefetch_embedding(ahead_ptr, CACHE_LINES_PER_EMBEDDING);
+
+                            // Prefetch the visited bitset word for the lookahead neighbor
+                            let bitset_ptr = ctx
+                                .visited
+                                .bits
+                                .as_ptr()
+                                .wrapping_add(ahead_id >> 6)
+                                as *const u8;
+                            prefetch_read(bitset_ptr);
+
+                            // Prefetch the norm for the lookahead neighbor
+                            let norm_ptr = self
+                                .norms
+                                .as_ptr()
+                                .wrapping_add(ahead_id)
+                                as *const u8;
+                            prefetch_read(norm_ptr);
                         }
                     }
 
                     if !ctx.is_visited(neighbor_id) {
                         ctx.mark_visited(neighbor_id);
+                        let dist = self.distance_to_node(query, neighbor_id, query_norm);
+                        batch_buf[batch_count] = (dist, neighbor_id);
+                        batch_count += 1;
+                    }
+                }
 
-                        let dist = self.distance(query, self.get_embedding(neighbor_id));
-                        let dist_ord = OrderedFloat(dist);
+                // Phase 2: Batch heap updates from the computed distances.
+                for &(dist, neighbor_id) in &batch_buf[..batch_count] {
+                    let dist_ord = OrderedFloat(dist);
 
-                        if ctx.best.len() < ef {
+                    if ctx.best.len() < ef {
+                        ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
+                        ctx.best.push((dist_ord, neighbor_id));
+                    } else if let Some(&(furthest_dist, _)) = ctx.best.peek() {
+                        if dist_ord < furthest_dist {
                             ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
                             ctx.best.push((dist_ord, neighbor_id));
-                        } else if let Some(&(furthest_dist, _)) = ctx.best.peek() {
-                            if dist_ord < furthest_dist {
-                                ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
-                                ctx.best.push((dist_ord, neighbor_id));
 
-                                // Keep only ef elements
-                                if ctx.best.len() > ef {
-                                    ctx.best.pop();
-                                }
+                            if ctx.best.len() > ef {
+                                ctx.best.pop();
                             }
                         }
                     }
@@ -1124,6 +1184,20 @@ impl HNSWIndex {
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
         1.0 - crate::vector::simd::cosine_similarity_simd(a, b)
+    }
+
+    /// Fused distance from query to a stored node using precomputed norms.
+    /// Single SIMD dispatch, single pass over data.
+    #[inline]
+    fn distance_to_node(&self, query: &[f32], node_id: usize, query_norm: f32) -> f32 {
+        let embedding = self.get_embedding(node_id);
+        let norm_b = self.norms[node_id];
+        // Reuse the fused path but with query_norm precomputed too
+        // We compute: 1 - dot(q, e) / (||q|| * ||e||)
+        if query_norm == 0.0 || norm_b == 0.0 {
+            return 1.0;
+        }
+        crate::vector::simd::cosine_distance_prenorm(query, embedding, norm_b)
     }
 
     /// Build an HNSW index from embeddings using parallel construction
@@ -1399,33 +1473,49 @@ impl HNSWIndex {
             connections.push(node_connections);
         }
 
+        // Compute norms for all points
+        let norms: Vec<f32> = points
+            .iter()
+            .map(|p| crate::vector::simd::norm_simd(p))
+            .collect();
+
         // Flatten embeddings to SoA
         let flat_embeddings: Vec<f32> = points.into_iter().flatten().collect();
 
         // Create ID mapping (shuffled index → original index)
         let ids: Vec<String> = shuffled.iter().map(|&(_, orig)| orig.to_string()).collect();
 
-        Self {
+        let mut index = Self {
             embedding_dim,
             config,
             embeddings: flat_embeddings,
+            norms,
             connections,
+            connections_l0: Vec::new(),
+            connections_l0_count: Vec::new(),
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
             entry_point: Some(0),
             max_layer: top.0,
-        }
+        };
+        index.build_l0_cache();
+        index
     }
 
     /// Build single-node index (trivial case)
     fn build_single(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         let embedding_dim = embeddings[0].len();
+        let norms = vec![crate::vector::simd::norm_simd(&embeddings[0])];
+        let m0 = config.m0;
         Self {
             embedding_dim,
             config,
             embeddings: embeddings.into_iter().flatten().collect(),
+            norms,
             connections: vec![vec![Vec::new()]],
+            connections_l0: vec![0u32; m0],
+            connections_l0_count: vec![0u8],
             ids: vec!["0".to_string()],
             contents: vec![String::new()],
             metadata: vec![None],

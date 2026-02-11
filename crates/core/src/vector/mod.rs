@@ -59,7 +59,9 @@ use crate::{RagError, Result};
 pub use ops::{approx_equal, cosine_similarity, dot_product, l2_distance, normalize};
 
 // Re-export SIMD functions
-pub use simd::{cosine_similarity_simd, dot_product_simd, l2_distance_simd};
+pub use simd::{
+    cosine_distance_prenorm, cosine_similarity_simd, dot_product_simd, l2_distance_simd, norm_simd,
+};
 
 /// Automatically selects between SIMD and scalar cosine similarity.
 ///
