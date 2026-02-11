@@ -948,6 +948,9 @@ mod tests {
 
         let query = vec![f32::NAN; dim];
         let outcome = std::panic::catch_unwind(|| index.search(&query, 1));
-        assert!(outcome.is_ok(), "PQ search panicked when query contains NaN");
+        assert!(
+            outcome.is_ok(),
+            "PQ search panicked when query contains NaN"
+        );
     }
 }

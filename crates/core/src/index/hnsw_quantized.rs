@@ -1207,7 +1207,8 @@ mod tests {
     #[test]
     fn test_sq8_add_nan_embedding_rejected() {
         let mut index = SQ8HNSWIndex::for_normalized(8, QuantizedHNSWConfig::default());
-        let doc = create_test_document("nan_doc", vec![0.1, 0.2, f32::NAN, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let doc =
+            create_test_document("nan_doc", vec![0.1, 0.2, f32::NAN, 0.4, 0.5, 0.6, 0.7, 0.8]);
         let result = index.add(doc);
         assert!(result.is_err());
         assert_eq!(index.len(), 0);
@@ -1216,7 +1217,8 @@ mod tests {
     #[test]
     fn test_binary_add_nan_embedding_rejected() {
         let mut index = BinaryHNSWIndex::new(8, QuantizedHNSWConfig::default());
-        let doc = create_test_document("nan_doc", vec![0.1, 0.2, 0.3, f32::NAN, 0.5, 0.6, 0.7, 0.8]);
+        let doc =
+            create_test_document("nan_doc", vec![0.1, 0.2, 0.3, f32::NAN, 0.5, 0.6, 0.7, 0.8]);
         let result = index.add(doc);
         assert!(result.is_err());
         assert_eq!(index.len(), 0);
@@ -1236,7 +1238,8 @@ mod tests {
         let dim = 8;
 
         let mut sq8 = SQ8HNSWIndex::for_normalized(dim, QuantizedHNSWConfig::default());
-        sq8.add(create_test_document("sq8_doc", vec![0.1; dim])).unwrap();
+        sq8.add(create_test_document("sq8_doc", vec![0.1; dim]))
+            .unwrap();
 
         let mut binary = BinaryHNSWIndex::new(dim, QuantizedHNSWConfig::default());
         binary
