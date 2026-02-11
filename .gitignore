@@ -6,3 +6,4 @@ Cargo.lock
 *.onnx
 *.bin
 /models/
+benchmarks/python/venv/
