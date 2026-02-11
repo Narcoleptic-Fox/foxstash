@@ -709,6 +709,12 @@ impl FileStorage {
             return true;
         }
 
+        // Reject path separators on all platforms (storage files may be portable).
+        // On Unix, `\` is a valid filename char but we reject it for cross-platform safety.
+        if name.contains('/') || name.contains('\\') {
+            return true;
+        }
+
         let path = Path::new(name);
         if path.is_absolute() {
             return true;
