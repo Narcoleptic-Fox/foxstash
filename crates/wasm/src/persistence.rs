@@ -625,6 +625,7 @@ pub fn deserialize_hnsw_index(
         use_heuristic: data.config.use_heuristic,
         extend_candidates: data.config.extend_candidates,
         keep_pruned_connections: data.config.keep_pruned_connections,
+        ..HNSWConfig::default()
     };
 
     let mut index = foxstash_core::index::HNSWIndex::new(data.embedding_dim, config);

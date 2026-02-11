@@ -163,6 +163,87 @@ pub fn cosine_similarity_simd(a: &[f32], b: &[f32]) -> f32 {
     })
 }
 
+/// Computes the L2 norm (magnitude) of a vector using SIMD acceleration.
+///
+/// Returns sqrt(sum(v[i]^2)).
+#[inline]
+pub fn norm_simd(v: &[f32]) -> f32 {
+    let simd = pulp::Arch::new();
+    simd.dispatch(Magnitude { vector: v })
+}
+
+/// Computes cosine distance with a precomputed norm for vector `b`.
+///
+/// This is the fused hot-path: a single `dispatch` call with two SIMD
+/// accumulators (dot product + norm_a²) in one pass over the data.
+/// The caller supplies `norm_b` (precomputed and cached per stored vector).
+///
+/// Returns `1.0 - dot(a,b) / (||a|| * norm_b)`, i.e. cosine distance in [0, 2].
+#[inline]
+pub fn cosine_distance_prenorm(a: &[f32], b: &[f32], norm_b: f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    if norm_b == 0.0 {
+        return 1.0;
+    }
+
+    let simd = pulp::Arch::new();
+    simd.dispatch(FusedCosineDistance { a, b, norm_b })
+}
+
+/// Fused cosine distance: single SIMD pass computing dot(a,b) and ||a||² simultaneously.
+struct FusedCosineDistance<'a> {
+    a: &'a [f32],
+    b: &'a [f32],
+    norm_b: f32,
+}
+
+impl pulp::WithSimd for FusedCosineDistance<'_> {
+    type Output = f32;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let a = self.a;
+        let b = self.b;
+        let norm_b = self.norm_b;
+        let n = a.len();
+
+        let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
+        let simd_end = n - n % lane_count;
+
+        let mut dot_acc = simd.f32s_splat(0.0);
+        let mut norm_a_acc = simd.f32s_splat(0.0);
+
+        let mut i = 0;
+        while i < simd_end {
+            let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
+            let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
+
+            dot_acc = simd.f32s_mul_add_e(a_vec, b_vec, dot_acc);
+            norm_a_acc = simd.f32s_mul_add_e(a_vec, a_vec, norm_a_acc);
+
+            i += lane_count;
+        }
+
+        let mut dot = simd.f32s_reduce_sum(dot_acc);
+        let mut norm_a_sq = simd.f32s_reduce_sum(norm_a_acc);
+
+        // Remainder
+        for i in simd_end..n {
+            dot += a[i] * b[i];
+            norm_a_sq += a[i] * a[i];
+        }
+
+        let norm_a = norm_a_sq.sqrt();
+        if norm_a == 0.0 {
+            return 1.0;
+        }
+
+        let similarity = dot / (norm_a * norm_b);
+        1.0 - similarity.clamp(-1.0, 1.0)
+    }
+}
+
 /// Internal implementation of dot product with SIMD.
 ///
 /// This function is generic over SIMD architecture and will use the best
@@ -270,47 +351,44 @@ fn l2_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
     simd.dispatch(L2Distance { a, b })
 }
 
+/// Vector magnitude WithSimd impl — used by both `magnitude_simd_impl` and `norm_simd`.
+struct Magnitude<'a> {
+    vector: &'a [f32],
+}
+
+impl pulp::WithSimd for Magnitude<'_> {
+    type Output = f32;
+
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+        let vector = self.vector;
+        let n = vector.len();
+
+        let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
+        let simd_end = n - n % lane_count;
+
+        let mut sum_squares = simd.f32s_splat(0.0);
+
+        let mut i = 0;
+        while i < simd_end {
+            let vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&vector[i..]));
+            sum_squares = simd.f32s_mul_add_e(vec, vec, sum_squares);
+            i += lane_count;
+        }
+
+        let mut result = simd.f32s_reduce_sum(sum_squares);
+
+        for i in simd_end..n {
+            result += vector[i] * vector[i];
+        }
+
+        result.sqrt()
+    }
+}
+
 /// Internal implementation of vector magnitude with SIMD.
 #[inline(always)]
 fn magnitude_simd_impl(simd: pulp::Arch, vector: &[f32]) -> f32 {
-    struct Magnitude<'a> {
-        vector: &'a [f32],
-    }
-
-    impl pulp::WithSimd for Magnitude<'_> {
-        type Output = f32;
-
-        #[inline(always)]
-        fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-            let vector = self.vector;
-            let n = vector.len();
-
-            let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
-            let simd_end = n - n % lane_count;
-
-            let mut sum_squares = simd.f32s_splat(0.0);
-
-            let mut i = 0;
-            while i < simd_end {
-                let vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&vector[i..]));
-
-                // Multiply and accumulate: vec^2
-                sum_squares = simd.f32s_mul_add_e(vec, vec, sum_squares);
-
-                i += lane_count;
-            }
-
-            let mut result = simd.f32s_reduce_sum(sum_squares);
-
-            // Handle remainder
-            for i in simd_end..n {
-                result += vector[i] * vector[i];
-            }
-
-            result.sqrt()
-        }
-    }
-
     simd.dispatch(Magnitude { vector })
 }
 
@@ -541,5 +619,64 @@ mod tests {
         let a = vec![1.0, 2.0];
         let b = vec![1.0, 2.0, 3.0];
         let _ = cosine_similarity_simd(&a, &b);
+    }
+
+    #[test]
+    fn test_norm_simd() {
+        let v = vec![3.0, 4.0];
+        let norm = norm_simd(&v);
+        assert!((norm - 5.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn test_cosine_distance_prenorm_matches_old() {
+        // Compare fused prenorm distance against the original cosine_similarity_simd path
+        for size in [3, 4, 8, 16, 32, 64, 128, 384, 768] {
+            let a: Vec<f32> = (0..size).map(|i| (i as f32) / (size as f32)).collect();
+            let b: Vec<f32> = (0..size)
+                .map(|i| 1.0 - (i as f32) / (size as f32))
+                .collect();
+
+            let old_dist = 1.0 - cosine_similarity_simd(&a, &b);
+            let norm_b = norm_simd(&b);
+            let new_dist = cosine_distance_prenorm(&a, &b, norm_b);
+
+            let epsilon = if size > 100 { 1e-4 } else { EPSILON };
+            assert!(
+                (old_dist - new_dist).abs() < epsilon,
+                "Size {}: old={}, new={}",
+                size,
+                old_dist,
+                new_dist
+            );
+        }
+    }
+
+    #[test]
+    fn test_cosine_distance_prenorm_zero_vectors() {
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 2.0, 3.0];
+        let norm_b = norm_simd(&b);
+        // Zero query should return distance 1.0
+        assert!((cosine_distance_prenorm(&a, &b, norm_b) - 1.0).abs() < EPSILON);
+        // Zero stored vector (norm_b=0) should return distance 1.0
+        assert!((cosine_distance_prenorm(&b, &a, 0.0) - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn test_cosine_distance_prenorm_identical() {
+        let a = vec![1.0, 2.0, 3.0];
+        let norm_a = norm_simd(&a);
+        let dist = cosine_distance_prenorm(&a, &a, norm_a);
+        assert!(dist.abs() < EPSILON, "Identical vectors should have distance ~0, got {}", dist);
+    }
+
+    #[test]
+    fn test_cosine_distance_prenorm_opposite() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b: Vec<f32> = a.iter().map(|x| -x).collect();
+        let norm_b = norm_simd(&b);
+        let dist = cosine_distance_prenorm(&a, &b, norm_b);
+        assert!((dist - 2.0).abs() < EPSILON, "Opposite vectors should have distance ~2, got {}", dist);
     }
 }
