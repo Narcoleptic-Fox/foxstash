@@ -10,18 +10,23 @@ Comparative benchmarks against industry-standard ANN libraries.
 
 ## Rust Ecosystem Comparison (100K vectors)
 
-| Library | Build Time | Search QPS | Recall@10 |
-|---------|------------|------------|-----------|
-| **Foxstash** (sequential) | **7.71s** | **8,251** | 63.3% |
-| **Foxstash** (parallel) | **7.63s** | 788 | 59.3% |
-| instant-distance | 74.21s | 559 | 58.6% |
+| Library | Build | Search | Search QPS | Recall@10 |
+|---------|-------|--------|------------|-----------|
+| **Foxstash** | parallel | batch (rayon) | **8,251** | 63.3% |
+| **Foxstash** | sequential | single-threaded | 801 | 61.9% |
+| **Foxstash** | parallel | single-threaded | 788 | 59.3% |
+| instant-distance | default | single-threaded | 559 | 58.6% |
+
+Build times: Foxstash parallel **7.7s**, Foxstash sequential 580s, instant-distance 74.2s
 
 ### Analysis
 
-- **Search Performance:** Foxstash is **14.75x faster** than instant-distance
-- **Build Performance:** Foxstash is **9.62x faster** than instant-distance
-- **Recall:** Foxstash achieves higher recall (63.3% vs 58.6%) at the same parameters
+- **Search Performance:** Foxstash batch search is **14.75x faster** than instant-distance
+- **Build Performance:** Foxstash parallel build is **9.62x faster** than instant-distance
+- **Recall:** Sequential build produces better graph quality (61.9% vs 59.3% recall)
 - **SIMD:** Foxstash uses SIMD-accelerated distance computation
+- Single-threaded search QPS is comparable across build strategies (~800 QPS);
+  the 8,251 QPS figure comes from parallelizing queries via `search_batch_fast`
 
 ## Python Ecosystem Comparison (100K vectors)
 
@@ -34,16 +39,20 @@ Comparative benchmarks against industry-standard ANN libraries.
 
 | Library | Search QPS | vs Foxstash |
 |---------|------------|-------------|
-| **Foxstash** | **8,251** | - |
+| **Foxstash** (batch) | **8,251** | - |
 | hnswlib (C++) | 4,110 | 2.0x slower |
 | faiss-hnsw (C++) | 3,131 | 2.6x slower |
 | instant-distance (Rust) | 559 | 14.8x slower |
 
-### Notes
+### Notes on Recall
 
-- Python libraries use C/C++ backends (not pure Python)
-- All benchmarks use M=32, ef_construction=100, ef_search=64 (or equivalent)
-- Synthetic random vectors; real-world recall is typically 10-20% higher
+All libraries show low recall at 100K synthetic vectors. This is expected —
+uniform random vectors in 128 dimensions are nearly equidistant due to the
+curse of dimensionality, making nearest-neighbor separation extremely hard.
+
+At **10K vectors**, Foxstash achieves **97% recall** with the same parameters.
+Real-world embeddings (which have natural clustering) typically see 10-20%
+higher recall than these synthetic benchmarks.
 
 ### Foxstash Advantages
 
