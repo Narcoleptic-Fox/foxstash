@@ -43,6 +43,9 @@ pub enum RagError {
 
     #[error("Compression error: {0}")]
     CompressionError(#[from] storage::compression::CompressionError),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
 /// Document with embedding

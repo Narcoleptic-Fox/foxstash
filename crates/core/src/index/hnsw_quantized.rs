@@ -166,6 +166,12 @@ impl SQ8HNSWIndex {
             });
         }
 
+        if document.embedding.iter().any(|v| v.is_nan()) {
+            return Err(RagError::IndexError(
+                "embedding contains NaN values".to_string(),
+            ));
+        }
+
         let node_id = self.nodes.len();
         let node_level = self.random_level();
 
@@ -570,6 +576,12 @@ impl BinaryHNSWIndex {
                 expected: self.embedding_dim,
                 actual: document.embedding.len(),
             });
+        }
+
+        if document.embedding.iter().any(|v| v.is_nan()) {
+            return Err(RagError::IndexError(
+                "embedding contains NaN values".to_string(),
+            ));
         }
 
         let node_id = self.nodes.len();
@@ -1190,6 +1202,33 @@ mod tests {
             binary_recall,
             k
         );
+    }
+
+    #[test]
+    fn test_sq8_add_nan_embedding_rejected() {
+        let mut index = SQ8HNSWIndex::for_normalized(8, QuantizedHNSWConfig::default());
+        let doc = create_test_document("nan_doc", vec![0.1, 0.2, f32::NAN, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let result = index.add(doc);
+        assert!(result.is_err());
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn test_binary_add_nan_embedding_rejected() {
+        let mut index = BinaryHNSWIndex::new(8, QuantizedHNSWConfig::default());
+        let doc = create_test_document("nan_doc", vec![0.1, 0.2, 0.3, f32::NAN, 0.5, 0.6, 0.7, 0.8]);
+        let result = index.add(doc);
+        assert!(result.is_err());
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn test_binary_add_with_full_precision_nan_embedding_rejected() {
+        let mut index = BinaryHNSWIndex::with_full_precision(8, QuantizedHNSWConfig::default());
+        let doc = create_test_document("nan_doc", vec![f32::NAN; 8]);
+        let result = index.add_with_full_precision(doc);
+        assert!(result.is_err());
+        assert_eq!(index.len(), 0);
     }
 
     #[test]

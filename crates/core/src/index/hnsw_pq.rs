@@ -208,6 +208,12 @@ impl PQHNSWIndex {
             });
         }
 
+        if document.embedding.iter().any(|v| v.is_nan()) {
+            return Err(RagError::IndexError(
+                "embedding contains NaN values".to_string(),
+            ));
+        }
+
         let node_id = self.nodes.len();
         let node_level = self.random_level();
 
@@ -903,6 +909,24 @@ mod tests {
         // ADC should generally give better results
         let adc_results = index.search(&query, 10).unwrap();
         assert_eq!(adc_results.len(), 10);
+    }
+
+    #[test]
+    fn test_pq_hnsw_add_nan_embedding_rejected() {
+        let dim = 64;
+        let pq_config = PQConfig::new(dim, 8, 8)
+            .with_seed(42)
+            .with_kmeans_iterations(10);
+        let training_data = generate_random_vectors(100, dim, 42);
+
+        let mut index =
+            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
+
+        let mut embedding = vec![0.5; dim];
+        embedding[10] = f32::NAN;
+        let doc = create_test_document("nan_doc", embedding);
+        assert!(index.add(doc).is_err());
+        assert_eq!(index.len(), 0);
     }
 
     #[test]

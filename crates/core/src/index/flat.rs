@@ -107,6 +107,13 @@ impl FlatIndex {
             });
         }
 
+        // Reject embeddings containing NaN values
+        if document.embedding.iter().any(|v| v.is_nan()) {
+            return Err(crate::RagError::IndexError(
+                "embedding contains NaN values".to_string(),
+            ));
+        }
+
         // Insert document (will replace if ID already exists)
         self.documents.insert(document.id.clone(), document);
         Ok(())
@@ -210,7 +217,7 @@ impl FlatIndex {
             .collect();
 
         // Sort by score in descending order
-        scored_docs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored_docs.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // Take top k results and convert to SearchResult
         let results = scored_docs
@@ -657,5 +664,14 @@ mod tests {
         query[0] = 500.0;
         let results = index.search(&query, 10).unwrap();
         assert_eq!(results.len(), 10);
+    }
+
+    #[test]
+    fn test_add_nan_embedding_rejected() {
+        let mut index = FlatIndex::new(3);
+        let doc = create_test_document("nan_doc", vec![1.0, f32::NAN, 0.0]);
+        let result = index.add(doc);
+        assert!(result.is_err());
+        assert_eq!(index.len(), 0);
     }
 }
