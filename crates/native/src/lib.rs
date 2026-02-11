@@ -148,7 +148,21 @@ impl RagIndex for HNSWIndex {
     }
 }
 
-/// Opaque handle to RAG index
+/// Opaque handle to RAG index.
+///
+/// # Threading Model
+///
+/// `RagHandle` is `Send + Sync` and designed for concurrent access from multiple
+/// threads via the C FFI. Internal synchronization uses:
+///
+/// - `RwLock<Box<dyn RagIndex>>` for the index (read-shared, write-exclusive)
+/// - `Mutex<Option<FileStorage>>` for persistence storage
+///
+/// # Lock Ordering
+///
+/// When both locks are needed (e.g., `rag_save`), always acquire the **storage
+/// `Mutex` before** the **index `RwLock`**. Never acquire the index lock and then
+/// attempt to acquire the storage lock -- doing so risks deadlock.
 pub struct RagHandle {
     index: RwLock<Box<dyn RagIndex>>,
     storage: Mutex<Option<FileStorage>>,
@@ -239,6 +253,11 @@ pub extern "C" fn rag_create(embedding_dim: usize, use_hnsw: i32) -> *mut RagHan
 /// # Safety
 /// After calling this function, the handle is invalid and must not be used.
 /// Passing NULL is safe (no-op).
+///
+/// **Caller must ensure no other threads are using this handle when calling
+/// `rag_destroy`.** Calling `rag_destroy` while another thread holds a read or
+/// write lock on the handle is undefined behavior (the `Box::from_raw` reclaims
+/// memory that may still be accessed by the other thread).
 ///
 /// # Example (C)
 /// ```c
@@ -437,7 +456,7 @@ pub extern "C" fn rag_add_document(
 /// ```
 #[no_mangle]
 pub extern "C" fn rag_search(
-    handle: *mut RagHandle,
+    handle: *const RagHandle,
     query: *const f32,
     query_len: usize,
     k: usize,
@@ -835,7 +854,10 @@ pub extern "C" fn rag_count(handle: *const RagHandle) -> usize {
         let handle = &*handle;
         let index = match handle.index.read() {
             Ok(lock) => lock,
-            Err(_) => return 0,
+            Err(_) => {
+                set_last_error("Index lock poisoned".to_string());
+                return 0;
+            }
         };
         index.len()
     }));
@@ -1116,6 +1138,56 @@ mod tests {
         rag_destroy(handle);
     }
 
+    /// Verify `rag_search` accepts `*const RagHandle` (shared/read-only access).
+    #[test]
+    fn test_search_accepts_const_handle() {
+        let handle = rag_create(3, 0);
+        assert!(!handle.is_null());
+
+        // Add a document via the mutable handle
+        let id = CString::new("doc1").unwrap();
+        let content = CString::new("Test document").unwrap();
+        let embedding = vec![1.0f32, 0.0, 0.0];
+
+        let ret = rag_add_document(
+            handle,
+            id.as_ptr(),
+            content.as_ptr(),
+            embedding.as_ptr(),
+            embedding.len(),
+        );
+        assert_eq!(ret, 0);
+
+        // Cast to *const to prove search works through a shared pointer
+        let const_handle: *const RagHandle = handle;
+
+        let query = vec![1.0f32, 0.0, 0.0];
+        let mut results: *mut SearchResult = ptr::null_mut();
+        let mut count: usize = 0;
+
+        let ret = rag_search(
+            const_handle,
+            query.as_ptr(),
+            query.len(),
+            1,
+            &mut results,
+            &mut count,
+        );
+
+        assert_eq!(ret, 0);
+        assert_eq!(count, 1);
+        assert!(!results.is_null());
+
+        unsafe {
+            let results_slice = std::slice::from_raw_parts(results, count);
+            let first_id = CStr::from_ptr(results_slice[0].id).to_str().unwrap();
+            assert_eq!(first_id, "doc1");
+        }
+
+        rag_free_results(results, count);
+        rag_destroy(handle);
+    }
+
     #[test]
     fn test_clear() {
         let handle = rag_create(3, 0);
@@ -1161,7 +1233,7 @@ mod tests {
 
         assert_eq!(
             rag_search(
-                ptr::null_mut(),
+                ptr::null(),
                 query.as_ptr(),
                 query.len(),
                 5,

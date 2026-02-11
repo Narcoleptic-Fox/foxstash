@@ -704,16 +704,46 @@ impl FileStorage {
             return true;
         }
 
+        // Reject null bytes (could truncate paths in C-based syscalls)
+        if name.contains('\0') {
+            return true;
+        }
+
         let path = Path::new(name);
         if path.is_absolute() {
             return true;
         }
 
+        // Must be exactly one normal component (no separators, no .., no .)
         let mut components = path.components();
         match components.next() {
-            Some(Component::Normal(_)) => components.next().is_some(),
-            _ => true,
+            Some(Component::Normal(_)) => {
+                if components.next().is_some() {
+                    return true;
+                }
+            }
+            _ => return true,
         }
+
+        // Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9).
+        // These are reserved with or without an extension (e.g. "CON.txt" is also invalid).
+        // Use the part before the first dot as the base name, since Windows treats
+        // "NUL.tar.gz" the same as "NUL".
+        let base_name = name.split('.').next().unwrap_or(name);
+        let stem_upper = base_name.to_ascii_uppercase();
+        let is_reserved = matches!(
+            stem_upper.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL"
+                | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
+                | "COM6" | "COM7" | "COM8" | "COM9"
+                | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
+                | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        );
+        if is_reserved {
+            return true;
+        }
+
+        false
     }
 
     fn validate_item_name(name: &str) -> Result<()> {
@@ -1363,5 +1393,54 @@ mod tests {
 
         let result = storage.save_document("../outside", &doc);
         assert!(result.is_err(), "path traversal names should be rejected");
+    }
+
+    #[test]
+    fn test_is_invalid_item_name_comprehensive() {
+        // Valid names
+        assert!(!FileStorage::is_invalid_item_name("hello"));
+        assert!(!FileStorage::is_invalid_item_name("my_index"));
+        assert!(!FileStorage::is_invalid_item_name("data-2024"));
+        assert!(!FileStorage::is_invalid_item_name("file.txt"));
+
+        // Empty
+        assert!(FileStorage::is_invalid_item_name(""));
+
+        // Path traversal / multi-component
+        assert!(FileStorage::is_invalid_item_name(".."));
+        assert!(FileStorage::is_invalid_item_name("."));
+        assert!(FileStorage::is_invalid_item_name("foo/bar"));
+        assert!(FileStorage::is_invalid_item_name("foo\\bar"));
+        assert!(FileStorage::is_invalid_item_name("../outside"));
+
+        // Absolute paths
+        assert!(FileStorage::is_invalid_item_name("/absolute"));
+        #[cfg(target_os = "windows")]
+        assert!(FileStorage::is_invalid_item_name("C:\\Windows\\System32"));
+
+        // Null bytes
+        assert!(FileStorage::is_invalid_item_name("hello\0world"));
+        assert!(FileStorage::is_invalid_item_name("\0"));
+
+        // Windows reserved device names (case-insensitive)
+        assert!(FileStorage::is_invalid_item_name("CON"));
+        assert!(FileStorage::is_invalid_item_name("con"));
+        assert!(FileStorage::is_invalid_item_name("Con"));
+        assert!(FileStorage::is_invalid_item_name("PRN"));
+        assert!(FileStorage::is_invalid_item_name("AUX"));
+        assert!(FileStorage::is_invalid_item_name("NUL"));
+        assert!(FileStorage::is_invalid_item_name("nul"));
+        assert!(FileStorage::is_invalid_item_name("COM1"));
+        assert!(FileStorage::is_invalid_item_name("com1"));
+        assert!(FileStorage::is_invalid_item_name("COM9"));
+        assert!(FileStorage::is_invalid_item_name("LPT1"));
+        assert!(FileStorage::is_invalid_item_name("lpt1"));
+        assert!(FileStorage::is_invalid_item_name("LPT9"));
+
+        // Reserved names with extension (stem is still reserved)
+        assert!(FileStorage::is_invalid_item_name("CON.txt"));
+        assert!(FileStorage::is_invalid_item_name("NUL.tar.gz"));
+        assert!(FileStorage::is_invalid_item_name("com1.data"));
+        assert!(FileStorage::is_invalid_item_name("lpt3.log"));
     }
 }

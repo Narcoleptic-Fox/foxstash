@@ -78,12 +78,24 @@ impl BitsetVisited {
 
     #[inline(always)]
     fn is_visited(&self, node: usize) -> bool {
+        debug_assert!(
+            (node >> 6) < self.bits.len(),
+            "BitsetVisited::is_visited: node {} out of bounds (capacity {})",
+            node,
+            self.bits.len() * 64
+        );
         let word = unsafe { *self.bits.get_unchecked(node >> 6) };
         word & (1u64 << (node & 63)) != 0
     }
 
     #[inline(always)]
     fn mark_visited(&mut self, node: usize) {
+        debug_assert!(
+            (node >> 6) < self.bits.len(),
+            "BitsetVisited::mark_visited: node {} out of bounds (capacity {})",
+            node,
+            self.bits.len() * 64
+        );
         unsafe {
             *self.bits.get_unchecked_mut(node >> 6) |= 1u64 << (node & 63);
         }
@@ -422,10 +434,10 @@ impl HNSWIndex {
         let mut rng = StdRng::seed_from_u64(seed);
         let ml = config.ml;
 
-        // Pre-generate all node levels
+        // Pre-generate all node levels (clamp to EPSILON to prevent ln(0) = -inf)
         let levels: Vec<usize> = (0..n)
             .map(|_| {
-                let r: f32 = rng.gen();
+                let r: f32 = rng.gen::<f32>().max(f32::EPSILON);
                 (-r.ln() * ml).floor() as usize
             })
             .collect();
@@ -556,6 +568,12 @@ impl HNSWIndex {
             });
         }
 
+        if document.embedding.iter().any(|v| v.is_nan()) {
+            return Err(crate::RagError::InvalidInput(
+                "embedding contains NaN values".into(),
+            ));
+        }
+
         let node_id = self.len();
         let node_level = self.random_level();
 
@@ -615,6 +633,12 @@ impl HNSWIndex {
                 expected: self.embedding_dim,
                 actual: embedding.len(),
             });
+        }
+
+        if embedding.iter().any(|v| v.is_nan()) {
+            return Err(crate::RagError::InvalidInput(
+                "embedding contains NaN values".into(),
+            ));
         }
 
         let node_id = self.len();
@@ -846,10 +870,12 @@ impl HNSWIndex {
         self.embedding_dim
     }
 
-    /// Generates a random level for a new node using exponential decay
+    /// Generates a random level for a new node using exponential decay.
+    ///
+    /// Clamps the uniform sample to `[EPSILON, 1)` to prevent `ln(0.0) = -inf`.
     fn random_level(&self) -> usize {
         let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen();
+        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
@@ -2199,5 +2225,80 @@ mod tests {
             vec![vec![1.0, 0.0, 0.0], vec![1.0, 0.0]],
             HNSWConfig::default(),
         );
+    }
+
+    #[test]
+    fn test_add_rejects_nan_embedding() {
+        let mut index = HNSWIndex::with_defaults(3);
+        let doc = create_test_document("nan_doc", vec![1.0, f32::NAN, 0.0]);
+        let result = index.add(doc);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("NaN"),
+            "Error should mention NaN, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_add_embedding_rejects_nan() {
+        let mut index = HNSWIndex::with_defaults(3);
+        let result = index.add_embedding("nan_vec".into(), vec![f32::NAN, 0.0, 0.0]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("NaN"),
+            "Error should mention NaN, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_add_rejects_all_nan_embedding() {
+        let mut index = HNSWIndex::with_defaults(3);
+        let doc = create_test_document("all_nan", vec![f32::NAN, f32::NAN, f32::NAN]);
+        assert!(index.add(doc).is_err());
+    }
+
+    #[test]
+    fn test_zero_vector_accepted_and_searchable() {
+        let mut index = HNSWIndex::with_defaults(3);
+
+        // Zero vectors are valid (they just have zero norm)
+        let doc_zero = create_test_document("zero", vec![0.0, 0.0, 0.0]);
+        assert!(index.add(doc_zero).is_ok());
+
+        let doc_normal = create_test_document("normal", vec![1.0, 0.0, 0.0]);
+        assert!(index.add(doc_normal).is_ok());
+
+        // Search should not panic with zero vectors in the index
+        let query = vec![1.0, 0.0, 0.0];
+        let results = index.search(&query, 2).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // The normal vector should rank higher than the zero vector
+        assert_eq!(results[0].id, "normal");
+    }
+
+    #[test]
+    fn test_zero_vector_query_does_not_panic() {
+        let mut index = HNSWIndex::with_defaults(3);
+        let doc = create_test_document("doc1", vec![1.0, 0.0, 0.0]);
+        index.add(doc).unwrap();
+
+        // Zero query should not panic (distance_to_node handles zero norm)
+        let query = vec![0.0, 0.0, 0.0];
+        let results = index.search(&query, 1).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_random_level_never_panics() {
+        // Exercise random_level many times to verify ln(0) is impossible
+        let index = HNSWIndex::with_defaults(3);
+        for _ in 0..10_000 {
+            let _level = index.random_level();
+        }
     }
 }
