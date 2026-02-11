@@ -84,8 +84,8 @@ fn main() {
     let id_qps = NUM_QUERIES as f64 / id_search_time.as_secs_f64();
     println!("Search time: {:?} ({:.0} QPS)", id_search_time, id_qps);
 
-    // === Foxstash Sequential ===
-    println!("\n--- Foxstash (sequential) ---");
+    // === Foxstash (parallel build + batch search) ===
+    println!("\n--- Foxstash (parallel build, batch search) ---");
     use foxstash_core::index::{BuildStrategy, HNSWConfig, HNSWIndex};
 
     let config = HNSWConfig::default().with_build_strategy(BuildStrategy::Parallel);
