@@ -257,22 +257,29 @@ mod tests {
 
     #[test]
     fn integration_full_lifecycle() {
+        use crate::filter::Filter;
+        use serde_json::json;
+
         let dir = TempDir::new().unwrap();
 
-        // ── Phase 1: Create, bulk insert 12 docs ───────────────────
-        // NOTE: metadata is None because bincode (used by WAL/checkpoint)
-        // doesn't support serde_json::Value roundtrips. Filtered search
-        // with metadata is covered in collection::tests::filtered_search.
+        // ── Phase 1: Create, bulk insert 12 docs with metadata ─────
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
         let col = store.collection("docs").unwrap();
 
+        let categories = ["rust", "python", "go"];
         for i in 0..12 {
+            let cat = categories[i % 3];
             let mut emb = vec![0.0f32; 3];
             emb[i % 3] = 1.0;
             emb[(i + 1) % 3] = (i as f32) * 0.01;
 
-            col.insert(format!("doc-{i}"), format!("content-{i}"), emb, None)
-                .unwrap();
+            col.insert(
+                format!("doc-{i}"),
+                format!("content-{i}"),
+                emb,
+                Some(json!({ "lang": cat, "idx": i })),
+            )
+            .unwrap();
         }
         assert_eq!(col.len(), 12);
 
@@ -280,7 +287,19 @@ mod tests {
         let results = col.search(&[1.0, 0.0, 0.0], 3, None).unwrap();
         assert_eq!(results.len(), 3);
 
-        // ── Phase 3: Delete 3 docs, verify exclusion ───────────────
+        // ── Phase 3: Filtered search (lang == "rust") ──────────────
+        let filter = Filter::eq("lang", "rust");
+        let results = col.search(&[1.0, 0.0, 0.0], 10, Some(&filter)).unwrap();
+        assert!(results.iter().all(|r| {
+            r.metadata
+                .as_ref()
+                .and_then(|m| m.get("lang"))
+                .and_then(|v| v.as_str())
+                == Some("rust")
+        }));
+        assert_eq!(results.len(), 4); // docs 0, 3, 6, 9
+
+        // ── Phase 4: Delete 3 docs, verify exclusion ───────────────
         col.delete("doc-0").unwrap();
         col.delete("doc-1").unwrap();
         col.delete("doc-2").unwrap();
@@ -291,11 +310,11 @@ mod tests {
         assert!(!results.iter().any(|r| r.id == "doc-1"));
         assert!(!results.iter().any(|r| r.id == "doc-2"));
 
-        // ── Phase 4: Compact, verify counts ────────────────────────
+        // ── Phase 5: Compact, verify counts ────────────────────────
         col.compact().unwrap();
         assert_eq!(col.len(), 9);
 
-        // ── Phase 5: get() for live and deleted docs ───────────────
+        // ── Phase 6: get() for live and deleted docs ───────────────
         let live = col.get("doc-3").unwrap();
         assert!(live.is_some());
         assert_eq!(live.unwrap().content, "content-3");
@@ -303,7 +322,7 @@ mod tests {
         let deleted = col.get("doc-0").unwrap();
         assert!(deleted.is_none());
 
-        // ── Phase 6: Flush, drop, reopen ───────────────────────────
+        // ── Phase 7: Flush, drop, reopen ───────────────────────────
         store.flush_all().unwrap();
         drop(store);
 
@@ -318,9 +337,10 @@ mod tests {
         assert!(col2.get("doc-1").unwrap().is_none());
         assert!(col2.get("doc-2").unwrap().is_none());
 
-        // Content correct.
+        // Content and metadata correct after reopen.
         let doc5 = col2.get("doc-5").unwrap().unwrap();
         assert_eq!(doc5.content, "content-5");
+        assert_eq!(doc5.metadata.as_ref().unwrap()["lang"], "go");
 
         // Search still works.
         let results = col2.search(&[0.0, 1.0, 0.0], 2, None).unwrap();

@@ -203,7 +203,7 @@ impl WalEntry {
 
     /// Compute CRC32 checksum
     fn compute_checksum(&self) -> u32 {
-        let data = bincode::serialize(&(&self.seq, &self.timestamp, &self.operation)).unwrap();
+        let data = serde_json::to_vec(&(&self.seq, &self.timestamp, &self.operation)).unwrap();
         crc32fast::hash(&data)
     }
 
@@ -316,7 +316,8 @@ impl WalWriter {
 
     /// Append entry to WAL
     fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        let data = bincode::serialize(entry)?;
+        let data = serde_json::to_vec(entry)
+            .map_err(|e| RagError::StorageError(format!("WAL serialize failed: {}", e)))?;
         let len = data.len() as u32;
 
         // Write length prefix + data
@@ -392,7 +393,8 @@ impl WalReader {
                 .read_exact(&mut data)
                 .map_err(|e| RagError::StorageError(format!("WAL read failed: {}", e)))?;
 
-            let entry: WalEntry = bincode::deserialize(&data)?;
+            let entry: WalEntry = serde_json::from_slice(&data)
+                .map_err(|e| RagError::StorageError(format!("WAL deserialize failed: {}", e)))?;
 
             // Verify integrity
             if !entry.verify() {
@@ -525,7 +527,8 @@ impl IncrementalStorage {
         let checkpoint_id = self.manifest.current_checkpoint.map(|c| c + 1).unwrap_or(1);
 
         // Serialize index
-        let data = bincode::serialize(index)?;
+        let data = serde_json::to_vec(index)
+            .map_err(|e| RagError::StorageError(format!("Checkpoint serialize failed: {}", e)))?;
         let original_size = data.len();
 
         // Compress
@@ -622,7 +625,8 @@ impl IncrementalStorage {
         let data = compression::decompress(&compressed)?;
 
         // Deserialize
-        let index: T = bincode::deserialize(&data)?;
+        let index: T = serde_json::from_slice(&data)
+            .map_err(|e| RagError::StorageError(format!("Checkpoint deserialize failed: {}", e)))?;
 
         Ok(Some((index, meta)))
     }
@@ -1124,5 +1128,84 @@ mod tests {
             2,
             "retention should keep exactly keep_checkpoints checkpoint files"
         );
+    }
+
+    #[test]
+    fn test_wal_roundtrip_with_metadata() {
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+
+        let doc = Document {
+            id: "meta-doc".to_string(),
+            content: "has metadata".to_string(),
+            embedding: vec![0.1; 4],
+            metadata: Some(serde_json::json!({
+                "scope": "workspace",
+                "tags": ["rust", "ai"],
+                "priority": 5
+            })),
+        };
+
+        storage.log_add(&doc).unwrap();
+        storage.sync().unwrap();
+
+        // Read back and verify metadata survived the roundtrip.
+        let entries = storage.get_wal_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].operation {
+            WalOperation::Add(recovered) => {
+                assert_eq!(recovered.id, "meta-doc");
+                let meta = recovered.metadata.as_ref().unwrap();
+                assert_eq!(meta["scope"], "workspace");
+                assert_eq!(meta["priority"], 5);
+                assert_eq!(meta["tags"][0], "rust");
+            }
+            _ => panic!("Expected Add operation"),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_roundtrip_with_metadata() {
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+
+        let docs = vec![
+            Document {
+                id: "d1".to_string(),
+                content: "first".to_string(),
+                embedding: vec![1.0, 0.0],
+                metadata: Some(serde_json::json!({"lang": "rust"})),
+            },
+            Document {
+                id: "d2".to_string(),
+                content: "second".to_string(),
+                embedding: vec![0.0, 1.0],
+                metadata: None,
+            },
+        ];
+
+        storage
+            .checkpoint(
+                &docs,
+                IndexMetadata {
+                    document_count: 2,
+                    embedding_dim: 2,
+                    index_type: "hnsw".to_string(),
+                },
+            )
+            .unwrap();
+
+        let (loaded, meta): (Vec<Document>, CheckpointMeta) =
+            storage.load_checkpoint().unwrap().unwrap();
+        assert_eq!(meta.document_count, 2);
+        assert_eq!(loaded.len(), 2);
+
+        assert_eq!(loaded[0].id, "d1");
+        assert_eq!(loaded[0].metadata.as_ref().unwrap()["lang"], "rust");
+
+        assert_eq!(loaded[1].id, "d2");
+        assert!(loaded[1].metadata.is_none());
     }
 }
