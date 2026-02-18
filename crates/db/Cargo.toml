@@ -1,0 +1,17 @@
+[package]
+name = "foxstash-db"
+version.workspace = true
+edition.workspace = true
+description = "Database layer for foxstash — collections, filtering, WAL persistence, and concurrent access"
+license = "MIT"
+
+[dependencies]
+foxstash-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "1.0"
+parking_lot = "0.12"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.8"
