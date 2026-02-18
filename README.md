@@ -275,8 +275,11 @@ See `crates/benches/` for benchmark implementations.
 - [x] Incremental persistence (WAL + checkpointing)
 - [x] Product quantization (PQ) - up to 192x compression
 - [x] Diversity-aware neighbor selection (Algorithm 4)
+- [ ] Constrained graph traversal for efficient pre-filtering
+- [ ] Cache-locality optimizations for quantized indices (flattened L0 cache)
+- [ ] High-concurrency scaling (sharded-lock or lock-free index updates)
+- [ ] Hybrid search (sparse + dense vectors / BM25)
 - [ ] GPU acceleration (optional)
-- [ ] Hybrid search (sparse + dense vectors)
 - [ ] Multi-vector support (late interaction)
 
 ## License
