@@ -70,6 +70,11 @@ impl IdMap {
         self.tombstones.contains(id)
     }
 
+    /// Check if an ID is live (present and not tombstoned).
+    pub fn is_live(&self, id: &str) -> bool {
+        self.id_to_pos.contains_key(id) && !self.tombstones.contains(id)
+    }
+
     /// Check if a position's document is tombstoned.
     pub fn is_pos_tombstoned(&self, pos: usize) -> bool {
         self.pos_to_id

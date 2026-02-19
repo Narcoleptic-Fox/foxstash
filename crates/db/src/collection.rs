@@ -108,10 +108,8 @@ impl Collection {
         // Then mutate in-memory state.
         {
             let mut inner = self.inner.write();
-            // Tombstone previous version if re-inserting same ID.
-            if inner.id_map.get(&id).is_some() {
-                inner.id_map.remove(&id);
-            }
+            // Tombstone previous version if re-inserting same ID (no-op if absent).
+            inner.id_map.remove(&id);
             inner.index.add(doc.clone()).map_err(DbError::Core)?;
             inner.id_map.insert(id);
             inner.documents.push(doc);
@@ -169,9 +167,6 @@ impl Collection {
             Some(p) => p,
             None => return Ok(None),
         };
-        // Walk the documents vec to find the one at this position.
-        // Since documents are append-only and positions are sequential,
-        // the document at `pos` is `inner.documents[pos]`.
         Ok(inner.documents.get(pos).cloned())
     }
 
@@ -265,24 +260,20 @@ impl Collection {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>> {
-        // Over-fetch to compensate for tombstones.
-        let fetch = if inner.id_map.tombstone_count() > 0 {
-            k + inner.id_map.tombstone_count()
-        } else {
-            k
-        };
+        // Over-fetch to compensate for tombstones (adding 0 is harmless).
+        let fetch = k + inner.id_map.tombstone_count();
         let raw = inner.index.search(query, fetch).map_err(DbError::Core)?;
 
         let results: Vec<SearchResult> = raw
             .into_iter()
-            .filter(|r| !inner.id_map.is_tombstoned(&r.id))
+            .filter(|r| inner.id_map.is_live(&r.id))
             .take(k)
             .collect();
 
         Ok(results)
     }
 
-    /// Filtered search: progressive over-fetch (2x → 4x → 8x).
+    /// Filtered search: progressive over-fetch (2x, 4x, 8x, then full scan).
     fn search_filtered(
         &self,
         inner: &CollectionInner,
@@ -290,38 +281,25 @@ impl Collection {
         k: usize,
         filter: &Filter,
     ) -> Result<Vec<SearchResult>> {
-        for multiplier in [2, 4, 8] {
-            let fetch = k * multiplier;
+        let fetch_sizes = [k * 2, k * 4, k * 8, inner.index.len()];
+
+        for fetch in fetch_sizes {
             let raw = inner.index.search(query, fetch).map_err(DbError::Core)?;
 
             let results: Vec<SearchResult> = raw
                 .into_iter()
                 .filter(|r| {
-                    !inner.id_map.is_tombstoned(&r.id)
-                        && filter.matches(r.metadata.as_ref())
+                    inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref())
                 })
                 .take(k)
                 .collect();
 
-            if results.len() >= k {
+            if results.len() >= k || fetch >= inner.index.len() {
                 return Ok(results);
             }
         }
 
-        // Final attempt with everything available.
-        let raw = inner
-            .index
-            .search(query, inner.index.len())
-            .map_err(DbError::Core)?;
-        let results: Vec<SearchResult> = raw
-            .into_iter()
-            .filter(|r| {
-                !inner.id_map.is_tombstoned(&r.id) && filter.matches(r.metadata.as_ref())
-            })
-            .take(k)
-            .collect();
-
-        Ok(results)
+        Ok(Vec::new())
     }
 
     /// Collect all live (non-tombstoned) documents, deduplicating by ID.
@@ -332,7 +310,7 @@ impl Collection {
             .documents
             .iter()
             .rev()
-            .filter(|doc| !inner.id_map.is_tombstoned(&doc.id) && seen.insert(doc.id.clone()))
+            .filter(|doc| inner.id_map.is_live(&doc.id) && seen.insert(doc.id.clone()))
             .cloned()
             .collect();
         live.reverse();

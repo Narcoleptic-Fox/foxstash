@@ -64,6 +64,3 @@ pub use incremental::{
     CheckpointMeta, IncrementalConfig, IncrementalStorage, IndexMetadata, Manifest, RecoveryHelper,
     StorageStats, WalEntry, WalOperation,
 };
-
-// Legacy placeholder (will be removed in future)
-pub struct MemoryStorage;
