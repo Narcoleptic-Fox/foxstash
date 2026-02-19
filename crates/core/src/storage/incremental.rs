@@ -209,12 +209,9 @@ impl WalEntry {
 
     /// Verify entry integrity
     pub fn verify(&self) -> bool {
-        let expected = {
-            let mut copy = self.clone();
-            copy.checksum = 0;
-            copy.compute_checksum()
-        };
-        self.checksum == expected
+        // compute_checksum() serializes (seq, timestamp, operation) — the checksum
+        // field is already excluded from the hash input, so no clone needed.
+        self.checksum == self.compute_checksum()
     }
 }
 
