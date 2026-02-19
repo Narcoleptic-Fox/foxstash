@@ -367,10 +367,24 @@ fn sq8_l2_distance_impl(simd: pulp::Arch, a: &[u8], b: &[u8]) -> f32 {
 
         #[inline(always)]
         fn with_simd<S: Simd>(self, _simd: S) -> Self::Output {
+            // pulp has no u8/i16 SIMD ops, so we use scalar unrolling.
+            // 4-at-a-time unrolling reduces loop overhead and gives the compiler
+            // headroom to auto-vectorize the inner body using integer SIMD.
             let mut sum_sq: u32 = 0;
 
-            for (&av, &bv) in self.a.iter().zip(self.b.iter()) {
-                let diff = (av as i32) - (bv as i32);
+            let mut chunks = self.a.chunks_exact(4).zip(self.b.chunks_exact(4));
+            for (a_chunk, b_chunk) in &mut chunks {
+                let d0 = (a_chunk[0] as i32) - (b_chunk[0] as i32);
+                let d1 = (a_chunk[1] as i32) - (b_chunk[1] as i32);
+                let d2 = (a_chunk[2] as i32) - (b_chunk[2] as i32);
+                let d3 = (a_chunk[3] as i32) - (b_chunk[3] as i32);
+                sum_sq += (d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3) as u32;
+            }
+
+            // Handle remainder (0..3 elements)
+            let rem_start = self.a.len() - self.a.len() % 4;
+            for i in rem_start..self.a.len() {
+                let diff = (self.a[i] as i32) - (self.b[i] as i32);
                 sum_sq += (diff * diff) as u32;
             }
 
@@ -414,17 +428,31 @@ fn sq8_asymmetric_l2_impl(
 
         #[inline(always)]
         fn with_simd<S: Simd>(self, _simd: S) -> Self::Output {
+            // pulp has no u8/i16 SIMD ops, so we use scalar unrolling.
+            // 4-at-a-time unrolling reduces loop overhead; the f32 accumulation
+            // gives the compiler room to auto-vectorize using f32 SIMD.
             let mut sum_sq: f32 = 0.0;
+            let n = self.query.len();
 
-            for ((&q, &qv), param) in self
-                .query
-                .iter()
-                .zip(self.quantized.iter())
-                .zip(self.params.iter())
-            {
-                let dequantized = param.dequantize_value(qv);
-                let diff = q - dequantized;
+            let mut i = 0;
+            while i + 4 <= n {
+                let d0 = self.query[i] - self.params[i].dequantize_value(self.quantized[i]);
+                let d1 =
+                    self.query[i + 1] - self.params[i + 1].dequantize_value(self.quantized[i + 1]);
+                let d2 =
+                    self.query[i + 2] - self.params[i + 2].dequantize_value(self.quantized[i + 2]);
+                let d3 =
+                    self.query[i + 3] - self.params[i + 3].dequantize_value(self.quantized[i + 3]);
+                sum_sq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+                i += 4;
+            }
+
+            // Handle remainder (0..3 elements)
+            while i < n {
+                let dequantized = self.params[i].dequantize_value(self.quantized[i]);
+                let diff = self.query[i] - dequantized;
                 sum_sq += diff * diff;
+                i += 1;
             }
 
             sum_sq.sqrt()
