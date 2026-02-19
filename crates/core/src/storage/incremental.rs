@@ -714,17 +714,19 @@ impl IncrementalStorage {
             writer.sync()?;
         }
 
-        // Delete old WAL if exists
+        // Open new WAL FIRST (before deleting old).
+        // This ensures we always have a valid WAL even if deletion fails.
+        let new_wal_path = self.base_path.join(format!("wal_{:05}.log", checkpoint_id));
+        let new_writer = WalWriter::open(&new_wal_path, self.config.sync_on_write)?;
+        self.wal_writer = Some(new_writer);
+
+        // Now safe to delete old WAL.
         let old_wal = self
             .base_path
             .join(format!("wal_{:05}.log", checkpoint_id.saturating_sub(1)));
-        if old_wal.exists() {
+        if old_wal.exists() && old_wal != new_wal_path {
             let _ = fs::remove_file(&old_wal);
         }
-
-        // Open new WAL
-        let new_wal_path = self.base_path.join(format!("wal_{:05}.log", checkpoint_id));
-        self.wal_writer = Some(WalWriter::open(&new_wal_path, self.config.sync_on_write)?);
 
         Ok(())
     }
