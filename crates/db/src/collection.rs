@@ -121,17 +121,21 @@ impl Collection {
 
     /// Soft-delete a document by ID. Returns `true` if the document existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
-        let existed = {
-            let mut inner = self.inner.write();
-            inner.id_map.remove(id)
-        };
+        // Hold write lock for the entire operation to prevent TOCTOU races.
+        let mut inner = self.inner.write();
+        if !inner.id_map.is_live(id) {
+            return Ok(false);
+        }
 
-        if existed {
+        // WAL first (crash-safe).
+        {
             let mut storage = self.storage.lock();
             storage.log_remove(id).map_err(DbError::Core)?;
         }
 
-        Ok(existed)
+        // Then apply tombstone in-memory.
+        inner.id_map.remove(id);
+        Ok(true)
     }
 
     /// Search for the `k` nearest neighbors, optionally filtered by metadata.
@@ -179,14 +183,13 @@ impl Collection {
 
     /// Compact: rebuild index from live documents only, checkpoint, reclaim tombstones.
     pub fn compact(&self) -> Result<()> {
-        let live_docs = {
-            let inner = self.inner.read();
-            self.collect_live_documents(&inner)
-        };
+        // Hold write lock for the entire operation to prevent concurrent mutations
+        // from being silently dropped during the swap.
+        let mut inner = self.inner.write();
 
+        let live_docs = self.collect_live_documents(&inner);
         let doc_count = live_docs.len();
 
-        // Rebuild index + id_map from scratch.
         let mut new_index = HNSWIndex::new(self.config.embedding_dim, self.config.hnsw.clone());
         let mut new_id_map = IdMap::new();
 
@@ -195,7 +198,6 @@ impl Collection {
             new_id_map.insert(doc.id.clone());
         }
 
-        // Checkpoint the compacted state.
         {
             let mut storage = self.storage.lock();
             storage
@@ -210,13 +212,9 @@ impl Collection {
                 .map_err(DbError::Core)?;
         }
 
-        // Swap in the new state.
-        {
-            let mut inner = self.inner.write();
-            inner.index = new_index;
-            inner.id_map = new_id_map;
-            inner.documents = live_docs;
-        }
+        inner.index = new_index;
+        inner.id_map = new_id_map;
+        inner.documents = live_docs;
 
         debug!(name = %self.name, doc_count, "compaction complete");
         Ok(())
@@ -260,8 +258,9 @@ impl Collection {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>> {
-        // Over-fetch to compensate for tombstones (adding 0 is harmless).
-        let fetch = k + inner.id_map.tombstone_count();
+        // Over-fetch to compensate for tombstones, clamped to index size
+        // to avoid requesting more results than the index can return.
+        let fetch = (k + inner.id_map.tombstone_count()).min(inner.index.len());
         let raw = inner.index.search(query, fetch).map_err(DbError::Core)?;
 
         let results: Vec<SearchResult> = raw
@@ -328,7 +327,21 @@ impl Collection {
         };
 
         if needs {
-            self.compact()?;
+            let inner = self.inner.read();
+            let live_docs = self.collect_live_documents(&inner);
+            let doc_count = live_docs.len();
+
+            let mut storage = self.storage.lock();
+            storage
+                .checkpoint(
+                    &live_docs,
+                    IndexMetadata {
+                        document_count: doc_count,
+                        embedding_dim: self.config.embedding_dim,
+                        index_type: "hnsw".into(),
+                    },
+                )
+                .map_err(DbError::Core)?;
         }
 
         Ok(())
@@ -523,6 +536,46 @@ mod tests {
 
         let doc = col.get("x").unwrap().unwrap();
         assert_eq!(doc.content, "new");
+    }
+
+    #[test]
+    fn compact_preserves_all_live_documents() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None).unwrap();
+        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None).unwrap();
+        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None).unwrap();
+        col.delete("b").unwrap();
+
+        col.compact().unwrap();
+
+        assert_eq!(col.len(), 2);
+        assert!(col.get("a").unwrap().is_some());
+        assert!(col.get("b").unwrap().is_none());
+        assert!(col.get("c").unwrap().is_some());
+
+        let results = col.search(&[1.0, 0.0, 0.0], 5, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(!results.iter().any(|r| r.id == "b"));
+    }
+
+    #[test]
+    fn delete_is_durable_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+            col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None).unwrap();
+            col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None).unwrap();
+            col.delete("a").unwrap();
+            col.flush().unwrap();
+        }
+        {
+            let col = Collection::open("test", dir.path(), cfg(3)).unwrap();
+            assert_eq!(col.len(), 1);
+            assert!(col.get("a").unwrap().is_none());
+            assert!(col.get("b").unwrap().is_some());
+        }
     }
 
     #[test]
