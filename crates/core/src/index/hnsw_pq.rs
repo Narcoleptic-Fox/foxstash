@@ -208,9 +208,9 @@ impl PQHNSWIndex {
             });
         }
 
-        if document.embedding.iter().any(|v| v.is_nan()) {
-            return Err(RagError::IndexError(
-                "embedding contains NaN values".to_string(),
+        if document.embedding.iter().any(|v| !v.is_finite()) {
+            return Err(RagError::InvalidInput(
+                "embedding contains non-finite values (NaN or Inf)".to_string(),
             ));
         }
 

@@ -569,9 +569,9 @@ impl HNSWIndex {
             });
         }
 
-        if document.embedding.iter().any(|v| v.is_nan()) {
+        if document.embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
-                "embedding contains NaN values".into(),
+                "embedding contains non-finite values (NaN or Inf)".into(),
             ));
         }
 
@@ -636,9 +636,9 @@ impl HNSWIndex {
             });
         }
 
-        if embedding.iter().any(|v| v.is_nan()) {
+        if embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
-                "embedding contains NaN values".into(),
+                "embedding contains non-finite values (NaN or Inf)".into(),
             ));
         }
 
@@ -1991,6 +1991,26 @@ mod tests {
         let doc = create_test_document("doc1", vec![1.0, 0.0]); // Wrong dimension
 
         assert!(index.add(doc).is_err());
+    }
+
+    #[test]
+    fn rejects_inf_embedding() {
+        let mut index = HNSWIndex::new(3, HNSWConfig::default());
+        let doc = Document {
+            id: "inf".to_string(),
+            content: "test".to_string(),
+            embedding: vec![f32::INFINITY, 0.0, 0.0],
+            metadata: None,
+        };
+        assert!(index.add(doc).is_err());
+
+        let doc_neg = Document {
+            id: "neg_inf".to_string(),
+            content: "test".to_string(),
+            embedding: vec![0.0, f32::NEG_INFINITY, 0.0],
+            metadata: None,
+        };
+        assert!(index.add(doc_neg).is_err());
     }
 
     #[test]
