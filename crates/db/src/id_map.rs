@@ -32,9 +32,15 @@ impl IdMap {
     /// Insert an ID and return its assigned position.
     ///
     /// If the ID was previously tombstoned, the tombstone is removed
-    /// and a new position is assigned.
+    /// and a new position is assigned. If the ID already occupies an
+    /// older position, that stale reverse mapping is removed to prevent
+    /// `id_at(old_pos)` from returning the ID after a re-insert.
     pub fn insert(&mut self, id: String) -> usize {
         self.tombstones.remove(&id);
+        // Remove stale reverse mapping if ID already exists at a different position.
+        if let Some(&old_pos) = self.id_to_pos.get(&id) {
+            self.pos_to_id.remove(&old_pos);
+        }
         let pos = self.next_pos;
         self.id_to_pos.insert(id.clone(), pos);
         self.pos_to_id.insert(pos, id);
@@ -180,6 +186,20 @@ mod tests {
 
         assert!(map.is_pos_tombstoned(0));
         assert!(!map.is_pos_tombstoned(1));
+    }
+
+    #[test]
+    fn reinsert_cleans_old_pos_to_id() {
+        let mut map = IdMap::new();
+        let old_pos = map.insert("x".into());
+        assert_eq!(map.id_at(old_pos), Some("x"));
+
+        map.remove("x");
+        let new_pos = map.insert("x".into());
+        assert_ne!(old_pos, new_pos);
+        assert_eq!(map.id_at(new_pos), Some("x"));
+        assert_eq!(map.id_at(old_pos), None); // stale entry must be gone
+        assert_eq!(map.get("x"), Some(new_pos));
     }
 
     #[test]

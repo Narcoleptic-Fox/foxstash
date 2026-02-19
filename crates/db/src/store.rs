@@ -19,6 +19,15 @@ use std::sync::Arc;
 use tracing::info;
 
 /// A vector store managing multiple named collections on disk.
+///
+/// All collections within a single `VectorStore` share the same
+/// `embedding_dim` from the [`DbConfig`] used to open the store. Attempting
+/// to insert a document whose embedding length differs from `config.embedding_dim`
+/// will return a [`DbError::DimensionMismatch`] error.
+///
+/// If you need to work with embeddings of different dimensions (produced by
+/// different models), open separate `VectorStore` instances in separate
+/// directories — one per embedding model.
 pub struct VectorStore {
     base_path: PathBuf,
     config: DbConfig,

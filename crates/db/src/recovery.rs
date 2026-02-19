@@ -30,6 +30,13 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
             "loaded checkpoint"
         );
 
+        if meta.embedding_dim != config.embedding_dim {
+            return Err(DbError::DimensionMismatch {
+                expected: config.embedding_dim,
+                actual: meta.embedding_dim,
+            });
+        }
+
         for doc in &checkpoint_docs {
             index.add(doc.clone()).map_err(DbError::Core)?;
             id_map.insert(doc.id.clone());
