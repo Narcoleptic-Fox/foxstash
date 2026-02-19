@@ -41,11 +41,8 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
     let helper = RecoveryHelper::new(storage);
     let replayed = helper.replay_wal(|op| match op {
         WalOperation::Add(doc) => {
-            // If this ID already exists (from checkpoint), it's a re-add (update).
-            // Since HNSW has no remove, we tombstone the old position and add fresh.
-            if id_map.get(&doc.id).is_some() {
-                id_map.remove(&doc.id);
-            }
+            // Tombstone old position if re-adding (no-op if absent).
+            id_map.remove(&doc.id);
             index.add(doc.clone())?;
             id_map.insert(doc.id.clone());
             documents.push(doc.clone());
