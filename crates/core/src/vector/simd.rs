@@ -216,6 +216,10 @@ impl pulp::WithSimd for FusedCosineDistance<'_> {
 
         let mut i = 0;
         while i < simd_end {
+            // f32s_partial_load is safe to use for full-width loads here: pulp's
+            // AVX2 impl uses _mm256_maskload_epi32 with a mask indexed by
+            // slice.len().min(lane_count), which saturates to the all-ones mask
+            // when slice.len() >= lane_count — equivalent to a full VMOVUPS load.
             let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
             let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
 
@@ -275,7 +279,9 @@ fn dot_product_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
 
             let mut i = 0;
             while i < simd_end {
-                // Load vectors from a and b
+                // f32s_partial_load with slice.len() >= lane_count saturates the
+                // mask to all-ones, making this a full-width unmasked SIMD load.
+                // See FusedCosineDistance::with_simd for detailed explanation.
                 let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
                 let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
 
@@ -324,6 +330,9 @@ fn l2_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
 
             let mut i = 0;
             while i < simd_end {
+                // f32s_partial_load with slice.len() >= lane_count saturates the
+                // mask to all-ones, making this a full-width unmasked SIMD load.
+                // See FusedCosineDistance::with_simd for detailed explanation.
                 let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
                 let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
 
@@ -371,6 +380,9 @@ impl pulp::WithSimd for Magnitude<'_> {
 
         let mut i = 0;
         while i < simd_end {
+            // f32s_partial_load with slice.len() >= lane_count saturates the
+            // mask to all-ones, making this a full-width unmasked SIMD load.
+            // See FusedCosineDistance::with_simd for detailed explanation.
             let vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&vector[i..]));
             sum_squares = simd.f32s_mul_add_e(vec, vec, sum_squares);
             i += lane_count;
