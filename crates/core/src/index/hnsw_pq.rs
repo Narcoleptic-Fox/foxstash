@@ -406,7 +406,7 @@ impl PQHNSWIndex {
 
     fn random_level(&self) -> usize {
         let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen();
+        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
