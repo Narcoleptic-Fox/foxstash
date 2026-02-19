@@ -579,7 +579,9 @@ impl FileStorage {
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)?;
 
+        // Try JSON first (v2+), fall back to bincode for v1 metadata files.
         let metadata: StorageMetadata = serde_json::from_slice(&contents)
+            .or_else(|_| bincode::deserialize::<StorageMetadata>(&contents))
             .map_err(|e| RagError::StorageError(format!("metadata deserialize failed: {}", e)))?;
         Ok(metadata)
     }

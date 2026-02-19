@@ -332,6 +332,11 @@ impl HNSWIndex {
     /// * `embedding_dim` - Dimensionality of embedding vectors
     /// * `config` - HNSW configuration parameters
     pub fn new(embedding_dim: usize, config: HNSWConfig) -> Self {
+        assert!(
+            config.m <= 127,
+            "m must be <= 127 (m0 = 2*m must fit in u8), got m={}",
+            config.m
+        );
         Self {
             embedding_dim,
             config,
