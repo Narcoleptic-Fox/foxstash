@@ -11,6 +11,9 @@ pub enum Filter {
     /// Field equals value.
     Eq { field: String, value: Value },
     /// Field does not equal value.
+    ///
+    /// Returns `true` when the field is missing or `None`, following SQL-like
+    /// NULL semantics where a missing value is considered "not equal" to any value.
     Ne { field: String, value: Value },
     /// Field value is in the given set.
     In { field: String, values: Vec<Value> },

@@ -275,6 +275,7 @@ impl HNSWConfig {
 
     /// Set M parameter (connections per node)
     pub fn with_m(mut self, m: usize) -> Self {
+        assert!(m <= 127, "m must be <= 127 (m0 = 2*m must fit in u8)");
         self.m = m;
         self.m0 = m * 2;
         self.ml = 1.0 / (m as f32).ln();
@@ -331,6 +332,11 @@ impl HNSWIndex {
     /// * `embedding_dim` - Dimensionality of embedding vectors
     /// * `config` - HNSW configuration parameters
     pub fn new(embedding_dim: usize, config: HNSWConfig) -> Self {
+        assert!(
+            config.m <= 127,
+            "m must be <= 127 (m0 = 2*m must fit in u8), got m={}",
+            config.m
+        );
         Self {
             embedding_dim,
             config,
@@ -532,6 +538,7 @@ impl HNSWIndex {
     fn build_l0_cache(&mut self) {
         let n = self.len();
         let m0 = self.config.m0;
+        debug_assert!(m0 <= 255, "m0 exceeds u8 capacity for connections_l0_count");
         self.connections_l0 = vec![0u32; n * m0];
         self.connections_l0_count = vec![0u8; n];
 
@@ -569,9 +576,9 @@ impl HNSWIndex {
             });
         }
 
-        if document.embedding.iter().any(|v| v.is_nan()) {
+        if document.embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
-                "embedding contains NaN values".into(),
+                "embedding contains non-finite values (NaN or Inf)".into(),
             ));
         }
 
@@ -603,10 +610,10 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        self.insert_node(node_id, node_level);
+        let affected = self.insert_node(node_id, node_level);
 
-        // Rebuild L0 cache (insert_node modifies bidirectional connections)
-        self.build_l0_cache();
+        // Update only the nodes whose L0 connections changed (O(m0) per node).
+        self.sync_l0_cache_for_nodes(&affected);
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -636,9 +643,9 @@ impl HNSWIndex {
             });
         }
 
-        if embedding.iter().any(|v| v.is_nan()) {
+        if embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
-                "embedding contains NaN values".into(),
+                "embedding contains non-finite values (NaN or Inf)".into(),
             ));
         }
 
@@ -670,10 +677,10 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        self.insert_node(node_id, node_level);
+        let affected = self.insert_node(node_id, node_level);
 
-        // Rebuild L0 cache (insert_node modifies bidirectional connections)
-        self.build_l0_cache();
+        // Update only the nodes whose L0 connections changed (O(m0) per node).
+        self.sync_l0_cache_for_nodes(&affected);
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -740,6 +747,11 @@ impl HNSWIndex {
 
         if self.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Ensure search context is large enough for current index size.
+        if ctx.capacity < self.len() {
+            *ctx = SearchContext::new(self.len());
         }
 
         // Precompute query norm once for fused distance
@@ -880,12 +892,17 @@ impl HNSWIndex {
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
-    /// Inserts a node into the graph structure
+    /// Inserts a node into the graph structure.
+    ///
+    /// Returns the IDs of all nodes whose layer-0 connections were modified
+    /// (the new node itself plus all layer-0 neighbors it linked to). The caller
+    /// can pass this list to `sync_l0_cache_for_nodes` instead of doing a full
+    /// `build_l0_cache` rebuild.
     ///
     /// # Arguments
     /// * `node_id` - ID of the node to insert
     /// * `node_level` - Maximum layer of the node
-    fn insert_node(&mut self, node_id: usize, node_level: usize) {
+    fn insert_node(&mut self, node_id: usize, node_level: usize) -> Vec<usize> {
         let entry_point = self.entry_point.unwrap();
         let mut current_nearest = vec![entry_point];
 
@@ -905,6 +922,10 @@ impl HNSWIndex {
                 query_norm,
             );
         }
+
+        // Collect L0-modified nodes for incremental cache update.
+        // The new node itself is always modified at layer 0.
+        let mut l0_modified: Vec<usize> = vec![node_id];
 
         // Insert into layers from top to bottom
         for layer in (0..=node_level).rev() {
@@ -966,7 +987,41 @@ impl HNSWIndex {
                         self.connections[neighbor_id][layer] =
                             pruned.into_iter().map(|x| x as u32).collect();
                     }
+
+                    // Track layer-0 nodes modified by bidirectional linking.
+                    if layer == 0 {
+                        l0_modified.push(neighbor_id);
+                    }
                 }
+            }
+        }
+
+        l0_modified
+    }
+
+    /// Updates the flat L0 cache for a specific subset of nodes.
+    ///
+    /// Called after incremental insertions to avoid the O(n) full rebuild
+    /// that `build_l0_cache` performs. Each node update is O(m0).
+    fn sync_l0_cache_for_nodes(&mut self, node_ids: &[usize]) {
+        let m0 = self.config.m0;
+        // Ensure cache is large enough for all nodes.
+        let needed = self.connections.len() * m0;
+        if self.connections_l0.len() < needed {
+            self.connections_l0.resize(needed, 0u32);
+            self.connections_l0_count
+                .resize(self.connections.len(), 0u8);
+        }
+        for &node_id in node_ids {
+            if node_id < self.connections.len() && !self.connections[node_id].is_empty() {
+                let neighbors = &self.connections[node_id][0];
+                let count = neighbors.len().min(m0);
+                let start = node_id * m0;
+                self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
+                for j in count..m0 {
+                    self.connections_l0[start + j] = 0;
+                }
+                self.connections_l0_count[node_id] = count as u8;
             }
         }
     }
@@ -1057,8 +1112,10 @@ impl HNSWIndex {
                     if !ctx.is_visited(neighbor_id) {
                         ctx.mark_visited(neighbor_id);
                         let dist = self.distance_to_node(query, neighbor_id, query_norm);
-                        batch_buf[batch_count] = (dist, neighbor_id);
-                        batch_count += 1;
+                        if batch_count < batch_buf.len() {
+                            batch_buf[batch_count] = (dist, neighbor_id);
+                            batch_count += 1;
+                        }
                     }
                 }
 
@@ -1991,6 +2048,48 @@ mod tests {
         let doc = create_test_document("doc1", vec![1.0, 0.0]); // Wrong dimension
 
         assert!(index.add(doc).is_err());
+    }
+
+    #[test]
+    fn rejects_inf_embedding() {
+        let mut index = HNSWIndex::new(3, HNSWConfig::default());
+        let doc = Document {
+            id: "inf".to_string(),
+            content: "test".to_string(),
+            embedding: vec![f32::INFINITY, 0.0, 0.0],
+            metadata: None,
+        };
+        assert!(index.add(doc).is_err());
+
+        let doc_neg = Document {
+            id: "neg_inf".to_string(),
+            content: "test".to_string(),
+            embedding: vec![0.0, f32::NEG_INFINITY, 0.0],
+            metadata: None,
+        };
+        assert!(index.add(doc_neg).is_err());
+    }
+
+    #[test]
+    fn search_context_resizes_after_add() {
+        let mut index = HNSWIndex::new(3, HNSWConfig::default());
+        index.add(Document {
+            id: "a".into(), content: "a".into(),
+            embedding: vec![1.0, 0.0, 0.0], metadata: None,
+        }).unwrap();
+
+        let mut ctx = index.create_search_context();
+
+        for i in 0..10 {
+            index.add(Document {
+                id: format!("doc-{i}"), content: format!("content-{i}"),
+                embedding: vec![(i as f32) * 0.1, 1.0 - (i as f32) * 0.1, 0.0],
+                metadata: None,
+            }).unwrap();
+        }
+
+        let results = index.search_with_context(&[1.0, 0.0, 0.0], 5, &mut ctx).unwrap();
+        assert!(!results.is_empty());
     }
 
     #[test]

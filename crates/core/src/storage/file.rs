@@ -55,7 +55,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const STORAGE_VERSION: u32 = 1;
+const STORAGE_VERSION: u32 = 2;
 const DATA_EXTENSION: &str = "data";
 const META_EXTENSION: &str = "meta";
 const TMP_EXTENSION: &str = "tmp";
@@ -272,7 +272,8 @@ impl FileStorage {
 
         // Save metadata file atomically
         let meta_path = self.metadata_path(id);
-        let meta_bytes = bincode::serialize(&metadata)?;
+        let meta_bytes = serde_json::to_vec(&metadata)
+            .map_err(|e| RagError::StorageError(format!("metadata serialize failed: {}", e)))?;
         self.write_atomic(&meta_path, &meta_bytes)?;
 
         Ok(stats)
@@ -578,7 +579,10 @@ impl FileStorage {
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)?;
 
-        let metadata: StorageMetadata = bincode::deserialize(&contents)?;
+        // Try JSON first (v2+), fall back to bincode for v1 metadata files.
+        let metadata: StorageMetadata = serde_json::from_slice(&contents)
+            .or_else(|_| bincode::deserialize::<StorageMetadata>(&contents))
+            .map_err(|e| RagError::StorageError(format!("metadata deserialize failed: {}", e)))?;
         Ok(metadata)
     }
 
@@ -867,7 +871,8 @@ impl FileStorage {
 
         // Save metadata file atomically
         let meta_path = self.metadata_path(name);
-        let meta_bytes = bincode::serialize(&metadata)?;
+        let meta_bytes = serde_json::to_vec(&metadata)
+            .map_err(|e| RagError::StorageError(format!("metadata serialize failed: {}", e)))?;
         self.write_atomic(&meta_path, &meta_bytes)?;
 
         Ok(stats)

@@ -59,7 +59,12 @@ pub struct DbConfig {
     pub hnsw: HNSWConfig,
     /// Incremental storage configuration.
     pub storage: IncrementalConfig,
-    /// Embedding dimensionality (all collections share the same dim).
+    /// Embedding dimensionality shared by every collection in this store.
+    ///
+    /// All documents inserted into any collection must have embeddings of
+    /// exactly this length. If you need collections with different dimensions
+    /// (e.g. different embedding models), open separate `VectorStore` instances
+    /// pointing to different directories.
     pub embedding_dim: usize,
     /// Whether to auto-checkpoint after threshold mutations.
     pub auto_checkpoint: bool,

@@ -208,9 +208,9 @@ impl PQHNSWIndex {
             });
         }
 
-        if document.embedding.iter().any(|v| v.is_nan()) {
-            return Err(RagError::IndexError(
-                "embedding contains NaN values".to_string(),
+        if document.embedding.iter().any(|v| !v.is_finite()) {
+            return Err(RagError::InvalidInput(
+                "embedding contains non-finite values (NaN or Inf)".to_string(),
             ));
         }
 
@@ -406,7 +406,7 @@ impl PQHNSWIndex {
 
     fn random_level(&self) -> usize {
         let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen();
+        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
