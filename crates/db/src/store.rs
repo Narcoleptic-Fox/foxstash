@@ -265,6 +265,95 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_search_lifecycle() {
+        use crate::filter::Filter;
+        use serde_json::json;
+
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::open(dir.path(), cfg()).unwrap();
+        let col = store.collection("hybrid").unwrap();
+
+        // ── Phase 1: Insert 10 docs with varied content + embeddings + metadata ──
+        let docs = [
+            ("d0", "gateway service running on port 8080", [1.0, 0.0, 0.0], "infra"),
+            ("d1", "database connection pool exhausted", [0.0, 1.0, 0.0], "infra"),
+            ("d2", "gateway timeout after 30 seconds", [0.9, 0.1, 0.0], "infra"),
+            ("d3", "user authentication failed for admin", [0.0, 0.0, 1.0], "auth"),
+            ("d4", "session token expired and gateway rejected request", [0.8, 0.1, 0.1], "auth"),
+            ("d5", "memory usage exceeded threshold on gateway node", [0.7, 0.2, 0.1], "infra"),
+            ("d6", "ssl certificate renewal pending", [0.1, 0.1, 0.8], "security"),
+            ("d7", "load balancer health check failed", [0.5, 0.5, 0.0], "infra"),
+            ("d8", "gateway dns resolution error", [0.6, 0.3, 0.1], "infra"),
+            ("d9", "disk space running low on primary node", [0.2, 0.7, 0.1], "infra"),
+        ];
+
+        for (id, content, emb, cat) in &docs {
+            col.insert(
+                id.to_string(),
+                content.to_string(),
+                emb.to_vec(),
+                Some(json!({ "category": cat })),
+            )
+            .unwrap();
+        }
+        assert_eq!(col.len(), 10);
+
+        // ── Phase 2: Text search for "gateway service" ──
+        let results = col.search_text("gateway service", 10, None).unwrap();
+        assert!(!results.is_empty());
+        // All results should contain "gateway" or "service".
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"d0")); // has both terms
+
+        // ── Phase 3: Hybrid search ──
+        let results = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway service", 5, None, None)
+            .unwrap();
+        assert!(!results.is_empty());
+        assert!(results.len() <= 5);
+
+        // ── Phase 4: Delete docs, verify exclusion ──
+        col.delete("d0").unwrap();
+        col.delete("d2").unwrap();
+
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert!(!results.iter().any(|r| r.id == "d0"));
+        assert!(!results.iter().any(|r| r.id == "d2"));
+
+        let results = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, None)
+            .unwrap();
+        assert!(!results.iter().any(|r| r.id == "d0"));
+        assert!(!results.iter().any(|r| r.id == "d2"));
+
+        // ── Phase 5: Compact, text search still works ──
+        col.compact().unwrap();
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert!(!results.is_empty());
+        assert!(!results.iter().any(|r| r.id == "d0"));
+
+        // ── Phase 6: Flush, reopen, text search works (recovery) ──
+        store.flush_all().unwrap();
+        drop(store);
+
+        let store2 = VectorStore::open(dir.path(), cfg()).unwrap();
+        let col2 = store2.get_collection("hybrid").unwrap();
+        assert_eq!(col2.len(), 8);
+
+        let results = col2.search_text("gateway", 10, None).unwrap();
+        assert!(!results.is_empty());
+        assert!(!results.iter().any(|r| r.id == "d0"));
+        assert!(!results.iter().any(|r| r.id == "d2"));
+
+        // Text search with filter.
+        let filter = Filter::eq("category", "auth");
+        let results = col2.search_text("gateway", 10, Some(&filter)).unwrap();
+        // Only d4 has "gateway" AND category=auth.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "d4");
+    }
+
+    #[test]
     fn integration_full_lifecycle() {
         use crate::filter::Filter;
         use serde_json::json;

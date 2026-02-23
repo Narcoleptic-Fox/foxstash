@@ -17,9 +17,12 @@
 
 pub mod collection;
 pub mod filter;
+pub mod hybrid;
 pub mod id_map;
+pub mod inverted_index;
 pub mod recovery;
 pub mod store;
+pub mod tokenizer;
 
 use foxstash_core::index::HNSWConfig;
 use foxstash_core::storage::IncrementalConfig;
@@ -68,6 +71,8 @@ pub struct DbConfig {
     pub embedding_dim: usize,
     /// Whether to auto-checkpoint after threshold mutations.
     pub auto_checkpoint: bool,
+    /// Default hybrid search configuration.
+    pub hybrid: HybridConfig,
 }
 
 impl Default for DbConfig {
@@ -77,6 +82,7 @@ impl Default for DbConfig {
             storage: IncrementalConfig::default(),
             embedding_dim: 384,
             auto_checkpoint: true,
+            hybrid: HybridConfig::default(),
         }
     }
 }
@@ -101,10 +107,16 @@ impl DbConfig {
         self.auto_checkpoint = auto;
         self
     }
+
+    pub fn with_hybrid(mut self, hybrid: HybridConfig) -> Self {
+        self.hybrid = hybrid;
+        self
+    }
 }
 
 // Re-export key types consumers need.
 pub use collection::Collection;
 pub use filter::Filter;
 pub use foxstash_core::{Document, SearchResult};
+pub use hybrid::{HybridConfig, MergeStrategy};
 pub use store::VectorStore;

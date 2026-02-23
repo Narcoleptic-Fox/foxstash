@@ -1,6 +1,8 @@
 //! Recovery: rebuild index state from checkpoint + WAL replay.
 
 use crate::id_map::IdMap;
+use crate::inverted_index::InvertedIndex;
+use crate::tokenizer::{SimpleTokenizer, Tokenizer};
 use crate::{DbConfig, DbError, Result};
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::storage::incremental::{IncrementalStorage, RecoveryHelper, WalOperation};
@@ -12,6 +14,7 @@ pub struct RecoveredState {
     pub index: HNSWIndex,
     pub id_map: IdMap,
     pub documents: Vec<Document>,
+    pub text_index: InvertedIndex,
 }
 
 /// Load a checkpoint (if any) and replay the WAL to produce a fully recovered state.
@@ -70,10 +73,22 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
 
     debug!(replayed, "WAL entries replayed");
 
+    // Phase 3: Rebuild inverted index from live documents.
+    let tokenizer = SimpleTokenizer::new();
+    let mut text_index = InvertedIndex::new();
+    for id in id_map.live_ids() {
+        let pos = id_map.get(id).unwrap();
+        let tokens = tokenizer.tokenize(&documents[pos].content);
+        text_index.add(pos, &tokens);
+    }
+
+    debug!(text_docs = text_index.len(), "text index rebuilt");
+
     Ok(RecoveredState {
         index,
         id_map,
         documents,
+        text_index,
     })
 }
 
