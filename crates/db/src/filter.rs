@@ -116,12 +116,10 @@ impl Filter {
 
     fn eval(&self, root: &Value) -> bool {
         match self {
-            Filter::Eq { field, value } => resolve(root, field)
-                .map(|v| v == value)
-                .unwrap_or(false),
-            Filter::Ne { field, value } => resolve(root, field)
-                .map(|v| v != value)
-                .unwrap_or(true),
+            Filter::Eq { field, value } => {
+                resolve(root, field).map(|v| v == value).unwrap_or(false)
+            }
+            Filter::Ne { field, value } => resolve(root, field).map(|v| v != value).unwrap_or(true),
             Filter::In { field, values } => resolve(root, field)
                 .map(|v| values.contains(v))
                 .unwrap_or(false),

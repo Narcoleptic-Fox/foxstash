@@ -275,16 +275,66 @@ mod tests {
 
         // ── Phase 1: Insert 10 docs with varied content + embeddings + metadata ──
         let docs = [
-            ("d0", "gateway service running on port 8080", [1.0, 0.0, 0.0], "infra"),
-            ("d1", "database connection pool exhausted", [0.0, 1.0, 0.0], "infra"),
-            ("d2", "gateway timeout after 30 seconds", [0.9, 0.1, 0.0], "infra"),
-            ("d3", "user authentication failed for admin", [0.0, 0.0, 1.0], "auth"),
-            ("d4", "session token expired and gateway rejected request", [0.8, 0.1, 0.1], "auth"),
-            ("d5", "memory usage exceeded threshold on gateway node", [0.7, 0.2, 0.1], "infra"),
-            ("d6", "ssl certificate renewal pending", [0.1, 0.1, 0.8], "security"),
-            ("d7", "load balancer health check failed", [0.5, 0.5, 0.0], "infra"),
-            ("d8", "gateway dns resolution error", [0.6, 0.3, 0.1], "infra"),
-            ("d9", "disk space running low on primary node", [0.2, 0.7, 0.1], "infra"),
+            (
+                "d0",
+                "gateway service running on port 8080",
+                [1.0, 0.0, 0.0],
+                "infra",
+            ),
+            (
+                "d1",
+                "database connection pool exhausted",
+                [0.0, 1.0, 0.0],
+                "infra",
+            ),
+            (
+                "d2",
+                "gateway timeout after 30 seconds",
+                [0.9, 0.1, 0.0],
+                "infra",
+            ),
+            (
+                "d3",
+                "user authentication failed for admin",
+                [0.0, 0.0, 1.0],
+                "auth",
+            ),
+            (
+                "d4",
+                "session token expired and gateway rejected request",
+                [0.8, 0.1, 0.1],
+                "auth",
+            ),
+            (
+                "d5",
+                "memory usage exceeded threshold on gateway node",
+                [0.7, 0.2, 0.1],
+                "infra",
+            ),
+            (
+                "d6",
+                "ssl certificate renewal pending",
+                [0.1, 0.1, 0.8],
+                "security",
+            ),
+            (
+                "d7",
+                "load balancer health check failed",
+                [0.5, 0.5, 0.0],
+                "infra",
+            ),
+            (
+                "d8",
+                "gateway dns resolution error",
+                [0.6, 0.3, 0.1],
+                "infra",
+            ),
+            (
+                "d9",
+                "disk space running low on primary node",
+                [0.2, 0.7, 0.1],
+                "infra",
+            ),
         ];
 
         for (id, content, emb, cat) in &docs {

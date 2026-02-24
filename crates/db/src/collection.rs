@@ -41,8 +41,8 @@ pub struct Collection {
 impl Collection {
     /// Open or create a collection at the given path.
     pub fn open(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
-        let storage = IncrementalStorage::new(path, config.storage.clone())
-            .map_err(DbError::Core)?;
+        let storage =
+            IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
         let state = recovery::recover(&storage, &config)?;
 
@@ -69,8 +69,8 @@ impl Collection {
 
     /// Create a fresh (empty) collection at the given path.
     pub fn create(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
-        let storage = IncrementalStorage::new(path, config.storage.clone())
-            .map_err(DbError::Core)?;
+        let storage =
+            IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
         Ok(Self {
             name: name.to_string(),
@@ -117,6 +117,11 @@ impl Collection {
         // Then mutate in-memory state.
         {
             let mut inner = self.inner.write();
+            // Clean up old inverted index postings before tombstoning.
+            // id_map.get() returns None after remove(), so capture old_pos first.
+            if let Some(old_pos) = inner.id_map.get(&id) {
+                inner.text_index.remove(old_pos);
+            }
             // Tombstone previous version if re-inserting same ID (no-op if absent).
             inner.id_map.remove(&id);
             inner.index.add(doc.clone()).map_err(DbError::Core)?;
@@ -144,6 +149,10 @@ impl Collection {
             storage.log_remove(id).map_err(DbError::Core)?;
         }
 
+        // Remove inverted index postings before tombstoning.
+        if let Some(pos) = inner.id_map.get(id) {
+            inner.text_index.remove(pos);
+        }
         // Then apply tombstone in-memory.
         inner.id_map.remove(id);
         Ok(true)
@@ -278,11 +287,11 @@ impl Collection {
             return Ok(Vec::new());
         }
 
-        // Over-fetch to compensate for tombstones + filter.
+        // Over-fetch to compensate for tombstones + filter, clamped to index size.
         let fetch = if filter.is_some() {
-            k * 4
+            (k.saturating_mul(4)).min(inner.text_index.len())
         } else {
-            k + inner.id_map.tombstone_count()
+            (k + inner.id_map.tombstone_count()).min(inner.text_index.len())
         };
         let raw = inner.text_index.search(&tokens, fetch);
 
@@ -356,7 +365,8 @@ impl Collection {
         let keyword_results = if tokens.is_empty() {
             Vec::new()
         } else {
-            let fetch = k * 2 + inner.id_map.tombstone_count();
+            let fetch =
+                (k.saturating_mul(2) + inner.id_map.tombstone_count()).min(inner.text_index.len());
             let raw = inner.text_index.search(&tokens, fetch);
             raw.into_iter()
                 .filter(|(pos, _)| {
@@ -439,9 +449,7 @@ impl Collection {
 
             let results: Vec<SearchResult> = raw
                 .into_iter()
-                .filter(|r| {
-                    inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref())
-                })
+                .filter(|r| inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref()))
                 .take(k)
                 .collect();
 
@@ -695,9 +703,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
 
-        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None).unwrap();
-        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None).unwrap();
-        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None).unwrap();
+        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
+            .unwrap();
+        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None)
+            .unwrap();
         col.delete("b").unwrap();
 
         col.compact().unwrap();
@@ -717,8 +728,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
-            col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None).unwrap();
-            col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None).unwrap();
+            col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+                .unwrap();
+            col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
+                .unwrap();
             col.delete("a").unwrap();
             col.flush().unwrap();
         }
@@ -795,10 +808,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
 
-        col.insert("a".into(), "gateway running".into(), vec![1.0, 0.0, 0.0], None)
-            .unwrap();
-        col.insert("b".into(), "gateway stopped".into(), vec![0.0, 1.0, 0.0], None)
-            .unwrap();
+        col.insert(
+            "a".into(),
+            "gateway running".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "gateway stopped".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
 
         col.delete("a").unwrap();
 
@@ -853,12 +876,27 @@ mod tests {
 
         {
             let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
-            col.insert("a".into(), "gateway service".into(), vec![1.0, 0.0, 0.0], None)
-                .unwrap();
-            col.insert("b".into(), "database pool".into(), vec![0.0, 1.0, 0.0], None)
-                .unwrap();
-            col.insert("c".into(), "gateway timeout".into(), vec![0.0, 0.0, 1.0], None)
-                .unwrap();
+            col.insert(
+                "a".into(),
+                "gateway service".into(),
+                vec![1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+            col.insert(
+                "b".into(),
+                "database pool".into(),
+                vec![0.0, 1.0, 0.0],
+                None,
+            )
+            .unwrap();
+            col.insert(
+                "c".into(),
+                "gateway timeout".into(),
+                vec![0.0, 0.0, 1.0],
+                None,
+            )
+            .unwrap();
 
             col.delete("b").unwrap();
             col.compact().unwrap();
@@ -909,5 +947,360 @@ mod tests {
         let mut ids = col.list_ids();
         ids.sort();
         assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    // ── Edge-case tests for text/hybrid search after mutations ──────
+
+    #[test]
+    fn search_text_after_reinsert() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service running".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        // Re-insert same ID with completely different content.
+        col.insert(
+            "a".into(),
+            "database connection pool".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        // Old terms ("gateway") must NOT match.
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert!(
+            results.is_empty(),
+            "old terms should be gone after re-insert, got {:?}",
+            results.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+
+        // New terms ("database") must match.
+        let results = col.search_text("database", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a");
+    }
+
+    #[test]
+    fn search_text_scores_correct_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service alpha".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "gateway service beta".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "c".into(),
+            "gateway service gamma".into(),
+            vec![0.0, 0.0, 1.0],
+            None,
+        )
+        .unwrap();
+
+        col.delete("b").unwrap();
+
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"c"));
+        assert!(!ids.contains(&"b"));
+    }
+
+    #[test]
+    fn search_hybrid_after_reinsert() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "database pool".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        // Re-insert "a" with new content and embedding.
+        col.insert(
+            "a".into(),
+            "database connection".into(),
+            vec![0.0, 0.0, 1.0],
+            None,
+        )
+        .unwrap();
+
+        let results = col
+            .search_hybrid(&[0.0, 0.0, 1.0], "database", 10, None, None)
+            .unwrap();
+
+        // "a" should appear (matched on "database" keyword and vector).
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"a"));
+    }
+
+    #[test]
+    fn search_hybrid_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "gateway timeout".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        col.delete("a").unwrap();
+
+        let results = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, None)
+            .unwrap();
+
+        // Deleted doc must not appear.
+        assert!(
+            results.iter().all(|r| r.id != "a"),
+            "deleted doc should not appear in hybrid results"
+        );
+    }
+
+    #[test]
+    fn search_text_k_zero() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        let results = col.search_text("gateway", 0, None).unwrap();
+        assert!(results.is_empty(), "k=0 should return empty");
+    }
+
+    #[test]
+    fn search_text_empty_query() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        let results = col.search_text("", 10, None).unwrap();
+        assert!(results.is_empty(), "empty query should return empty");
+    }
+
+    #[test]
+    fn search_hybrid_empty_text_query() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "database pool".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        // Empty text query → only vector contributes.
+        let results = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "", 10, None, None)
+            .unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "vector arm should still produce results"
+        );
+        // "a" should rank first by vector similarity.
+        assert_eq!(results[0].id, "a");
+    }
+
+    #[test]
+    fn search_text_no_matching_terms() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        let results = col.search_text("xyznonexistent", 10, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn reinsert_then_compact_preserves_text_search() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service alpha".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "database pool beta".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        // Re-insert "a" with new text.
+        col.insert(
+            "a".into(),
+            "database connection gamma".into(),
+            vec![0.0, 0.0, 1.0],
+            None,
+        )
+        .unwrap();
+
+        col.compact().unwrap();
+
+        // After compact, "gateway" should not match (old content).
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert!(results.is_empty(), "old terms should be gone after compact");
+
+        // "database" should match both docs.
+        let results = col.search_text("database", 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn delete_all_then_search_text() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "gateway timeout".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        col.delete("a").unwrap();
+        col.delete("b").unwrap();
+
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert!(results.is_empty(), "all deleted → empty results");
+    }
+
+    #[test]
+    fn text_index_rebuilt_on_recovery() {
+        let dir = TempDir::new().unwrap();
+
+        // Session 1: insert, re-insert, delete, flush.
+        {
+            let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+            col.insert(
+                "a".into(),
+                "gateway service alpha".into(),
+                vec![1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+            col.insert(
+                "b".into(),
+                "database pool beta".into(),
+                vec![0.0, 1.0, 0.0],
+                None,
+            )
+            .unwrap();
+            col.insert(
+                "c".into(),
+                "gateway timeout gamma".into(),
+                vec![0.0, 0.0, 1.0],
+                None,
+            )
+            .unwrap();
+            // Re-insert "a" with different text.
+            col.insert(
+                "a".into(),
+                "database connection delta".into(),
+                vec![0.5, 0.5, 0.0],
+                None,
+            )
+            .unwrap();
+            col.delete("c").unwrap();
+            col.flush().unwrap();
+        }
+
+        // Session 2: reopen → recovery rebuilds text index.
+        {
+            let col = Collection::open("test", dir.path(), cfg(3)).unwrap();
+            assert_eq!(col.len(), 2);
+
+            // "gateway" should not match (a was re-inserted, c deleted).
+            let results = col.search_text("gateway", 10, None).unwrap();
+            assert!(
+                results.is_empty(),
+                "gateway should not match after recovery"
+            );
+
+            // "database" should match both a and b.
+            let results = col.search_text("database", 10, None).unwrap();
+            assert_eq!(results.len(), 2);
+        }
     }
 }

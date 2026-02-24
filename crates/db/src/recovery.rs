@@ -24,8 +24,9 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
     let mut documents: Vec<Document> = Vec::new();
 
     // Phase 1: Load checkpoint.
-    if let Some((checkpoint_docs, meta)) =
-        storage.load_checkpoint::<Vec<Document>>().map_err(DbError::Core)?
+    if let Some((checkpoint_docs, meta)) = storage
+        .load_checkpoint::<Vec<Document>>()
+        .map_err(DbError::Core)?
     {
         info!(
             checkpoint_id = meta.id,
@@ -77,8 +78,16 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
     let tokenizer = SimpleTokenizer::new();
     let mut text_index = InvertedIndex::new();
     for id in id_map.live_ids() {
-        let pos = id_map.get(id).unwrap();
-        let tokens = tokenizer.tokenize(&documents[pos].content);
+        let pos = id_map.get(id).ok_or_else(|| {
+            DbError::Recovery(format!("live ID '{id}' has no position in id_map"))
+        })?;
+        let doc = documents.get(pos).ok_or_else(|| {
+            DbError::Recovery(format!(
+                "position {pos} out of bounds (len={})",
+                documents.len()
+            ))
+        })?;
+        let tokens = tokenizer.tokenize(&doc.content);
         text_index.add(pos, &tokens);
     }
 
@@ -114,8 +123,7 @@ mod tests {
     #[test]
     fn recover_empty_storage() {
         let dir = TempDir::new().unwrap();
-        let storage =
-            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
         let config = test_config(4);
 
         let state = recover(&storage, &config).unwrap();
@@ -192,5 +200,22 @@ mod tests {
         assert_eq!(state.id_map.live_count(), 1);
         assert!(state.id_map.get("b").is_some());
         assert!(state.id_map.get("a").is_none());
+    }
+
+    #[test]
+    fn recover_wal_remove_nonexistent_is_noop() {
+        // Removing an ID that was never added should not panic during recovery.
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let config = test_config(4);
+
+        storage.log_add(&test_doc("a", 4)).unwrap();
+        storage.log_remove("nonexistent").unwrap();
+        storage.sync().unwrap();
+
+        let state = recover(&storage, &config).unwrap();
+        assert_eq!(state.id_map.live_count(), 1);
+        assert!(state.id_map.get("a").is_some());
     }
 }

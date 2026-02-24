@@ -1,7 +1,7 @@
 //! BM25-scored inverted index for keyword search.
 
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 /// BM25 tuning parameters.
 #[derive(Debug, Clone)]
@@ -124,9 +124,8 @@ impl InvertedIndex {
                     .unwrap_or(0.0);
 
                 let tf = posting.tf as f32;
-                let tf_component =
-                    (tf * (self.config.k1 + 1.0))
-                        / (tf + self.config.k1 * (1.0 - self.config.b + self.config.b * dl / avgdl));
+                let tf_component = (tf * (self.config.k1 + 1.0))
+                    / (tf + self.config.k1 * (1.0 - self.config.b + self.config.b * dl / avgdl));
 
                 *scores.entry(posting.doc_id).or_default() += idf * tf_component;
             }
@@ -147,8 +146,11 @@ impl InvertedIndex {
             }
         }
 
-        let mut results: Vec<(usize, f32)> = heap.into_iter().map(|Reverse(e)| (e.doc_id, e.score)).collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut results: Vec<(usize, f32)> = heap
+            .into_iter()
+            .map(|Reverse(e)| (e.doc_id, e.score))
+            .collect();
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results
     }
 
@@ -198,8 +200,7 @@ impl PartialOrd for OrdF32Entry {
 impl Ord for OrdF32Entry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
-            .partial_cmp(&other.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&other.score)
             .then(self.doc_id.cmp(&other.doc_id))
     }
 }
@@ -261,7 +262,10 @@ mod tests {
         let mut idx = InvertedIndex::new();
         // Short doc with "target" should score higher than long doc with "target".
         idx.add(0, &tokens("target"));
-        idx.add(1, &tokens("target word word word word word word word word word"));
+        idx.add(
+            1,
+            &tokens("target word word word word word word word word word"),
+        );
 
         let results = idx.search(&tokens("target"), 10);
         assert_eq!(results.len(), 2);
@@ -341,5 +345,57 @@ mod tests {
 
         let results = idx.search(&tokens("old"), 10);
         assert!(results.is_empty());
+    }
+
+    // ── Edge-case tests ────────────────────────────────────────────
+
+    #[test]
+    fn search_after_add_remove_same_doc() {
+        let mut idx = InvertedIndex::new();
+        idx.add(0, &tokens("gateway service running"));
+        idx.remove(0);
+
+        assert!(idx.is_empty());
+        let results = idx.search(&tokens("gateway"), 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn reinsert_same_position() {
+        let mut idx = InvertedIndex::new();
+        idx.add(0, &tokens("gateway service"));
+        idx.remove(0);
+        idx.add(0, &tokens("database pool"));
+
+        // Old terms should be gone.
+        let results = idx.search(&tokens("gateway"), 10);
+        assert!(results.is_empty());
+
+        // New terms should match.
+        let results = idx.search(&tokens("database"), 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 0);
+    }
+
+    #[test]
+    fn bm25_scores_with_single_doc() {
+        let mut idx = InvertedIndex::new();
+        idx.add(0, &tokens("rust programming language"));
+
+        let results = idx.search(&tokens("rust"), 10);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_finite(), "BM25 score should be finite");
+        assert!(results[0].1 > 0.0, "BM25 score should be positive");
+    }
+
+    #[test]
+    fn search_returns_at_most_k() {
+        let mut idx = InvertedIndex::new();
+        for i in 0..50 {
+            idx.add(i, &tokens("shared term unique"));
+        }
+
+        let results = idx.search(&tokens("shared"), 10);
+        assert_eq!(results.len(), 10, "should return exactly k=10 results");
     }
 }
