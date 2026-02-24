@@ -44,6 +44,12 @@ jobs:
       - name: Run doctests
         run: cargo test -p foxstash-core --doc --verbose
 
+      - name: Build foxstash-db
+        run: cargo build -p foxstash-db --verbose
+
+      - name: Run foxstash-db tests
+        run: cargo test -p foxstash-db --verbose
+
       - name: Build with features (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: cargo build -p foxstash-core --features compression-all
@@ -62,8 +68,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Clippy
+      - name: Clippy foxstash-core
         run: cargo clippy -p foxstash-core -- -D warnings
+
+      - name: Clippy foxstash-db
+        run: cargo clippy -p foxstash-db -- -D warnings
 
   fmt:
     name: Format
@@ -76,8 +85,11 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Check formatting
+      - name: Check foxstash-core formatting
         run: cargo fmt -p foxstash-core -- --check
+
+      - name: Check foxstash-db formatting
+        run: cargo fmt -p foxstash-db -- --check
 
   wasm:
     name: WASM Build

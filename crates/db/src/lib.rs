@@ -51,6 +51,9 @@ pub enum DbError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("recovery error: {0}")]
+    Recovery(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

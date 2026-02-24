@@ -1355,6 +1355,57 @@ mod concurrent_access {
 }
 
 // ============================================================================
+// (i) Additional Edge Cases
+// ============================================================================
+
+mod additional_edge_cases {
+    use super::*;
+
+    #[test]
+    fn search_with_k_zero() {
+        // k=0 should return empty for both HNSW and Flat.
+        let dim = 16;
+
+        let mut hnsw = HNSWIndex::with_defaults(dim);
+        hnsw.add(make_doc("doc_0", dim, 0)).unwrap();
+        let results = hnsw.search(&deterministic_embedding(dim, 0), 0).unwrap();
+        assert!(results.is_empty(), "HNSW k=0 should return empty");
+
+        let mut flat = FlatIndex::new(dim);
+        flat.add(make_doc("doc_0", dim, 0)).unwrap();
+        let results = flat.search(&deterministic_embedding(dim, 0), 0).unwrap();
+        assert!(results.is_empty(), "Flat k=0 should return empty");
+    }
+
+    #[test]
+    fn sequential_insert_and_search_no_panic() {
+        // Interleaved add + search should not panic or produce inconsistency.
+        let dim = 16;
+        let mut index = HNSWIndex::with_defaults(dim);
+
+        for i in 0..20 {
+            let doc = make_doc(&format!("doc_{}", i), dim, i);
+            index.add(doc).unwrap();
+
+            // Search after every insert.
+            let query = deterministic_embedding(dim, i);
+            let results = index.search(&query, 5.min(i + 1)).unwrap();
+            assert!(
+                !results.is_empty(),
+                "search should return results after insert #{i}"
+            );
+            // Results should be sorted.
+            for window in results.windows(2) {
+                assert!(
+                    window[0].score >= window[1].score,
+                    "results not sorted at insert #{i}"
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Cross-cutting: Full Pipeline Test
 // ============================================================================
 

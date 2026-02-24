@@ -9,18 +9,40 @@ pub enum MergeStrategy {
     /// Reciprocal Rank Fusion — rank-based, no normalization needed.
     #[default]
     Rrf,
-    /// Min-max normalize each system's scores to [0,1], then weighted sum.
+    /// Min-max normalize each system's scores to \[0,1\], then weighted sum.
     WeightedSum,
 }
 
 /// Configuration for hybrid search merging.
 #[derive(Debug, Clone)]
 pub struct HybridConfig {
-    pub vector_weight: f32,
-    pub keyword_weight: f32,
-    pub merge_strategy: MergeStrategy,
+    vector_weight: f32,
+    keyword_weight: f32,
+    merge_strategy: MergeStrategy,
     /// RRF smoothing constant (only used with `MergeStrategy::Rrf`).
-    pub rrf_k: f32,
+    rrf_k: f32,
+}
+
+impl HybridConfig {
+    /// Vector similarity weight.
+    pub fn vector_weight(&self) -> f32 {
+        self.vector_weight
+    }
+
+    /// Keyword (BM25) weight.
+    pub fn keyword_weight(&self) -> f32 {
+        self.keyword_weight
+    }
+
+    /// Merge strategy in use.
+    pub fn merge_strategy(&self) -> &MergeStrategy {
+        &self.merge_strategy
+    }
+
+    /// RRF smoothing constant.
+    pub fn rrf_k(&self) -> f32 {
+        self.rrf_k
+    }
 }
 
 impl Default for HybridConfig {
@@ -36,6 +58,14 @@ impl Default for HybridConfig {
 
 impl HybridConfig {
     pub fn with_weights(mut self, vector: f32, keyword: f32) -> Self {
+        assert!(
+            vector.is_finite() && vector >= 0.0,
+            "vector_weight must be finite and non-negative, got {vector}"
+        );
+        assert!(
+            keyword.is_finite() && keyword >= 0.0,
+            "keyword_weight must be finite and non-negative, got {keyword}"
+        );
         self.vector_weight = vector;
         self.keyword_weight = keyword;
         self
@@ -47,6 +77,10 @@ impl HybridConfig {
     }
 
     pub fn with_rrf_k(mut self, rrf_k: f32) -> Self {
+        assert!(
+            rrf_k.is_finite() && rrf_k >= 0.0,
+            "rrf_k must be finite and non-negative, got {rrf_k}"
+        );
         self.rrf_k = rrf_k;
         self
     }
@@ -86,7 +120,9 @@ fn merge_rrf(
     for (rank, r) in vector_results.iter().enumerate() {
         let rrf_score = config.vector_weight / (config.rrf_k + rank as f32 + 1.0);
         *scores.entry(r.id.clone()).or_default() += rrf_score;
-        results_by_id.entry(r.id.clone()).or_insert_with(|| r.clone());
+        results_by_id
+            .entry(r.id.clone())
+            .or_insert_with(|| r.clone());
     }
 
     // Keyword results (already ranked by BM25 score).
@@ -122,7 +158,9 @@ fn merge_weighted_sum(
     for (i, r) in vector_results.iter().enumerate() {
         let norm_score = config.vector_weight * v_norm[i];
         *scores.entry(r.id.clone()).or_default() += norm_score;
-        results_by_id.entry(r.id.clone()).or_insert_with(|| r.clone());
+        results_by_id
+            .entry(r.id.clone())
+            .or_insert_with(|| r.clone());
     }
 
     for (i, (pos, _)) in keyword_results.iter().enumerate() {
@@ -143,7 +181,7 @@ fn min_max_normalize(values: &[f32]) -> Vec<f32> {
     let min = values.iter().cloned().fold(f32::INFINITY, f32::min);
     let max = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let range = max - min;
-    if range == 0.0 {
+    if range <= f32::EPSILON {
         vec![1.0; values.len()]
     } else {
         values.iter().map(|v| (v - min) / range).collect()
@@ -156,7 +194,7 @@ fn collect_top_k(
     k: usize,
 ) -> Vec<SearchResult> {
     let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     ranked.truncate(k);
 
     ranked
@@ -307,5 +345,71 @@ mod tests {
         assert!((config.keyword_weight - 0.5).abs() < f32::EPSILON);
         assert!((config.rrf_k - 30.0).abs() < f32::EPSILON);
         assert!(matches!(config.merge_strategy, MergeStrategy::WeightedSum));
+    }
+
+    // ── Edge-case tests ────────────────────────────────────────────
+
+    #[test]
+    fn rrf_with_zero_rrf_k() {
+        // rrf_k=0 means score = weight / (0 + rank + 1). Should produce finite scores.
+        let vector = vec![sr("a", 0.9), sr("b", 0.8)];
+        let keyword = vec![(10, 5.0)];
+        let lookup = make_lookup(vec![(10, sr("c", 5.0))]);
+
+        let config = HybridConfig::default().with_rrf_k(0.0);
+        let results = merge_results(&vector, &keyword, &lookup, 10, &config);
+
+        assert!(!results.is_empty());
+        for r in &results {
+            assert!(
+                r.score.is_finite(),
+                "score should be finite, got {}",
+                r.score
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_sum_identical_scores() {
+        // All identical scores → range ≈ 0 → normalize to 1.0.
+        let vector = vec![sr("a", 0.5), sr("b", 0.5), sr("c", 0.5)];
+        let config = HybridConfig::default().with_strategy(MergeStrategy::WeightedSum);
+        let lookup = make_lookup(vec![]);
+
+        let results = merge_results(&vector, &[], &lookup, 10, &config);
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(r.score.is_finite(), "score should be finite");
+        }
+    }
+
+    #[test]
+    fn weighted_sum_single_element() {
+        // Single element normalizes to 1.0, score = vector_weight * 1.0.
+        let vector = vec![sr("a", 0.42)];
+        let config = HybridConfig::default().with_strategy(MergeStrategy::WeightedSum);
+        let lookup = make_lookup(vec![]);
+
+        let results = merge_results(&vector, &[], &lookup, 10, &config);
+        assert_eq!(results.len(), 1);
+        assert!((results[0].score - config.vector_weight).abs() < 0.001);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector_weight must be finite and non-negative")]
+    fn config_validation_rejects_negative_vector_weight() {
+        HybridConfig::default().with_weights(-1.0, 0.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector_weight must be finite and non-negative")]
+    fn config_validation_rejects_nan_weight() {
+        HybridConfig::default().with_weights(f32::NAN, 0.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "rrf_k must be finite and non-negative")]
+    fn config_validation_rejects_negative_rrf_k() {
+        HybridConfig::default().with_rrf_k(-10.0);
     }
 }
