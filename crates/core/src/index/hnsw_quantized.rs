@@ -325,6 +325,11 @@ impl SQ8HNSWIndex {
         self.max_layer = 0;
     }
 
+    /// Get the embedding dimension
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
     /// Get the quantizer for analysis
     pub fn quantizer(&self) -> &ScalarQuantizer {
         &self.quantizer
@@ -483,6 +488,28 @@ impl SQ8HNSWIndex {
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+impl crate::index::VectorIndex for SQ8HNSWIndex {
+    fn add(&mut self, document: Document) -> Result<()> {
+        self.add(document)
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.search(query, k)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn clear(&mut self) {
+        self.clear()
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.embedding_dim()
     }
 }
 
@@ -926,6 +953,28 @@ impl BinaryHNSWIndex {
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(m);
         scored.into_iter().map(|(_, id)| id).collect()
+    }
+}
+
+impl crate::index::VectorIndex for BinaryHNSWIndex {
+    fn add(&mut self, document: Document) -> Result<()> {
+        self.add(document)
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.search(query, k)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn clear(&mut self) {
+        self.clear()
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.embedding_dim()
     }
 }
 

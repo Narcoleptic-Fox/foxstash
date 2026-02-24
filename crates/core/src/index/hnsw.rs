@@ -1619,6 +1619,34 @@ impl HNSWIndex {
     }
 }
 
+impl crate::index::VectorIndex for HNSWIndex {
+    fn add(&mut self, document: Document) -> Result<()> {
+        self.add(document)
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.search(query, k)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn clear(&mut self) {
+        self.clear()
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.embedding_dim()
+    }
+}
+
+impl crate::index::VectorIndexSnapshot for HNSWIndex {
+    fn get_all_documents(&self) -> Vec<Document> {
+        self.get_all_documents()
+    }
+}
+
 // ============================================================================
 // INSTANT-DISTANCE STYLE PARALLEL CONSTRUCTION
 // Uses fixed-size arrays and layer-copying for safe parallelization

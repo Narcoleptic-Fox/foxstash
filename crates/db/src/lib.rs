@@ -22,6 +22,7 @@ pub mod id_map;
 pub mod inverted_index;
 pub mod recovery;
 pub mod store;
+pub mod text_index;
 pub mod tokenizer;
 
 use foxstash_core::index::HNSWConfig;
@@ -123,3 +124,4 @@ pub use filter::Filter;
 pub use foxstash_core::{Document, SearchResult};
 pub use hybrid::{HybridConfig, MergeStrategy};
 pub use store::VectorStore;
+pub use text_index::TextIndex;
