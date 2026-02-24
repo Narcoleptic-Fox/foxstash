@@ -366,6 +366,34 @@ impl FlatIndex {
     }
 }
 
+impl crate::index::VectorIndex for FlatIndex {
+    fn add(&mut self, document: Document) -> Result<()> {
+        self.add(document)
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.search(query, k)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn clear(&mut self) {
+        self.clear()
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.embedding_dim()
+    }
+}
+
+impl crate::index::VectorIndexSnapshot for FlatIndex {
+    fn get_all_documents(&self) -> Vec<Document> {
+        self.get_all_documents()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
