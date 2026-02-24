@@ -160,8 +160,10 @@ mod tests {
 
     #[test]
     fn vector_index_sq8() {
-        let mut index: Box<dyn VectorIndex> =
-            Box::new(SQ8HNSWIndex::for_normalized(4, QuantizedHNSWConfig::default()));
+        let mut index: Box<dyn VectorIndex> = Box::new(SQ8HNSWIndex::for_normalized(
+            4,
+            QuantizedHNSWConfig::default(),
+        ));
 
         index.add(make_doc("q", vec![0.5, -0.3, 0.8, 0.1])).unwrap();
         assert_eq!(index.len(), 1);

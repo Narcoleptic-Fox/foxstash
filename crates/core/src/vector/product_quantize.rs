@@ -308,7 +308,7 @@ impl ProductQuantizer {
 
     /// Precompute distance table for a query (for batch search)
     ///
-    /// Returns [M][K] table where table[m][k] = distance from query subvector m to centroid k
+    /// Returns `[M][K]` table where `table[m][k]` = distance from query subvector m to centroid k
     pub fn compute_distance_table(&self, query: &[f32]) -> Vec<Vec<f32>> {
         let m = self.config.num_subvectors;
         let k = self.config.num_centroids();
