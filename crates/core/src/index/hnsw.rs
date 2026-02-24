@@ -302,7 +302,7 @@ pub struct HNSWIndex {
 
     // === GRAPH STRUCTURE ===
     /// Connections for each node at each layer: connections[node_id][layer] -> neighbors
-    /// Uses Vec<u32> instead of HashSet for cache-friendly traversal (4-5x faster search)
+    /// Uses `Vec<u32>` instead of HashSet for cache-friendly traversal (4-5x faster search)
     connections: Vec<Vec<Vec<u32>>>,
 
     /// Flat layer 0 connection cache: `node_id * m0 + i` → neighbor_id.
@@ -2101,22 +2101,31 @@ mod tests {
     #[test]
     fn search_context_resizes_after_add() {
         let mut index = HNSWIndex::new(3, HNSWConfig::default());
-        index.add(Document {
-            id: "a".into(), content: "a".into(),
-            embedding: vec![1.0, 0.0, 0.0], metadata: None,
-        }).unwrap();
+        index
+            .add(Document {
+                id: "a".into(),
+                content: "a".into(),
+                embedding: vec![1.0, 0.0, 0.0],
+                metadata: None,
+            })
+            .unwrap();
 
         let mut ctx = index.create_search_context();
 
         for i in 0..10 {
-            index.add(Document {
-                id: format!("doc-{i}"), content: format!("content-{i}"),
-                embedding: vec![(i as f32) * 0.1, 1.0 - (i as f32) * 0.1, 0.0],
-                metadata: None,
-            }).unwrap();
+            index
+                .add(Document {
+                    id: format!("doc-{i}"),
+                    content: format!("content-{i}"),
+                    embedding: vec![(i as f32) * 0.1, 1.0 - (i as f32) * 0.1, 0.0],
+                    metadata: None,
+                })
+                .unwrap();
         }
 
-        let results = index.search_with_context(&[1.0, 0.0, 0.0], 5, &mut ctx).unwrap();
+        let results = index
+            .search_with_context(&[1.0, 0.0, 0.0], 5, &mut ctx)
+            .unwrap();
         assert!(!results.is_empty());
     }
 

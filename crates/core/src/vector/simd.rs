@@ -71,7 +71,7 @@ pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
 
 /// Computes L2 (Euclidean) distance using SIMD acceleration.
 ///
-/// Calculates: sqrt(sum((a[i] - b[i])^2))
+/// Calculates: `sqrt(sum((a[i] - b[i])^2))`
 ///
 /// # Arguments
 ///
@@ -165,7 +165,7 @@ pub fn cosine_similarity_simd(a: &[f32], b: &[f32]) -> f32 {
 
 /// Computes the L2 norm (magnitude) of a vector using SIMD acceleration.
 ///
-/// Returns sqrt(sum(v[i]^2)).
+/// Returns `sqrt(sum(v[i]^2))`.
 #[inline]
 pub fn norm_simd(v: &[f32]) -> f32 {
     let simd = pulp::Arch::new();
