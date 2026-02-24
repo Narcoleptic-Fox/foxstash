@@ -184,63 +184,19 @@ pub trait BatchIndex {
     }
 }
 
-// Implement for HNSWIndex
-impl BatchIndex for crate::index::HNSWIndex {
+// Blanket implementation for all VectorIndex types.
+// This covers HNSWIndex, FlatIndex, SQ8HNSWIndex, BinaryHNSWIndex, and PQHNSWIndex.
+impl<T: crate::index::VectorIndex> BatchIndex for T {
     fn add_document(&mut self, doc: Document) -> Result<()> {
-        self.add(doc)
+        crate::index::VectorIndex::add(self, doc)
     }
 
     fn embedding_dim(&self) -> usize {
-        self.embedding_dim()
+        crate::index::VectorIndex::embedding_dim(self)
     }
 
     fn len(&self) -> usize {
-        self.len()
-    }
-}
-
-// Implement for SQ8HNSWIndex
-impl BatchIndex for crate::index::SQ8HNSWIndex {
-    fn add_document(&mut self, doc: Document) -> Result<()> {
-        self.add(doc)
-    }
-
-    fn embedding_dim(&self) -> usize {
-        self.quantizer().dim()
-    }
-
-    fn len(&self) -> usize {
-        self.len()
-    }
-}
-
-// Implement for BinaryHNSWIndex
-impl BatchIndex for crate::index::BinaryHNSWIndex {
-    fn add_document(&mut self, doc: Document) -> Result<()> {
-        self.add(doc)
-    }
-
-    fn embedding_dim(&self) -> usize {
-        self.embedding_dim()
-    }
-
-    fn len(&self) -> usize {
-        self.len()
-    }
-}
-
-// Implement for FlatIndex
-impl BatchIndex for crate::index::FlatIndex {
-    fn add_document(&mut self, doc: Document) -> Result<()> {
-        self.add(doc)
-    }
-
-    fn embedding_dim(&self) -> usize {
-        self.embedding_dim()
-    }
-
-    fn len(&self) -> usize {
-        self.len()
+        crate::index::VectorIndex::len(self)
     }
 }
 

@@ -352,6 +352,11 @@ impl PQHNSWIndex {
         self.max_layer = 0;
     }
 
+    /// Get the embedding dimension
+    pub fn embedding_dim(&self) -> usize {
+        self.pq.config().dim
+    }
+
     /// Get the product quantizer
     pub fn quantizer(&self) -> &ProductQuantizer {
         &self.pq
@@ -688,6 +693,28 @@ impl PQHNSWIndex {
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(k);
         results
+    }
+}
+
+impl crate::index::VectorIndex for PQHNSWIndex {
+    fn add(&mut self, document: Document) -> Result<()> {
+        self.add(document)
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.search(query, k)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn clear(&mut self) {
+        self.clear()
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.embedding_dim()
     }
 }
 

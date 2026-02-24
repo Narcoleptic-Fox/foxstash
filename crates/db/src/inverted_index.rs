@@ -176,6 +176,28 @@ impl Default for InvertedIndex {
     }
 }
 
+impl crate::text_index::TextIndex for InvertedIndex {
+    fn add(&mut self, doc_id: usize, tokens: &[String]) {
+        self.add(doc_id, tokens)
+    }
+
+    fn remove(&mut self, doc_id: usize) {
+        self.remove(doc_id)
+    }
+
+    fn search(&self, query_tokens: &[String], k: usize) -> Vec<(usize, f32)> {
+        self.search(query_tokens, k)
+    }
+
+    fn clear(&mut self) {
+        self.clear()
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+}
+
 /// Wrapper for f32 that implements Ord (for BinaryHeap).
 #[derive(Clone, Copy)]
 struct OrdF32Entry {
