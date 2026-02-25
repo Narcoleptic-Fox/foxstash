@@ -1,6 +1,6 @@
 # IndexedDB Persistence Implementation
 
-This document describes the IndexedDB persistence implementation for the Nexus Local RAG WASM system.
+This document describes the IndexedDB persistence implementation for the foxstash WASM system.
 
 ## Overview
 
@@ -74,7 +74,7 @@ const store = new IndexedDBStore("my-custom-db");
 
 ### Database Schema
 
-- **Database Name**: `nexus-rag-db` (configurable)
+- **Database Name**: `foxstash-rag-db` (configurable)
 - **Object Store**: `indices`
 - **Storage Type**: Key-value pairs (key = string, value = serialized index)
 - **Version**: 1
@@ -197,7 +197,7 @@ impl HNSWIndex {
 ### Basic Save and Load
 
 ```javascript
-import init, { LocalRAG, JsDocument, IndexedDBStore } from './nexus_rag_wasm.js';
+import init, { LocalRAG, JsDocument, IndexedDBStore } from './foxstash_rag_wasm.js';
 
 await init();
 

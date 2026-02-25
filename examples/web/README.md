@@ -1,6 +1,6 @@
-# Nexus RAG - Web Demo
+# foxstash - Web Demo
 
-A complete web application demonstrating the Nexus Local RAG system with Rust/WASM vector search, IndexedDB persistence, and a modern UI.
+A complete web application demonstrating the foxstash with Rust/WASM vector search, IndexedDB persistence, and a modern UI.
 
 ## Overview
 
@@ -79,7 +79,7 @@ This will:
 ```
 [INFO]: Checking for the Wasm target...
 [INFO]: Compiling to Wasm...
-   Compiling nexus-rag-wasm v0.1.0
+   Compiling foxstash-rag-wasm v0.1.0
     Finished release [optimized] target(s) in 12.34s
 [INFO]: Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
@@ -219,8 +219,8 @@ examples/web/
 ├── package.json     # Build scripts and dependencies
 ├── README.md        # This file
 └── pkg/             # Generated WASM module (after build)
-    ├── nexus_rag_wasm.js
-    ├── nexus_rag_wasm_bg.wasm
+    ├── foxstash_rag_wasm.js
+    ├── foxstash_rag_wasm_bg.wasm
     └── ...
 ```
 
@@ -294,11 +294,11 @@ npm run build
 curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 ```
 
-**Error**: "error: could not compile `nexus-rag-wasm`"
+**Error**: "error: could not compile `foxstash-rag-wasm`"
 
 **Solution**: Ensure you're running from the correct directory and all dependencies are up to date:
 ```bash
-cd /home/user/nexus/nexus-local-rag/examples/web
+cd /home/user/nexus/foxstash/examples/web
 cargo update
 npm run build
 ```

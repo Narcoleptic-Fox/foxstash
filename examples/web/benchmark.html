@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nexus RAG - WASM Performance Benchmarks</title>
+    <title>foxstash - WASM Performance Benchmarks</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * {
@@ -237,7 +237,7 @@
 <body>
     <div class="container">
         <header>
-            <h1>🚀 Nexus RAG Performance Benchmarks</h1>
+            <h1>foxstash Performance Benchmarks</h1>
             <p class="subtitle">WASM-based Vector Search Performance Testing</p>
         </header>
 
@@ -365,13 +365,13 @@
         </div>
 
         <footer>
-            <p>Nexus Local RAG - Phase 6: Optimization & Benchmarking</p>
+            <p>foxstash Benchmarks
             <p>Built with Rust + WebAssembly</p>
         </footer>
     </div>
 
     <script type="module">
-        import init, * as wasm from './pkg/nexus_rag_wasm.js';
+        import init, * as wasm from './pkg/foxstash_rag_wasm.js';
 
         let wasmModule = null;
         let latencyChart = null;
@@ -635,7 +635,7 @@
         // Save results to IndexedDB
         async function saveResults(results) {
             try {
-                const dbName = 'nexus-rag-benchmarks';
+                const dbName = 'foxstash-rag-benchmarks';
                 const request = indexedDB.open(dbName, 1);
 
                 request.onupgradeneeded = (event) => {
