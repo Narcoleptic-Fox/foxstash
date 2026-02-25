@@ -172,6 +172,10 @@ impl Collection {
             });
         }
 
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
         let inner = self.inner.read();
 
         if inner.index.is_empty() {
@@ -336,6 +340,10 @@ impl Collection {
                 expected: self.config.embedding_dim,
                 actual: query.len(),
             });
+        }
+
+        if k == 0 {
+            return Ok(Vec::new());
         }
 
         let default_config = HybridConfig::default();
@@ -1302,5 +1310,49 @@ mod tests {
             let results = col.search_text("database", 10, None).unwrap();
             assert_eq!(results.len(), 2);
         }
+    }
+
+    // ── P2.1: Input validation edge tests ───────────────────────────
+
+    #[test]
+    fn search_k_zero_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+        col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+
+        let results = col.search(&[1.0, 0.0, 0.0], 0, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_hybrid_k_zero_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+
+        let results = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 0, None, None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_k_exceeds_collection_size() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
+            .unwrap();
+
+        let results = col.search(&[1.0, 0.0, 0.0], 100, None).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
