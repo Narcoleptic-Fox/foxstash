@@ -1,6 +1,6 @@
-# Nexus Local RAG Benchmarks
+# foxstash Benchmarks
 
-Comprehensive benchmarking suite for the Nexus Local RAG project using Criterion.rs.
+Comprehensive benchmarking suite for foxstash using Criterion.rs.
 
 ## Benchmark Categories
 
@@ -45,40 +45,40 @@ Future benchmarks for ONNX-based embedding generation:
 
 ### Run All Benchmarks
 ```bash
-cargo bench -p nexus-rag-benches
+cargo bench -p foxstash-benches
 ```
 
 ### Run Specific Benchmark Group
 ```bash
 # Vector operations only
-cargo bench -p nexus-rag-benches --bench embedding vector_operations
+cargo bench -p foxstash-benches --bench embedding vector_operations
 
 # Flat index only
-cargo bench -p nexus-rag-benches --bench embedding flat_index
+cargo bench -p foxstash-benches --bench embedding flat_index
 
 # HNSW index only
-cargo bench -p nexus-rag-benches --bench embedding hnsw_index
+cargo bench -p foxstash-benches --bench embedding hnsw_index
 ```
 
 ### Run Specific Benchmark
 ```bash
 # Run only cosine similarity benchmark
-cargo bench -p nexus-rag-benches --bench embedding 'cosine_similarity_384d$'
+cargo bench -p foxstash-benches --bench embedding 'cosine_similarity_384d$'
 
 # Run only HNSW search with 10k documents
-cargo bench -p nexus-rag-benches --bench embedding 'hnsw_index/search.*10000'
+cargo bench -p foxstash-benches --bench embedding 'hnsw_index/search.*10000'
 ```
 
 ### Compare Performance Over Time
 Criterion automatically saves baseline measurements. To compare:
 ```bash
 # Save current performance as baseline
-cargo bench -p nexus-rag-benches -- --save-baseline before
+cargo bench -p foxstash-benches -- --save-baseline before
 
 # Make changes to code...
 
 # Compare against baseline
-cargo bench -p nexus-rag-benches -- --baseline before
+cargo bench -p foxstash-benches -- --baseline before
 ```
 
 ## Viewing Results
@@ -149,14 +149,14 @@ When the ONNX embedding module is implemented:
 1. Uncomment embedding benchmark functions
 2. Add the `onnx` feature flag
 3. Update the criterion groups to include embedding benchmarks
-4. Run with: `cargo bench -p nexus-rag-benches --features onnx`
+4. Run with: `cargo bench -p foxstash-benches --features onnx`
 
 ## Troubleshooting
 
 ### Benchmarks Take Too Long
 Reduce sample size or iterations:
 ```bash
-cargo bench -p nexus-rag-benches -- --sample-size 10
+cargo bench -p foxstash-benches -- --sample-size 10
 ```
 
 ### Inconsistent Results

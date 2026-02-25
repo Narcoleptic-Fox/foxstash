@@ -1,6 +1,6 @@
 # Native Build Guide
 
-Instructions for building Nexus RAG native libraries for iOS, Android, and Desktop platforms.
+Instructions for building foxstash native libraries for iOS, Android, and Desktop platforms.
 
 ## Prerequisites
 
@@ -48,40 +48,40 @@ Instructions for building Nexus RAG native libraries for iOS, Android, and Deskt
 ### iOS
 
 **Outputs:**
-- `build/ios/NexusRAG.xcframework` - XCFramework for Xcode integration
+- `build/ios/FoxstashRAG.xcframework` - XCFramework for Xcode integration
 
 **Manual Build:**
 ```bash
 # Device (ARM64)
-cargo build --release --target aarch64-apple-ios -p nexus-rag-native
+cargo build --release --target aarch64-apple-ios -p foxstash-rag-native
 
 # Simulator (Intel)
-cargo build --release --target x86_64-apple-ios -p nexus-rag-native
+cargo build --release --target x86_64-apple-ios -p foxstash-rag-native
 
 # Simulator (Apple Silicon)
-cargo build --release --target aarch64-apple-ios-sim -p nexus-rag-native
+cargo build --release --target aarch64-apple-ios-sim -p foxstash-rag-native
 ```
 
 **Xcode Integration:**
-1. Drag `NexusRAG.xcframework` into Xcode project
+1. Drag `FoxstashRAG.xcframework` into Xcode project
 2. Add to "Frameworks, Libraries, and Embedded Content"
-3. Import header: `#include "nexus_rag.h"`
+3. Import header: `#include "foxstash_rag.h"`
 
 ### Android
 
 **Outputs:**
 - `build/android/jniLibs/` - JNI libraries for all architectures
-  - `arm64-v8a/libnexus_rag_native.so` (ARM64)
-  - `armeabi-v7a/libnexus_rag_native.so` (ARMv7)
-  - `x86_64/libnexus_rag_native.so` (x86_64)
-  - `x86/libnexus_rag_native.so` (x86)
+  - `arm64-v8a/libfoxstash_rag_native.so` (ARM64)
+  - `armeabi-v7a/libfoxstash_rag_native.so` (ARMv7)
+  - `x86_64/libfoxstash_rag_native.so` (x86_64)
+  - `x86/libfoxstash_rag_native.so` (x86)
 
 **Manual Build:**
 ```bash
-cargo build --release --target aarch64-linux-android -p nexus-rag-native
-cargo build --release --target armv7-linux-androideabi -p nexus-rag-native
-cargo build --release --target x86_64-linux-android -p nexus-rag-native
-cargo build --release --target i686-linux-android -p nexus-rag-native
+cargo build --release --target aarch64-linux-android -p foxstash-rag-native
+cargo build --release --target armv7-linux-androideabi -p foxstash-rag-native
+cargo build --release --target x86_64-linux-android -p foxstash-rag-native
+cargo build --release --target i686-linux-android -p foxstash-rag-native
 ```
 
 **Android Studio Integration:**
@@ -91,19 +91,19 @@ cargo build --release --target i686-linux-android -p nexus-rag-native
 ### Desktop
 
 **Outputs:**
-- `build/desktop/libnexus_rag_native.{a,so,dylib,dll}` - Static/dynamic libraries
-- `build/desktop/nexus_rag.h` - C header
+- `build/desktop/libfoxstash_rag_native.{a,so,dylib,dll}` - Static/dynamic libraries
+- `build/desktop/foxstash_rag.h` - C header
 
 **Manual Build:**
 ```bash
-cargo build --release -p nexus-rag-native
+cargo build --release -p foxstash-rag-native
 ```
 
 **Linking:**
 ```c
 // Compile with:
-// gcc -o app app.c -L./build/desktop -lnexus_rag_native -lm
-#include "nexus_rag.h"
+// gcc -o app app.c -L./build/desktop -lfoxstash_rag_native -lm
+#include "foxstash_rag.h"
 
 int main() {
     RagHandle* rag = rag_create(384, 1);

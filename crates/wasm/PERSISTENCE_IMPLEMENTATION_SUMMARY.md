@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document summarizes the complete IndexedDB persistence implementation for the Nexus Local RAG WASM system. The implementation provides production-ready, async-safe IndexedDB storage for RAG indices in browser environments.
+This document summarizes the complete IndexedDB persistence implementation for the foxstash WASM system. The implementation provides production-ready, async-safe IndexedDB storage for RAG indices in browser environments.
 
 ## Files Created
 
@@ -284,7 +284,7 @@ mod wasm_tests {
 Run tests with:
 ```bash
 # Unit tests
-cargo test -p nexus-rag-wasm
+cargo test -p foxstash-rag-wasm
 
 # WASM tests (requires wasm-pack)
 wasm-pack test --headless --firefox

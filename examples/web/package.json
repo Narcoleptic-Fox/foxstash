@@ -1,7 +1,7 @@
 {
-  "name": "nexus-rag-demo",
+  "name": "foxstash-rag-demo",
   "version": "0.1.0",
-  "description": "Nexus RAG - Local Vector Search Demo Application",
+  "description": "foxstash - Local Vector Search Demo Application",
   "type": "module",
   "scripts": {
     "build": "cd ../../crates/wasm && wasm-pack build --target web --out-dir ../../examples/web/pkg",

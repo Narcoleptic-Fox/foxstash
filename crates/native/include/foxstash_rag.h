@@ -1,7 +1,7 @@
 /**
- * Nexus RAG Native FFI - C/C++ Header
+ * foxstash Native FFI - C/C++ Header
  *
- * Cross-platform native bindings for the Nexus Local RAG system.
+ * Cross-platform native bindings for the foxstash RAG system.
  * Provides high-performance vector search with HNSW and Flat indices.
  *
  * Supported Platforms: iOS, Android, Linux, macOS, Windows
@@ -9,7 +9,7 @@
  * Example Usage:
  *
  * ```c
- * #include "nexus_rag.h"
+ * #include "foxstash_rag.h"
  *
  * // Create index
  * RagHandle* rag = rag_create(384, 1);  // 384-dim, HNSW
@@ -40,8 +40,8 @@
  * ```
  */
 
-#ifndef NEXUS_RAG_H
-#define NEXUS_RAG_H
+#ifndef FOXSTASH_RAG_H
+#define FOXSTASH_RAG_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -330,9 +330,9 @@ void rag_free_error(const char* error);
  *
  * API is stable for 1.x releases.
  */
-#define NEXUS_RAG_VERSION_MAJOR 1
-#define NEXUS_RAG_VERSION_MINOR 0
-#define NEXUS_RAG_VERSION_PATCH 0
+#define FOXSTASH_RAG_VERSION_MAJOR 1
+#define FOXSTASH_RAG_VERSION_MINOR 0
+#define FOXSTASH_RAG_VERSION_PATCH 0
 
 /* =============================================================================
  * Constants
@@ -341,16 +341,16 @@ void rag_free_error(const char* error);
 /**
  * Maximum supported embedding dimension
  */
-#define NEXUS_RAG_MAX_DIMENSION 100000
+#define FOXSTASH_RAG_MAX_DIMENSION 100000
 
 /**
  * Index types
  */
-#define NEXUS_RAG_INDEX_FLAT 0  /**< Flat (exact) index */
-#define NEXUS_RAG_INDEX_HNSW 1  /**< HNSW (approximate) index */
+#define FOXSTASH_RAG_INDEX_FLAT 0  /**< Flat (exact) index */
+#define FOXSTASH_RAG_INDEX_HNSW 1  /**< HNSW (approximate) index */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* NEXUS_RAG_H */
+#endif /* FOXSTASH_RAG_H */

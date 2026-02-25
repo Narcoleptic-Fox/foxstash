@@ -1,6 +1,6 @@
 # Storage Benchmarks
 
-Comprehensive benchmarking suite for the Nexus Local RAG storage layer.
+Comprehensive benchmarking suite for the foxstash storage layer.
 
 ## Overview
 
@@ -70,39 +70,39 @@ End-to-end scenarios:
 
 ### Run all storage benchmarks
 ```bash
-cargo bench -p nexus-rag-benches storage
+cargo bench -p foxstash-benches storage
 ```
 
 ### Run specific benchmark groups
 ```bash
 # Compression codecs
-cargo bench -p nexus-rag-benches compression_codecs
+cargo bench -p foxstash-benches compression_codecs
 
 # Compression at different sizes
-cargo bench -p nexus-rag-benches compression_sizes
+cargo bench -p foxstash-benches compression_sizes
 
 # Serialization
-cargo bench -p nexus-rag-benches serialization
+cargo bench -p foxstash-benches serialization
 
 # File storage operations
-cargo bench -p nexus-rag-benches file_storage
+cargo bench -p foxstash-benches file_storage
 
 # Batch operations
-cargo bench -p nexus-rag-benches batch_operations
+cargo bench -p foxstash-benches batch_operations
 
 # Realistic workloads
-cargo bench -p nexus-rag-benches realistic_workloads
+cargo bench -p foxstash-benches realistic_workloads
 ```
 
 ### Run specific benchmarks
 ```bash
 # Benchmark specific codec and data type
-cargo bench -p nexus-rag-benches "gzip_compress/json"
-cargo bench -p nexus-rag-benches "lz4_decompress/embeddings"
+cargo bench -p foxstash-benches "gzip_compress/json"
+cargo bench -p foxstash-benches "lz4_decompress/embeddings"
 
 # Benchmark specific size
-cargo bench -p nexus-rag-benches "serialize_document/medium"
-cargo bench -p nexus-rag-benches "save_flat_index/1000"
+cargo bench -p foxstash-benches "serialize_document/medium"
+cargo bench -p foxstash-benches "save_flat_index/1000"
 ```
 
 ## Performance Targets
@@ -134,7 +134,7 @@ The benchmarks are structured to work with both:
 - **Real implementations** (future): Will use actual `FileStorage` and compression codecs
 
 To switch from mock to real implementations, update the benchmark code to:
-1. Import real `FileStorage` and `Codec` from `nexus_rag_core::storage`
+1. Import real `FileStorage` and `Codec` from `foxstash_core::storage`
 2. Replace mock compress/decompress calls with real codec methods
 3. Replace direct file I/O with `FileStorage` API calls
 
@@ -226,10 +226,10 @@ Once the storage module is complete, update benchmarks:
 
 ```rust
 // Replace mock codec
-use nexus_rag_core::storage::compression::Codec;
+use foxstash_core::storage::compression::Codec;
 
 // Replace mock file operations
-use nexus_rag_core::storage::FileStorage;
+use foxstash_core::storage::FileStorage;
 
 // In benchmarks, replace:
 let compressed = codec.compress(&data).unwrap();

@@ -18,7 +18,7 @@
 //! # Example (C)
 //!
 //! ```c
-//! #include "nexus_rag.h"
+//! #include "foxstash_rag.h"
 //!
 //! int main() {
 //!     // Create index

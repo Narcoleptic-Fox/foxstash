@@ -1,16 +1,16 @@
 # Platform Integration Examples
 
-Examples for integrating Nexus RAG into iOS, Android, and Desktop applications.
+Examples for integrating foxstash into iOS, Android, and Desktop applications.
 
 ## iOS (Swift)
 
 ### Setup
 
 **1. Add Framework:**
-Drag `NexusRAG.xcframework` into your Xcode project.
+Drag `FoxstashRAG.xcframework` into your Xcode project.
 
 **2. Add Swift wrapper:**
-Include `NexusRAG.swift` in your project.
+Include `FoxstashRAG.swift` in your project.
 
 **3. Configure Xcode:**
 - In your target's "General" settings, add the framework to "Frameworks, Libraries, and Embedded Content"
@@ -20,10 +20,10 @@ Include `NexusRAG.swift` in your project.
 ### Usage
 
 ```swift
-import NexusRAG
+import FoxstashRAG
 
 // Create RAG index
-let rag = try NexusRAG(embeddingDim: 384, useHNSW: true)
+let rag = try FoxstashRAG(embeddingDim: 384, useHNSW: true)
 
 // Add documents
 let embedding = [Float](repeating: 0.1, count: 384)
@@ -42,7 +42,7 @@ for result in results {
 
 // Save/load
 try rag.save(to: "/path/to/index.bin")
-let loaded = try NexusRAG.load(from: "/path/to/index.bin")
+let loaded = try FoxstashRAG.load(from: "/path/to/index.bin")
 
 // Get count
 print("Documents: \(rag.count)")
@@ -55,7 +55,7 @@ try rag.clear()
 
 ```swift
 do {
-    let rag = try NexusRAG(embeddingDim: 384)
+    let rag = try FoxstashRAG(embeddingDim: 384)
     try rag.add(id: "doc1", content: "text", embedding: embedding)
 } catch RAGError.initializationFailed {
     print("Failed to initialize RAG")
@@ -70,15 +70,15 @@ do {
 
 ```swift
 import SwiftUI
-import NexusRAG
+import FoxstashRAG
 
 class RAGViewModel: ObservableObject {
-    @Published var results: [NexusRAG.SearchResult] = []
-    private var rag: NexusRAG?
+    @Published var results: [FoxstashRAG.SearchResult] = []
+    private var rag: FoxstashRAG?
 
     init() {
         do {
-            rag = try NexusRAG(embeddingDim: 384)
+            rag = try FoxstashRAG(embeddingDim: 384)
         } catch {
             print("Failed to initialize: \(error)")
         }
@@ -125,17 +125,17 @@ Copy native libraries to `app/src/main/jniLibs/`:
 ```
 jniLibs/
 ├── arm64-v8a/
-│   └── libnexus_rag_native.so
+│   └── libfoxstash_rag_native.so
 ├── armeabi-v7a/
-│   └── libnexus_rag_native.so
+│   └── libfoxstash_rag_native.so
 ├── x86/
-│   └── libnexus_rag_native.so
+│   └── libfoxstash_rag_native.so
 └── x86_64/
-    └── libnexus_rag_native.so
+    └── libfoxstash_rag_native.so
 ```
 
 **2. Add Kotlin wrapper:**
-Include `NexusRAG.kt` in your project (e.g., `app/src/main/java/com/nexus/rag/NexusRAG.kt`).
+Include `FoxstashRAG.kt` in your project (e.g., `app/src/main/java/com/foxstash/rag/FoxstashRAG.kt`).
 
 **3. Configure Gradle:**
 ```gradle
@@ -153,10 +153,10 @@ android {
 ### Usage
 
 ```kotlin
-import com.nexus.rag.NexusRAG
+import com.com.foxstash.rag.FoxstashRAG
 
 // Create RAG index
-val rag = NexusRAG(embeddingDim = 384, useHNSW = true)
+val rag = FoxstashRAG(embeddingDim = 384, useHNSW = true)
 
 // Add documents
 val embedding = FloatArray(384) { 0.1f }
@@ -175,7 +175,7 @@ for (result in results) {
 
 // Save/load
 rag.save("/path/to/index.bin")
-val loaded = NexusRAG.load("/path/to/index.bin")
+val loaded = FoxstashRAG.load("/path/to/index.bin")
 
 // Get count
 println("Documents: ${rag.getCount()}")
@@ -191,7 +191,7 @@ rag.close()
 
 ```kotlin
 try {
-    val rag = NexusRAG(embeddingDim = 384)
+    val rag = FoxstashRAG(embeddingDim = 384)
     rag.add("doc1", "text", embedding)
 } catch (e: RAGException) {
     Log.e("RAG", "Operation failed: ${e.message}")
@@ -201,7 +201,7 @@ try {
 ### Using with AutoCloseable
 
 ```kotlin
-NexusRAG(embeddingDim = 384).use { rag ->
+FoxstashRAG(embeddingDim = 384).use { rag ->
     rag.add("doc1", "content", embedding)
     val results = rag.search(embedding, k = 10)
     // Automatically closed after block
@@ -220,14 +220,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class RAGViewModel : ViewModel() {
-    private val _results = MutableStateFlow<List<NexusRAG.SearchResult>>(emptyList())
-    val results: StateFlow<List<NexusRAG.SearchResult>> = _results
+    private val _results = MutableStateFlow<List<FoxstashRAG.SearchResult>>(emptyList())
+    val results: StateFlow<List<FoxstashRAG.SearchResult>> = _results
 
-    private var rag: NexusRAG? = null
+    private var rag: FoxstashRAG? = null
 
     init {
         try {
-            rag = NexusRAG(embeddingDim = 384)
+            rag = FoxstashRAG(embeddingDim = 384)
         } catch (e: RAGException) {
             Log.e("RAG", "Failed to initialize: ${e.message}")
         }
@@ -294,21 +294,21 @@ fun SearchScreen(viewModel: RAGViewModel = viewModel()) {
 **1. Link library:**
 ```bash
 # Linux/macOS
-gcc -o app app.c -L./build/desktop -lnexus_rag_native
+gcc -o app app.c -L./build/desktop -lfoxstash_rag_native
 
 # Windows (MSVC)
-cl app.c /link nexus_rag_native.lib
+cl app.c /link foxstash_rag_native.lib
 ```
 
 **2. Include header:**
 ```c
-#include "nexus_rag.h"
+#include "foxstash_rag.h"
 ```
 
 ### Usage
 
 ```c
-#include "nexus_rag.h"
+#include "foxstash_rag.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -379,14 +379,14 @@ int main() {
 ### C++ Wrapper Example
 
 ```cpp
-#include "nexus_rag.h"
+#include "foxstash_rag.h"
 #include <iostream>
 #include <memory>
 #include <vector>
 #include <string>
 #include <stdexcept>
 
-class NexusRAG {
+class FoxstashRAG {
 private:
     struct RAGDeleter {
         void operator()(RagHandle* rag) const {
@@ -403,7 +403,7 @@ public:
         float score;
     };
 
-    NexusRAG(int embeddingDim, bool useHNSW = true) {
+    FoxstashRAG(int embeddingDim, bool useHNSW = true) {
         handle_.reset(rag_create(embeddingDim, useHNSW ? 1 : 0));
         if (!handle_) {
             throw std::runtime_error(std::string("Failed to create RAG: ") + rag_last_error());
@@ -459,12 +459,12 @@ public:
         }
     }
 
-    static NexusRAG load(const std::string& path, bool useHNSW = true) {
+    static FoxstashRAG load(const std::string& path, bool useHNSW = true) {
         RagHandle* handle = rag_load(path.c_str(), useHNSW ? 1 : 0);
         if (!handle) {
             throw std::runtime_error(std::string("Load failed: ") + rag_last_error());
         }
-        return NexusRAG(handle);
+        return FoxstashRAG(handle);
     }
 
     size_t count() const {
@@ -472,7 +472,7 @@ public:
     }
 
 private:
-    NexusRAG(RagHandle* handle) {
+    FoxstashRAG(RagHandle* handle) {
         handle_.reset(handle);
     }
 };
@@ -483,7 +483,7 @@ private:
 ### Memory Management
 
 **iOS (Swift):**
-- `NexusRAG` automatically releases resources in `deinit`
+- `FoxstashRAG` automatically releases resources in `deinit`
 - Use `defer` for cleanup in error paths
 - Avoid circular references when storing in properties
 
@@ -541,10 +541,10 @@ if (result != 0) {
 **Example (iOS):**
 ```swift
 class ThreadSafeRAG {
-    private let rag: NexusRAG
-    private let queue = DispatchQueue(label: "com.nexus.rag")
+    private let rag: FoxstashRAG
+    private let queue = DispatchQueue(label: "com.com.foxstash.rag")
 
-    func search(query: [Float], k: Int) throws -> [NexusRAG.SearchResult] {
+    func search(query: [Float], k: Int) throws -> [FoxstashRAG.SearchResult] {
         try queue.sync {
             try rag.search(query: query, k: k)
         }
@@ -653,7 +653,7 @@ override fun onStop() {
 **"UnsatisfiedLinkError" (Android):**
 - Verify .so files are in correct jniLibs directories
 - Check ABI filters match device architecture
-- Ensure library name matches `System.loadLibrary("nexus_rag_native")`
+- Ensure library name matches `System.loadLibrary("foxstash_rag_native")`
 
 **"Invalid handle" errors:**
 - Don't use RAG after calling `close()`/`destroy()`
