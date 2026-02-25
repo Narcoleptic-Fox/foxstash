@@ -7,8 +7,8 @@
 //! 2. Place them in a `models/` directory
 //! 3. Run: `cargo run --example embedding_example --features onnx`
 
-use nexus_rag_core::embedding::OnnxEmbedder;
-use nexus_rag_core::Result;
+use foxstash_core::embedding::OnnxEmbedder;
+use foxstash_core::Result;
 
 fn main() -> Result<()> {
     println!("ONNX Embedder Example\n");

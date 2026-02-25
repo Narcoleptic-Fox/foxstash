@@ -2,10 +2,10 @@
  * IndexedDB Persistence Example
  *
  * This example demonstrates how to use the IndexedDB persistence module
- * with the Nexus Local RAG WASM bindings.
+ * with the foxstash WASM bindings.
  */
 
-import init, { LocalRAG, JsDocument, IndexedDBStore } from './nexus_rag_wasm.js';
+import init, { LocalRAG, JsDocument, IndexedDBStore } from './foxstash_rag_wasm.js';
 
 // Initialize WASM module
 await init();

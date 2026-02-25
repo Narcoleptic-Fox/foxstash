@@ -1,11 +1,11 @@
-//! Swift wrapper for Nexus RAG native library
+//! Swift wrapper for foxstash native library
 //!
 //! Provides idiomatic Swift API for iOS applications.
 
 import Foundation
 
-/// Swift wrapper for Nexus RAG
-public class NexusRAG {
+/// Swift wrapper for foxstash
+public class FoxstashRAG {
     private var handle: OpaquePointer?
 
     /// Create new RAG index
@@ -126,7 +126,7 @@ public class NexusRAG {
     }
 
     /// Load index from file
-    public static func load(from path: String, useHNSW: Bool = true) throws -> NexusRAG {
+    public static func load(from path: String, useHNSW: Bool = true) throws -> FoxstashRAG {
         let handle = path.withCString { pathPtr in
             rag_load(pathPtr, useHNSW ? 1 : 0)
         }
@@ -135,7 +135,7 @@ public class NexusRAG {
             throw RAGError.loadFailed(getLastError())
         }
 
-        return NexusRAG(handle: handle)
+        return FoxstashRAG(handle: handle)
     }
 
     /// Get document count

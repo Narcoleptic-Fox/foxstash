@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Nexus RAG Native Build Script
+# foxstash Native Build Script
 # Builds native libraries for iOS, Android, and Desktop
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,14 +38,14 @@ build_ios() {
 
     # Build for device (ARM64)
     log_info "Building for iOS device (aarch64)..."
-    cargo build --release --target aarch64-apple-ios -p nexus-rag-native
+    cargo build --release --target aarch64-apple-ios -p foxstash-rag-native
 
     # Build for simulators
     log_info "Building for iOS simulator (x86_64)..."
-    cargo build --release --target x86_64-apple-ios -p nexus-rag-native
+    cargo build --release --target x86_64-apple-ios -p foxstash-rag-native
 
     log_info "Building for iOS simulator (aarch64)..."
-    cargo build --release --target aarch64-apple-ios-sim -p nexus-rag-native
+    cargo build --release --target aarch64-apple-ios-sim -p foxstash-rag-native
 
     # Create XCFramework
     create_xcframework
@@ -57,15 +57,15 @@ create_xcframework() {
     mkdir -p "$OUTPUT_DIR/ios"
 
     xcodebuild -create-xcframework \
-        -library "target/aarch64-apple-ios/release/libnexus_rag_native.a" \
+        -library "target/aarch64-apple-ios/release/libfoxstash_rag_native.a" \
         -headers "crates/native/include" \
-        -library "target/x86_64-apple-ios/release/libnexus_rag_native.a" \
+        -library "target/x86_64-apple-ios/release/libfoxstash_rag_native.a" \
         -headers "crates/native/include" \
-        -library "target/aarch64-apple-ios-sim/release/libnexus_rag_native.a" \
+        -library "target/aarch64-apple-ios-sim/release/libfoxstash_rag_native.a" \
         -headers "crates/native/include" \
-        -output "$OUTPUT_DIR/ios/NexusRAG.xcframework"
+        -output "$OUTPUT_DIR/ios/FoxstashRAG.xcframework"
 
-    log_info "XCFramework created at $OUTPUT_DIR/ios/NexusRAG.xcframework"
+    log_info "XCFramework created at $OUTPUT_DIR/ios/FoxstashRAG.xcframework"
 }
 
 # Build for Android
@@ -86,16 +86,16 @@ build_android() {
 
     # Build for each architecture
     log_info "Building for Android ARM64..."
-    cargo build --release --target aarch64-linux-android -p nexus-rag-native
+    cargo build --release --target aarch64-linux-android -p foxstash-rag-native
 
     log_info "Building for Android ARMv7..."
-    cargo build --release --target armv7-linux-androideabi -p nexus-rag-native
+    cargo build --release --target armv7-linux-androideabi -p foxstash-rag-native
 
     log_info "Building for Android x86_64..."
-    cargo build --release --target x86_64-linux-android -p nexus-rag-native
+    cargo build --release --target x86_64-linux-android -p foxstash-rag-native
 
     log_info "Building for Android i686..."
-    cargo build --release --target i686-linux-android -p nexus-rag-native
+    cargo build --release --target i686-linux-android -p foxstash-rag-native
 
     # Copy to Android jniLibs structure
     create_android_libs
@@ -109,16 +109,16 @@ create_android_libs() {
     mkdir -p "$OUTPUT_DIR/android/jniLibs/x86_64"
     mkdir -p "$OUTPUT_DIR/android/jniLibs/x86"
 
-    cp "target/aarch64-linux-android/release/libnexus_rag_native.so" \
+    cp "target/aarch64-linux-android/release/libfoxstash_rag_native.so" \
        "$OUTPUT_DIR/android/jniLibs/arm64-v8a/"
 
-    cp "target/armv7-linux-androideabi/release/libnexus_rag_native.so" \
+    cp "target/armv7-linux-androideabi/release/libfoxstash_rag_native.so" \
        "$OUTPUT_DIR/android/jniLibs/armeabi-v7a/"
 
-    cp "target/x86_64-linux-android/release/libnexus_rag_native.so" \
+    cp "target/x86_64-linux-android/release/libfoxstash_rag_native.so" \
        "$OUTPUT_DIR/android/jniLibs/x86_64/"
 
-    cp "target/i686-linux-android/release/libnexus_rag_native.so" \
+    cp "target/i686-linux-android/release/libfoxstash_rag_native.so" \
        "$OUTPUT_DIR/android/jniLibs/x86/"
 
     log_info "Android libraries created at $OUTPUT_DIR/android/jniLibs"
@@ -129,24 +129,24 @@ build_desktop() {
     log_info "Building for Desktop..."
 
     # Build for current platform
-    cargo build --release -p nexus-rag-native
+    cargo build --release -p foxstash-rag-native
 
     mkdir -p "$OUTPUT_DIR/desktop"
 
     # Copy library
     if [[ "$OSTYPE" == "darwin"* ]]; then
-        cp "target/release/libnexus_rag_native.dylib" "$OUTPUT_DIR/desktop/" || true
-        cp "target/release/libnexus_rag_native.a" "$OUTPUT_DIR/desktop/"
+        cp "target/release/libfoxstash_rag_native.dylib" "$OUTPUT_DIR/desktop/" || true
+        cp "target/release/libfoxstash_rag_native.a" "$OUTPUT_DIR/desktop/"
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        cp "target/release/libnexus_rag_native.so" "$OUTPUT_DIR/desktop/"
-        cp "target/release/libnexus_rag_native.a" "$OUTPUT_DIR/desktop/"
+        cp "target/release/libfoxstash_rag_native.so" "$OUTPUT_DIR/desktop/"
+        cp "target/release/libfoxstash_rag_native.a" "$OUTPUT_DIR/desktop/"
     elif [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]]; then
-        cp "target/release/nexus_rag_native.dll" "$OUTPUT_DIR/desktop/" || true
-        cp "target/release/nexus_rag_native.lib" "$OUTPUT_DIR/desktop/" || true
+        cp "target/release/foxstash_rag_native.dll" "$OUTPUT_DIR/desktop/" || true
+        cp "target/release/foxstash_rag_native.lib" "$OUTPUT_DIR/desktop/" || true
     fi
 
     # Copy header
-    cp "crates/native/include/nexus_rag.h" "$OUTPUT_DIR/desktop/"
+    cp "crates/native/include/foxstash_rag.h" "$OUTPUT_DIR/desktop/"
 
     log_info "Desktop libraries created at $OUTPUT_DIR/desktop"
 }
