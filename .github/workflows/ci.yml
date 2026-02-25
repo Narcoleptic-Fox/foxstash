@@ -18,13 +18,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        include:
-          - os: ubuntu-latest
-            features: compression-all
-          - os: macos-latest
-            features: ""
-          - os: windows-latest
-            features: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -35,14 +28,20 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Build foxstash-core
         run: cargo build -p foxstash-core --verbose
 
-      - name: Run tests
+      - name: Run foxstash-core unit tests
         run: cargo test -p foxstash-core --lib --verbose
 
-      - name: Run doctests
+      - name: Run foxstash-core integration tests
+        run: cargo test -p foxstash-core --tests --verbose
+
+      - name: Run foxstash-core doctests
         run: cargo test -p foxstash-core --doc --verbose
+
+      - name: Run foxstash-core tests with compression features
+        run: cargo test -p foxstash-core --features compression-all --verbose
 
       - name: Build foxstash-db
         run: cargo build -p foxstash-db --verbose
@@ -50,9 +49,17 @@ jobs:
       - name: Run foxstash-db tests
         run: cargo test -p foxstash-db --verbose
 
-      - name: Build with features (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo build -p foxstash-core --features compression-all
+      # foxstash-native depends on foxstash-core with the "onnx" feature, which
+      # uses ort with load-dynamic. This means compilation succeeds without the
+      # ONNX Runtime shared library present — the library is only loaded at
+      # runtime when OnnxEmbedder is actually initialized. The native crate's
+      # own tests exercise FFI (FlatIndex/HNSWIndex) and do not invoke the ONNX
+      # embedder, so they run without ORT_DYLIB_PATH being set.
+      - name: Build foxstash-native
+        run: cargo build -p foxstash-native --verbose
+
+      - name: Run foxstash-native tests
+        run: cargo test -p foxstash-native --verbose
 
   clippy:
     name: Clippy
@@ -74,6 +81,9 @@ jobs:
       - name: Clippy foxstash-db
         run: cargo clippy -p foxstash-db -- -D warnings
 
+      - name: Clippy foxstash-native
+        run: cargo clippy -p foxstash-native -- -D warnings
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -90,6 +100,9 @@ jobs:
 
       - name: Check foxstash-db formatting
         run: cargo fmt -p foxstash-db -- --check
+
+      - name: Check foxstash-native formatting
+        run: cargo fmt -p foxstash-native -- --check
 
   wasm:
     name: WASM Build
@@ -110,7 +123,6 @@ jobs:
 
       - name: Build WASM
         run: wasm-pack build crates/wasm --target web
-        continue-on-error: true  # WASM crate may not be complete
 
   coverage:
     name: Coverage
@@ -129,11 +141,17 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Generate coverage
-        run: cargo llvm-cov -p foxstash-core --lib --lcov --output-path lcov.info
+      # Run coverage for foxstash-core including unit tests, integration tests
+      # (crates/core/tests/integration_tests.rs), and doctests. The previous
+      # --lib flag excluded integration tests; omitting it captures all targets.
+      - name: Generate coverage for foxstash-core
+        run: cargo llvm-cov -p foxstash-core --lcov --output-path lcov-core.info
+
+      - name: Generate coverage for foxstash-db
+        run: cargo llvm-cov -p foxstash-db --lcov --output-path lcov-db.info
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         with:
-          files: lcov.info
+          files: lcov-core.info,lcov-db.info
           fail_ci_if_error: false
