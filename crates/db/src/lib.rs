@@ -55,6 +55,9 @@ pub enum DbError {
 
     #[error("recovery error: {0}")]
     Recovery(String),
+
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -93,6 +96,7 @@ impl Default for DbConfig {
 
 impl DbConfig {
     pub fn with_embedding_dim(mut self, dim: usize) -> Self {
+        assert!(dim > 0, "embedding_dim must be greater than zero");
         self.embedding_dim = dim;
         self
     }
@@ -125,3 +129,14 @@ pub use foxstash_core::{Document, SearchResult};
 pub use hybrid::{HybridConfig, MergeStrategy};
 pub use store::VectorStore;
 pub use text_index::TextIndex;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "embedding_dim must be greater than zero")]
+    fn config_rejects_zero_embedding_dim() {
+        DbConfig::default().with_embedding_dim(0);
+    }
+}
