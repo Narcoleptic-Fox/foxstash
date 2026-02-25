@@ -68,7 +68,18 @@ impl Collection {
     }
 
     /// Create a fresh (empty) collection at the given path.
+    ///
+    /// Returns an error if the path already contains checkpoint or WAL data.
+    /// Use [`open`](Self::open) to recover an existing collection.
     pub fn create(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
+        // Guard: refuse to create over existing data.
+        if path.join("manifest.json").exists() {
+            return Err(DbError::Validation(format!(
+                "path already contains data: {}. Use Collection::open() instead",
+                path.display()
+            )));
+        }
+
         let storage =
             IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
@@ -133,6 +144,21 @@ impl Collection {
 
         self.maybe_auto_checkpoint()?;
         Ok(())
+    }
+
+    /// Insert or update a document. Explicit upsert semantics.
+    ///
+    /// If the ID already exists, the previous version is removed (WAL-safe)
+    /// and replaced with the new content/embedding/metadata. Equivalent to
+    /// calling [`insert`](Self::insert), but communicates intent more clearly.
+    pub fn upsert(
+        &self,
+        id: String,
+        content: String,
+        embedding: Vec<f32>,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        self.insert(id, content, embedding, metadata)
     }
 
     /// Soft-delete a document by ID. Returns `true` if the document existed.
@@ -1354,5 +1380,80 @@ mod tests {
 
         let results = col.search(&[1.0, 0.0, 0.0], 100, None).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── P2.2: Create guard ──────────────────────────────────────────
+
+    #[test]
+    fn create_on_existing_data_returns_error() {
+        let dir = TempDir::new().unwrap();
+
+        // Session 1: create, insert, flush to produce WAL/checkpoint files.
+        {
+            let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+            col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+                .unwrap();
+            col.flush().unwrap();
+        }
+
+        // Session 2: create() on same path should fail.
+        let result = Collection::create("test", dir.path(), cfg(3));
+        assert!(result.is_err(), "create() over existing data should error");
+    }
+
+    // ── P3.2: Upsert semantics ──────────────────────────────────────
+
+    #[test]
+    fn upsert_creates_new_document() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.upsert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        assert_eq!(col.len(), 1);
+
+        let doc = col.get("a").unwrap().unwrap();
+        assert_eq!(doc.content, "alpha");
+    }
+
+    #[test]
+    fn upsert_updates_existing_document() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.upsert("a".into(), "old".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.upsert(
+            "a".into(),
+            "new".into(),
+            vec![0.0, 1.0, 0.0],
+            Some(json!({"updated": true})),
+        )
+        .unwrap();
+
+        assert_eq!(col.len(), 1);
+        let doc = col.get("a").unwrap().unwrap();
+        assert_eq!(doc.content, "new");
+        assert_eq!(doc.metadata.unwrap()["updated"], true);
+    }
+
+    #[test]
+    fn upsert_changes_search_results() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.upsert("a".into(), "gateway service".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.upsert("a".into(), "database pool".into(), vec![0.0, 1.0, 0.0], None)
+            .unwrap();
+
+        // Old text gone.
+        let results = col.search_text("gateway", 10, None).unwrap();
+        assert!(results.is_empty());
+
+        // New text found.
+        let results = col.search_text("database", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a");
     }
 }
