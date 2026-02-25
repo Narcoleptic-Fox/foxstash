@@ -9,6 +9,9 @@ license = "MIT"
 foxstash-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
+
+# Desktop-only dependencies (filesystem, concurrency, error handling)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 thiserror = "1.0"
 parking_lot = "0.12"
 tracing = "0.1"
