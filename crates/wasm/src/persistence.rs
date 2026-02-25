@@ -514,6 +514,7 @@ pub fn create_flat_index(embedding_dim: usize, documents: Vec<Document>) -> Seri
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Creates a SerializedIndex from HNSW index components
 pub fn create_hnsw_index(
     embedding_dim: usize,

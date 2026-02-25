@@ -1442,10 +1442,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
 
-        col.upsert("a".into(), "gateway service".into(), vec![1.0, 0.0, 0.0], None)
-            .unwrap();
-        col.upsert("a".into(), "database pool".into(), vec![0.0, 1.0, 0.0], None)
-            .unwrap();
+        col.upsert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.upsert(
+            "a".into(),
+            "database pool".into(),
+            vec![0.0, 1.0, 0.0],
+            None,
+        )
+        .unwrap();
 
         // Old text gone.
         let results = col.search_text("gateway", 10, None).unwrap();
