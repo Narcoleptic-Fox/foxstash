@@ -7,29 +7,50 @@
 //!
 //! ```text
 //! foxstash-core (HNSWIndex, IncrementalStorage)
-//!       ↓
+//!       |
 //! foxstash-db  (Collection, VectorStore, Filter, Recovery)
-//!       ↓
+//!       |
 //! consumer     (foxloom, CLI tools, etc.)
 //! ```
+//!
+//! # Platform Support
+//!
+//! The pure-algorithm modules ([`hybrid`], [`inverted_index`], [`tokenizer`],
+//! [`text_index`]) compile on all targets including `wasm32`. The filesystem-
+//! dependent modules (`collection`, `store`, `recovery`, `filter`, `id_map`)
+//! are only available on non-WASM targets.
 
-#![cfg(not(target_arch = "wasm32"))]
+// ── Pure algorithm modules — available on all targets including wasm32 ──
 
-pub mod collection;
-pub mod filter;
 pub mod hybrid;
-pub mod id_map;
 pub mod inverted_index;
-pub mod recovery;
-pub mod store;
 pub mod text_index;
 pub mod tokenizer;
 
+// ── Filesystem-dependent modules — desktop/server only ──
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod collection;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod filter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod id_map;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod recovery;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod store;
+
+// ── Desktop-only imports and types ──
+
+#[cfg(not(target_arch = "wasm32"))]
 use foxstash_core::index::HNSWConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use foxstash_core::storage::IncrementalConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use thiserror::Error;
 
 /// Errors from the database layer.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("collection not found: {0}")]
@@ -60,9 +81,11 @@ pub enum DbError {
     Validation(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Configuration for opening a [`VectorStore`].
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct DbConfig {
     /// HNSW index configuration.
@@ -82,6 +105,7 @@ pub struct DbConfig {
     pub hybrid: HybridConfig,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for DbConfig {
     fn default() -> Self {
         Self {
@@ -94,6 +118,7 @@ impl Default for DbConfig {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl DbConfig {
     pub fn with_embedding_dim(mut self, dim: usize) -> Self {
         assert!(dim > 0, "embedding_dim must be greater than zero");
@@ -122,13 +147,21 @@ impl DbConfig {
     }
 }
 
-// Re-export key types consumers need.
-pub use collection::Collection;
-pub use filter::Filter;
-pub use foxstash_core::{Document, SearchResult};
+// ── Re-exports: always available ──
+
 pub use hybrid::{HybridConfig, MergeStrategy};
-pub use store::VectorStore;
 pub use text_index::TextIndex;
+
+// ── Re-exports: desktop only ──
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use collection::Collection;
+#[cfg(not(target_arch = "wasm32"))]
+pub use filter::Filter;
+#[cfg(not(target_arch = "wasm32"))]
+pub use foxstash_core::{Document, SearchResult};
+#[cfg(not(target_arch = "wasm32"))]
+pub use store::VectorStore;
 
 #[cfg(test)]
 mod tests {
