@@ -2,11 +2,15 @@
 name = "foxstash-db"
 version.workspace = true
 edition.workspace = true
-description = "Database layer for foxstash — collections, filtering, WAL persistence, and concurrent access"
+description = "Database layer for foxstash — collections, filtering, hybrid search, WAL persistence, and concurrent access"
+repository = "https://github.com/Narcoleptic-Fox/foxstash"
 license = "MIT"
+readme = "../../README.md"
+keywords = ["rag", "vector-search", "hybrid-search", "bm25", "database"]
+categories = ["algorithms", "data-structures", "database-implementations"]
 
 [dependencies]
-foxstash-core = { path = "../core" }
+foxstash-core = { path = "../core", version = "0.4.0" }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -96,12 +96,6 @@ impl VectorStore {
         Ok(col)
     }
 
-    /// Alias for [`get_or_create_collection`].
-    #[deprecated(since = "0.4.0", note = "Use get_or_create_collection() instead")]
-    pub fn collection(&self, name: &str) -> Result<Arc<Collection>> {
-        self.get_or_create_collection(name)
-    }
-
     /// Create a new collection. Returns error if it already exists.
     pub fn create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         let mut map = self.collections.write();
