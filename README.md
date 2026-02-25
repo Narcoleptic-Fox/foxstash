@@ -7,13 +7,14 @@
 [![CI](https://github.com/Narcoleptic-Fox/foxstash/actions/workflows/ci.yml/badge.svg)](https://github.com/Narcoleptic-Fox/foxstash/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Foxstash is a local-first Retrieval-Augmented Generation (RAG) library featuring SIMD-accelerated vector operations, HNSW indexing, vector quantization, ONNX embeddings, and WebAssembly support.
+Foxstash is a local-first Retrieval-Augmented Generation (RAG) library featuring SIMD-accelerated vector operations, HNSW indexing, vector quantization, ONNX embeddings, hybrid search (BM25 + vector), and WebAssembly support.
 
 ## Features
 
 - **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with 3-4x speedup
 - **HNSW Indexing** - Hierarchical Navigable Small World graphs for fast similarity search
 - **Vector Quantization** - Int8 (4x), Binary (32x), and Product Quantization (192x)
+- **Hybrid Search** - Combine BM25 keyword search with vector similarity for best-of-both recall
 - **ONNX Embeddings** - Generate embeddings locally with MiniLM-L6-v2 or any ONNX model
 - **WASM Support** - Run in the browser with IndexedDB persistence
 - **Compression** - Gzip, LZ4, and Zstd support for efficient storage
@@ -26,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-foxstash-core = "0.1"
+foxstash-core = "0.3"
 ```
 
 ### Basic Usage
@@ -190,7 +191,7 @@ Enable the `onnx` feature:
 
 ```toml
 [dependencies]
-foxstash-core = { version = "0.1", features = ["onnx"] }
+foxstash-core = { version = "0.3", features = ["onnx"] }
 ```
 
 ```rust
@@ -205,11 +206,200 @@ let embedding = embedder.embed("Foxes cache food for later retrieval")?;
 assert_eq!(embedding.len(), 384);
 ```
 
+## Database Layer (foxstash-db)
+
+For production use, `foxstash-db` provides a high-level document store with named collections, metadata filtering, BM25 full-text search, and hybrid search built on top of `foxstash-core`.
+
+```toml
+[dependencies]
+foxstash-db = "0.3"
+```
+
+### VectorStore and Collections
+
+```rust
+use foxstash_db::{VectorStore, DbConfig, Filter, HybridConfig, MergeStrategy};
+use serde_json::json;
+
+// Open a persistent store (recovers existing collections from disk)
+let config = DbConfig::default().with_embedding_dim(384);
+let store = VectorStore::open("/var/data/my_store", config)?;
+
+// Get or create a collection
+let col = store.get_or_create_collection("articles")?;
+
+// Insert documents with optional metadata
+col.insert(
+    "doc1".to_string(),
+    "Foxes are highly adaptable mammals found worldwide".to_string(),
+    vec![0.1_f32; 384],  // embedding from your model
+    Some(json!({ "category": "biology", "year": 2024 })),
+)?;
+
+col.insert(
+    "doc2".to_string(),
+    "Red foxes cache food in scattered locations for later retrieval".to_string(),
+    vec![0.2_f32; 384],
+    Some(json!({ "category": "behavior", "year": 2023 })),
+)?;
+
+// Upsert (insert or replace) a document
+col.upsert(
+    "doc1".to_string(),
+    "Updated content about fox adaptability".to_string(),
+    vec![0.1_f32; 384],
+    Some(json!({ "category": "biology", "year": 2025 })),
+)?;
+
+// Vector similarity search
+let query_embedding = vec![0.15_f32; 384];
+let results = col.search(&query_embedding, 5, None)?;
+
+// Vector search with metadata filter
+let filter = Filter::eq("category", "biology");
+let filtered = col.search(&query_embedding, 5, Some(&filter))?;
+
+// BM25 full-text search
+let text_results = col.search_text("fox cache food", 5, None)?;
+
+// Hybrid search: combines vector + BM25 with Reciprocal Rank Fusion
+let hybrid_results = col.search_hybrid(
+    &query_embedding,
+    "fox cache food",
+    5,
+    None,    // optional Filter
+    None,    // optional HybridConfig (uses default if None)
+)?;
+
+// Look up a document by ID
+if let Some(doc) = col.get("doc1")? {
+    println!("Found: {}", doc.content);
+}
+
+// Delete a document
+col.delete("doc2")?;
+
+// Compact tombstoned entries
+col.compact()?;
+
+// Flush WAL to disk
+col.flush()?;
+
+// Flush all collections at once
+store.flush_all()?;
+```
+
+### VectorStore API
+
+| Method | Description |
+|--------|-------------|
+| `VectorStore::open(path, config)` | Open a store, recovering existing collections from disk |
+| `get_or_create_collection(name)` | Return existing collection or create a new one |
+| `create_collection(name)` | Create a new collection; error if it already exists |
+| `get_collection(name)` | Get an existing collection; error if not found |
+| `collections()` | List all collection names |
+| `unload_collection(name)` | Remove from memory (files remain; can be re-opened) |
+| `delete_collection(name)` | Permanently delete from memory and disk |
+| `flush_all()` | Flush all collections to disk |
+
+### Collection API
+
+| Method | Description |
+|--------|-------------|
+| `insert(id, content, embedding, metadata)` | Insert a document; error on duplicate ID |
+| `upsert(id, content, embedding, metadata)` | Insert or replace a document |
+| `delete(id)` | Tombstone a document by ID |
+| `get(id)` | Retrieve a document by ID |
+| `search(query, k, filter)` | Vector similarity search with optional metadata filter |
+| `search_text(query, k, filter)` | BM25 keyword search with optional metadata filter |
+| `search_hybrid(query, text, k, filter, config)` | Hybrid vector + BM25 search |
+| `flush()` | Flush WAL to disk |
+| `compact()` | Remove tombstoned entries and rebuild index |
+
+### Metadata Filtering
+
+`Filter` supports dot-notation field access into JSON metadata:
+
+```rust
+use foxstash_db::Filter;
+use serde_json::json;
+
+// Equality
+let f = Filter::eq("category", "biology");
+
+// Inequality
+let f = Filter::ne("status", "archived");
+
+// Range comparisons
+let f = Filter::gt("year", json!(2020));
+let f = Filter::lte("score", json!(0.9));
+
+// Set membership
+let f = Filter::is_in("lang", vec![json!("en"), json!("fr")]);
+
+// Field existence
+let f = Filter::exists("tags.entity");
+
+// Logical composition
+let f = Filter::and(vec![
+    Filter::eq("category", "biology"),
+    Filter::gt("year", json!(2020)),
+]);
+
+let f = Filter::or(vec![
+    Filter::eq("status", "active"),
+    Filter::eq("status", "pending"),
+]);
+
+let f = Filter::not(Filter::eq("archived", true));
+```
+
+### Hybrid Search Configuration
+
+```rust
+use foxstash_db::{HybridConfig, MergeStrategy};
+
+let config = HybridConfig::default()
+    .with_weights(0.7, 0.3)               // vector_weight=0.7, keyword_weight=0.3
+    .with_strategy(MergeStrategy::Rrf)    // Reciprocal Rank Fusion (default)
+    .with_rrf_k(60.0);                    // RRF smoothing constant
+
+// Alternatively, use WeightedSum with min-max normalized scores
+let config = HybridConfig::default()
+    .with_weights(0.6, 0.4)
+    .with_strategy(MergeStrategy::WeightedSum);
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `vector_weight` | `0.7` | Weight for vector similarity scores |
+| `keyword_weight` | `0.3` | Weight for BM25 keyword scores |
+| `merge_strategy` | `Rrf` | `Rrf` (rank-based) or `WeightedSum` (score-based) |
+| `rrf_k` | `60.0` | RRF smoothing constant (only used with `Rrf`) |
+
+## Index and Text Index Trait Abstractions
+
+`foxstash-core` exposes `VectorIndex` and `VectorIndexSnapshot` traits that abstract over
+concrete index types (HNSW, Flat, SQ8, Binary, PQ). The `foxstash-db` crate additionally
+exports a `TextIndex` trait for BM25-backed keyword indexes. These traits make it straightforward
+to swap implementations or build generic search pipelines without coupling to a specific type.
+
+```rust
+use foxstash_core::index::{VectorIndex, VectorIndexSnapshot};
+use foxstash_db::TextIndex;
+
+fn search_any<I: VectorIndex>(index: &I, query: &[f32], k: usize) {
+    let results = index.search(query, k).unwrap();
+    // ...
+}
+```
+
 ## Crates
 
 | Crate | Description |
 |-------|-------------|
 | `foxstash-core` | Core library with indexes, embeddings, and storage |
+| `foxstash-db` | Document storage, collections, hybrid search, BM25 |
 | `foxstash-wasm` | WebAssembly bindings with IndexedDB persistence |
 | `foxstash-native` | Native bindings with full ONNX support |
 
@@ -223,6 +413,11 @@ foxstash/
 │   │   ├── index/      # HNSW, Flat, SQ8, Binary, PQ indexes
 │   │   ├── storage/    # File persistence, compression, WAL
 │   │   └── vector/     # SIMD ops, quantization
+│   ├── db/             # Database layer
+│   │   ├── collection/ # Named collections with WAL
+│   │   ├── filter/     # Metadata filtering
+│   │   ├── hybrid/     # BM25 + vector hybrid search
+│   │   └── store/      # VectorStore (multi-collection manager)
 │   ├── wasm/           # Browser target
 │   ├── native/         # Desktop/server target
 │   └── benches/        # Comprehensive benchmarks
@@ -275,10 +470,11 @@ See `crates/benches/` for benchmark implementations.
 - [x] Incremental persistence (WAL + checkpointing)
 - [x] Product quantization (PQ) - up to 192x compression
 - [x] Diversity-aware neighbor selection (Algorithm 4)
+- [x] Hybrid search (BM25 + vector, RRF and WeightedSum)
+- [x] VectorIndex / TextIndex trait abstractions
 - [ ] Constrained graph traversal for efficient pre-filtering
 - [ ] Cache-locality optimizations for quantized indices (flattened L0 cache)
 - [ ] High-concurrency scaling (sharded-lock or lock-free index updates)
-- [ ] Hybrid search (sparse + dense vectors / BM25)
 - [ ] GPU acceleration (optional)
 - [ ] Multi-vector support (late interaction)
 
