@@ -249,6 +249,7 @@ impl JsSearchResult {
     }
 }
 
+#[allow(clippy::upper_case_acronyms, clippy::large_enum_variant)]
 /// Internal index type selector
 enum IndexType {
     Flat(FlatIndex),
@@ -590,8 +591,13 @@ impl LocalRAG {
             })
         };
 
-        let merged =
-            hybrid::merge_results(&vector_results, &keyword_results, &doc_lookup, k, &self.hybrid_config);
+        let merged = hybrid::merge_results(
+            &vector_results,
+            &keyword_results,
+            &doc_lookup,
+            k,
+            &self.hybrid_config,
+        );
 
         Ok(merged.into_iter().map(JsSearchResult::from_core).collect())
     }
@@ -617,12 +623,7 @@ impl LocalRAG {
     /// rag.set_hybrid_config(0.6, 0.4, false);
     /// ```
     #[wasm_bindgen]
-    pub fn set_hybrid_config(
-        &mut self,
-        vector_weight: f32,
-        keyword_weight: f32,
-        use_rrf: bool,
-    ) {
+    pub fn set_hybrid_config(&mut self, vector_weight: f32, keyword_weight: f32, use_rrf: bool) {
         let strategy = if use_rrf {
             MergeStrategy::Rrf
         } else {
@@ -1319,14 +1320,40 @@ mod native_tests {
     #[test]
     fn hybrid_merge_rrf_basic() {
         let vector = vec![
-            SearchResult { id: "a".into(), content: "alpha".into(), score: 0.9, metadata: None },
-            SearchResult { id: "b".into(), content: "beta".into(), score: 0.8, metadata: None },
+            SearchResult {
+                id: "a".into(),
+                content: "alpha".into(),
+                score: 0.9,
+                metadata: None,
+            },
+            SearchResult {
+                id: "b".into(),
+                content: "beta".into(),
+                score: 0.8,
+                metadata: None,
+            },
         ];
         let keyword = vec![(10, 5.0), (20, 3.0)];
 
         let doc_map: HashMap<usize, SearchResult> = vec![
-            (10, SearchResult { id: "c".into(), content: "gamma".into(), score: 5.0, metadata: None }),
-            (20, SearchResult { id: "a".into(), content: "alpha".into(), score: 3.0, metadata: None }),
+            (
+                10,
+                SearchResult {
+                    id: "c".into(),
+                    content: "gamma".into(),
+                    score: 5.0,
+                    metadata: None,
+                },
+            ),
+            (
+                20,
+                SearchResult {
+                    id: "a".into(),
+                    content: "alpha".into(),
+                    score: 3.0,
+                    metadata: None,
+                },
+            ),
         ]
         .into_iter()
         .collect();
@@ -1349,7 +1376,10 @@ mod native_tests {
 
         assert!((config.vector_weight() - 0.5).abs() < f32::EPSILON);
         assert!((config.keyword_weight() - 0.5).abs() < f32::EPSILON);
-        assert!(matches!(config.merge_strategy(), MergeStrategy::WeightedSum));
+        assert!(matches!(
+            config.merge_strategy(),
+            MergeStrategy::WeightedSum
+        ));
     }
 
     #[test]

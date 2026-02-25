@@ -1,3 +1,8 @@
+// FFI functions intentionally dereference raw pointers without being marked
+// `unsafe` — they are C-ABI entry points with internal validation and panic
+// guards, following the common pattern for Rust-to-C library exports.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 //! Native FFI bindings for iOS, Android, and Desktop platforms
 //!
 //! Provides a C-compatible API for embedding the RAG system in native applications.

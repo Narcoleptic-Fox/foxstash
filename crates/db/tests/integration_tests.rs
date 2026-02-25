@@ -74,9 +74,7 @@ fn scenario_full_lifecycle() {
         let t_results = col.search_text("alpha", 10, None).unwrap();
         assert!(!t_results.is_empty());
         assert!(
-            t_results.iter().all(|r| {
-                r.content.contains("alpha")
-            }),
+            t_results.iter().all(|r| { r.content.contains("alpha") }),
             "text search for 'alpha' should only return alpha docs"
         );
 
@@ -156,8 +154,16 @@ fn scenario_multi_collection_isolation() {
     }
 
     let fruit_data = [
-        ("apple", "crisp red apple from orchard", [0.0, 1.0, 0.0, 0.0]),
-        ("banana", "yellow banana ripe and sweet", [0.0, 0.9, 0.1, 0.0]),
+        (
+            "apple",
+            "crisp red apple from orchard",
+            [0.0, 1.0, 0.0, 0.0],
+        ),
+        (
+            "banana",
+            "yellow banana ripe and sweet",
+            [0.0, 0.9, 0.1, 0.0],
+        ),
     ];
     for (id, content, emb) in &fruit_data {
         fruits
@@ -288,10 +294,7 @@ fn scenario_wal_recovery() {
                 doc.is_some(),
                 "wal-only doc wal-{i} should be recovered from WAL"
             );
-            assert_eq!(
-                doc.unwrap().metadata.as_ref().unwrap()["batch"],
-                "wal"
-            );
+            assert_eq!(doc.unwrap().metadata.as_ref().unwrap()["batch"], "wal");
         }
 
         // Search works across all recovered docs.
@@ -406,18 +409,34 @@ fn scenario_filter_combinations() {
     // Insert 12 docs with diverse metadata.
     let docs = [
         // id, content, axis, priority, tag, active, score, nested_level
-        ("d00", "rust programming language", 0, 1, "lang",   true,  90.0f64),
-        ("d01", "python scripting language", 1, 2, "lang",   true,  70.0),
-        ("d02", "go systems language",       2, 1, "lang",   false, 80.0),
-        ("d03", "rust game development",     0, 3, "dev",    true,  95.0),
-        ("d04", "python data science",       1, 1, "data",   true,  75.0),
-        ("d05", "go microservices server",   2, 2, "server", false, 85.0),
-        ("d06", "rust embedded systems",     3, 3, "dev",    true,  88.0),
-        ("d07", "python web framework",      1, 2, "web",    true,  72.0),
-        ("d08", "go web server handlers",    2, 1, "web",    false, 82.0),
-        ("d09", "rust async runtime crate",  0, 2, "async",  true,  91.0),
-        ("d10", "typescript front end",      3, 1, "web",    true,  65.0),
-        ("d11", "typescript node server",    3, 3, "server", false, 60.0),
+        (
+            "d00",
+            "rust programming language",
+            0,
+            1,
+            "lang",
+            true,
+            90.0f64,
+        ),
+        ("d01", "python scripting language", 1, 2, "lang", true, 70.0),
+        ("d02", "go systems language", 2, 1, "lang", false, 80.0),
+        ("d03", "rust game development", 0, 3, "dev", true, 95.0),
+        ("d04", "python data science", 1, 1, "data", true, 75.0),
+        (
+            "d05",
+            "go microservices server",
+            2,
+            2,
+            "server",
+            false,
+            85.0,
+        ),
+        ("d06", "rust embedded systems", 3, 3, "dev", true, 88.0),
+        ("d07", "python web framework", 1, 2, "web", true, 72.0),
+        ("d08", "go web server handlers", 2, 1, "web", false, 82.0),
+        ("d09", "rust async runtime crate", 0, 2, "async", true, 91.0),
+        ("d10", "typescript front end", 3, 1, "web", true, 65.0),
+        ("d11", "typescript node server", 3, 3, "server", false, 60.0),
     ];
 
     for (id, content, ax, priority, tag, active, score) in &docs {
@@ -441,24 +460,25 @@ fn scenario_filter_combinations() {
         .search(&axis(0, 4), 12, Some(&Filter::eq("tag", "lang")))
         .unwrap();
     assert_eq!(results.len(), 3, "exactly 3 lang docs");
-    assert!(results.iter().all(|r| r.metadata.as_ref().unwrap()["tag"] == "lang"));
+    assert!(results
+        .iter()
+        .all(|r| r.metadata.as_ref().unwrap()["tag"] == "lang"));
 
     // ── Ne ─────────────────────────────────────────────────────────
     let results = col
         .search(&axis(0, 4), 12, Some(&Filter::ne("tag", "lang")))
         .unwrap();
     assert_eq!(results.len(), 9, "9 non-lang docs");
-    assert!(results.iter().all(|r| r.metadata.as_ref().unwrap()["tag"] != "lang"));
+    assert!(results
+        .iter()
+        .all(|r| r.metadata.as_ref().unwrap()["tag"] != "lang"));
 
     // ── In ─────────────────────────────────────────────────────────
     let results = col
         .search(
             &axis(0, 4),
             12,
-            Some(&Filter::is_in(
-                "tag",
-                vec![json!("dev"), json!("async")],
-            )),
+            Some(&Filter::is_in("tag", vec![json!("dev"), json!("async")])),
         )
         .unwrap();
     assert_eq!(results.len(), 3, "dev + async docs: d03, d06, d09");
@@ -524,7 +544,9 @@ fn scenario_filter_combinations() {
         )
         .unwrap();
     assert_eq!(results.len(), 4, "inactive docs: d02, d05, d08, d11");
-    assert!(results.iter().all(|r| r.metadata.as_ref().unwrap()["active"] == false));
+    assert!(results
+        .iter()
+        .all(|r| r.metadata.as_ref().unwrap()["active"] == false));
 
     // ── Exists ─────────────────────────────────────────────────────
     let results = col
@@ -560,10 +582,7 @@ fn scenario_filter_combinations() {
             &axis(0, 4),
             12,
             Some(&Filter::and(vec![
-                Filter::or(vec![
-                    Filter::eq("tag", "server"),
-                    Filter::eq("tag", "web"),
-                ]),
+                Filter::or(vec![Filter::eq("tag", "server"), Filter::eq("tag", "web")]),
                 Filter::eq("active", false),
             ])),
         )
@@ -584,16 +603,40 @@ fn scenario_hybrid_search_strategies() {
     // Insert docs where some are strong vector matches and some are strong text matches.
     let docs = [
         // Strong vector match for axis 0 query, weak text match.
-        ("vec-a", "unrelated noise filler content here", [1.0, 0.0, 0.0, 0.0_f32]),
-        ("vec-b", "more noise unrelated terms filler", [0.99, 0.01, 0.0, 0.0]),
+        (
+            "vec-a",
+            "unrelated noise filler content here",
+            [1.0, 0.0, 0.0, 0.0_f32],
+        ),
+        (
+            "vec-b",
+            "more noise unrelated terms filler",
+            [0.99, 0.01, 0.0, 0.0],
+        ),
         // Strong text match, moderate vector match.
-        ("txt-a", "rust async runtime channel message", [0.5, 0.5, 0.0, 0.0]),
-        ("txt-b", "rust channel async send receive", [0.4, 0.6, 0.0, 0.0]),
+        (
+            "txt-a",
+            "rust async runtime channel message",
+            [0.5, 0.5, 0.0, 0.0],
+        ),
+        (
+            "txt-b",
+            "rust channel async send receive",
+            [0.4, 0.6, 0.0, 0.0],
+        ),
         // Both strong vector and text matches — should rank high in both strategies.
         ("both-a", "rust async runtime fast", [0.95, 0.05, 0.0, 0.0]),
         // Irrelevant to both.
-        ("none-a", "completely different topic cooking", [0.0, 0.0, 1.0, 0.0]),
-        ("none-b", "gardening and flowers spring time", [0.0, 0.0, 0.0, 1.0]),
+        (
+            "none-a",
+            "completely different topic cooking",
+            [0.0, 0.0, 1.0, 0.0],
+        ),
+        (
+            "none-b",
+            "gardening and flowers spring time",
+            [0.0, 0.0, 0.0, 1.0],
+        ),
     ];
 
     for (id, content, emb) in &docs {
@@ -762,15 +805,24 @@ fn scenario_edge_cases() {
 
     // ── 8a: Search on empty collection returns empty, not an error. ─
     let v = col.search(&axis(0, 4), 5, None).unwrap();
-    assert!(v.is_empty(), "vector search on empty collection must return []");
+    assert!(
+        v.is_empty(),
+        "vector search on empty collection must return []"
+    );
 
     let t = col.search_text("anything", 5, None).unwrap();
-    assert!(t.is_empty(), "text search on empty collection must return []");
+    assert!(
+        t.is_empty(),
+        "text search on empty collection must return []"
+    );
 
     let h = col
         .search_hybrid(&axis(0, 4), "anything", 5, None, None)
         .unwrap();
-    assert!(h.is_empty(), "hybrid search on empty collection must return []");
+    assert!(
+        h.is_empty(),
+        "hybrid search on empty collection must return []"
+    );
 
     // ── 8b: k=0 search returns empty immediately. ───────────────────
     col.insert("x".into(), "some content here".into(), axis(0, 4), None)
@@ -802,7 +854,10 @@ fn scenario_edge_cases() {
     assert_eq!(col.len(), 0);
 
     let v = col.search(&axis(0, 4), 5, None).unwrap();
-    assert!(v.is_empty(), "vector search after all-delete must return []");
+    assert!(
+        v.is_empty(),
+        "vector search after all-delete must return []"
+    );
 
     let t = col.search_text("temporary", 5, None).unwrap();
     assert!(t.is_empty(), "text search after all-delete must return []");
@@ -817,7 +872,11 @@ fn scenario_edge_cases() {
         )
         .unwrap();
     }
-    assert_eq!(col.len(), 1, "10 upserts of same ID must produce 1 live doc");
+    assert_eq!(
+        col.len(),
+        1,
+        "10 upserts of same ID must produce 1 live doc"
+    );
 
     let doc = col.get("upsert-target").unwrap().unwrap();
     assert_eq!(
@@ -828,13 +887,8 @@ fn scenario_edge_cases() {
     col.delete("upsert-target").unwrap();
 
     // ── 8e: Insert with empty content — valid, text search returns nothing. ─
-    col.insert(
-        "empty-content".into(),
-        String::new(),
-        axis(0, 4),
-        None,
-    )
-    .unwrap();
+    col.insert("empty-content".into(), String::new(), axis(0, 4), None)
+        .unwrap();
     assert_eq!(col.len(), 1);
 
     // Vector search still finds it.
@@ -844,13 +898,16 @@ fn scenario_edge_cases() {
 
     // Text search for any term finds nothing (empty content has no tokens).
     let results = col.search_text("anything", 5, None).unwrap();
-    assert!(results.is_empty(), "empty-content doc must not appear in text search");
+    assert!(
+        results.is_empty(),
+        "empty-content doc must not appear in text search"
+    );
 
     // ── 8f: Dimension mismatch returns an error, not a panic. ───────
     let wrong_dim_result = col.insert(
         "wrong-dim".into(),
         "will fail".into(),
-        vec![1.0, 2.0],  // dim=2 but store expects dim=4
+        vec![1.0, 2.0], // dim=2 but store expects dim=4
         None,
     );
     assert!(
@@ -869,16 +926,24 @@ fn scenario_edge_cases() {
     assert!(!removed, "delete of non-existent ID must return false");
 
     // ── 8h: list_ids and contains reflect live docs accurately. ─────
-    col.insert("a".into(), "content a".into(), axis(0, 4), None).unwrap();
-    col.insert("b".into(), "content b".into(), axis(1, 4), None).unwrap();
+    col.insert("a".into(), "content a".into(), axis(0, 4), None)
+        .unwrap();
+    col.insert("b".into(), "content b".into(), axis(1, 4), None)
+        .unwrap();
     col.delete("a").unwrap();
 
     let ids = col.list_ids();
     assert!(ids.contains(&"b".to_string()), "b must be in list_ids");
-    assert!(!ids.contains(&"a".to_string()), "deleted a must not be in list_ids");
+    assert!(
+        !ids.contains(&"a".to_string()),
+        "deleted a must not be in list_ids"
+    );
 
     assert!(col.contains("b"), "contains must be true for live doc b");
-    assert!(!col.contains("a"), "contains must be false for deleted doc a");
+    assert!(
+        !col.contains("a"),
+        "contains must be false for deleted doc a"
+    );
 }
 
 // ── Scenario 9: Upsert semantics and WAL consistency ──────────────────────
@@ -956,7 +1021,10 @@ fn scenario_upsert_wal_consistency() {
 
         // Text index rebuilt correctly on recovery — old terms absent.
         let rust_results = col.search_text("rust", 5, None).unwrap();
-        assert!(rust_results.is_empty(), "rust term must be absent after reopen");
+        assert!(
+            rust_results.is_empty(),
+            "rust term must be absent after reopen"
+        );
 
         let go_results = col.search_text("production", 5, None).unwrap();
         assert_eq!(go_results.len(), 1);
