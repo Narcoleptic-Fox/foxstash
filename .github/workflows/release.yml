@@ -1,0 +1,411 @@
+# Release workflow
+#
+# Triggered by any tag matching v* (e.g. v0.3.1, v0.4.0-beta.1).
+#
+# Job graph:
+#   test ──► publish   (stable tags only; skipped for pre-releases)
+#   test ──► build     (cross-platform native libs)
+#   test ──► wasm      (wasm-pack bundle)
+#   build + wasm ──► release  (GitHub Release with artifacts + changelog)
+#
+# Required repository secrets:
+#   CARGO_REGISTRY_TOKEN  – crates.io publish token
+#   GITHUB_TOKEN          – automatically provided by Actions
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Allow the workflow to create GitHub Releases and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. TEST — full test suite across the whole workspace
+  # -------------------------------------------------------------------------
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # foxstash-core: lib tests + doc tests
+      - name: Test foxstash-core
+        run: cargo test -p foxstash-core --lib --verbose
+
+      - name: Doctest foxstash-core
+        run: cargo test -p foxstash-core --doc --verbose
+
+      # foxstash-db: full test suite
+      - name: Test foxstash-db
+        run: cargo test -p foxstash-db --verbose
+
+      # foxstash-native: lib tests (no ONNX runtime available on CI runner,
+      # so only compile + unit tests that don't require a model file)
+      - name: Test foxstash-native
+        run: cargo test -p foxstash-native --lib --verbose
+
+  # -------------------------------------------------------------------------
+  # 2. PUBLISH — cargo publish foxstash-core to crates.io
+  #
+  #    Runs only on stable tags (v1.2.3), never on pre-releases
+  #    (v1.2.3-alpha.1, v1.2.3-beta.2, v1.2.3-rc.1).
+  # -------------------------------------------------------------------------
+  publish:
+    name: Publish to crates.io
+    needs: test
+    runs-on: ubuntu-latest
+
+    # Skip publish for pre-release tags.  The check looks for a hyphen after
+    # the semver triplet, which is the conventional pre-release separator.
+    if: ${{ !contains(github.ref_name, '-') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Dry-run first so publish fails fast before touching crates.io.
+      - name: Verify package (dry run)
+        run: cargo publish -p foxstash-core --dry-run
+
+      - name: Publish foxstash-core
+        run: cargo publish -p foxstash-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # foxstash-db: not yet published (missing repository/keywords metadata).
+      # Uncomment the block below once those fields are added to its Cargo.toml:
+      #
+      # - name: Publish foxstash-db
+      #   run: cargo publish -p foxstash-db
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # -------------------------------------------------------------------------
+  # 3. BUILD — cross-platform native shared libraries
+  #
+  #    Produces one artifact per target:
+  #      Linux   x86_64  → libfoxstash_native.so
+  #      macOS   x86_64  → libfoxstash_native.dylib
+  #      macOS   aarch64 → libfoxstash_native.dylib  (Apple Silicon)
+  #      Windows x86_64  → foxstash_native.dll
+  #
+  #    Native runners are used instead of cross-compilation to avoid the
+  #    complexity of cross-compiling ONNX Runtime and its dependencies.
+  # -------------------------------------------------------------------------
+  build:
+    name: Build native (${{ matrix.target }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact_name: libfoxstash_native.so
+            asset_name: foxstash-native-linux-x86_64.so
+
+          - target: x86_64-apple-darwin
+            runner: macos-13          # Intel runner
+            artifact_name: libfoxstash_native.dylib
+            asset_name: foxstash-native-macos-x86_64.dylib
+
+          - target: aarch64-apple-darwin
+            runner: macos-latest      # Apple Silicon runner
+            artifact_name: libfoxstash_native.dylib
+            asset_name: foxstash-native-macos-aarch64.dylib
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact_name: foxstash_native.dll
+            asset_name: foxstash-native-windows-x86_64.dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build foxstash-native (release)
+        run: cargo build -p foxstash-native --release --target ${{ matrix.target }}
+
+      # Locate the built library and copy it to a predictable path so the
+      # upload step doesn't need to know the OS-specific extension.
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+        run: cp "target/${TARGET}/release/${ARTIFACT_NAME}" "${ASSET_NAME}"
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          ASSET_NAME: ${{ matrix.asset_name }}
+        run: Copy-Item "target\$env:TARGET\release\$env:ARTIFACT_NAME" "$env:ASSET_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 4. WASM — wasm-pack bundle for browser targets
+  #
+  #    Output: pkg/ directory packed into foxstash-wasm-<version>.tar.gz
+  # -------------------------------------------------------------------------
+  wasm:
+    name: Build WASM package
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # wasm-pack is not in the default PATH; install it via cargo.
+      # The binary is cached by rust-cache so subsequent runs are fast.
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      # --target web produces an ES module + companion .js glue file.
+      # The workspace Cargo.toml defines a release-wasm profile with
+      # opt-level = "z" for maximum size reduction.
+      - name: Build WASM (web target)
+        run: wasm-pack build crates/wasm --target web --release
+
+      # Pack the generated pkg/ directory into a tarball so it can be
+      # attached to the GitHub Release as a single downloadable file.
+      - name: Package WASM bundle
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          ARCHIVE="foxstash-wasm-${VERSION}.tar.gz"
+          tar -czf "$ARCHIVE" -C crates/wasm pkg/
+          echo "WASM_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: foxstash-wasm
+          path: ${{ env.WASM_ARCHIVE }}
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 5. RELEASE — create GitHub Release with changelog + all artifacts
+  #
+  #    Waits for the build and wasm jobs to finish so that artifacts are
+  #    available before the release is created.
+  #    publish runs in parallel; the release is independent of it.
+  # -------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [build, wasm]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is required so that git log can reach the previous tag.
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------
+      # Generate a changelog from conventional commits since the last tag.
+      # Groups commits by type: feat, fix, refactor, perf, docs, chore.
+      #
+      # github.ref_name is placed in an env var before use in the shell to
+      # prevent injection of specially-crafted tag names.
+      # -----------------------------------------------------------------
+      - name: Generate changelog
+        id: changelog
+        env:
+          CURRENT_TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Find the previous tag so we can bound the git log range.
+          # HEAD^ walks back one commit from HEAD to skip the current tag's
+          # own commit, then `git describe` finds the nearest ancestor tag.
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [[ -z "$PREVIOUS_TAG" ]]; then
+            # No previous tag: include the entire commit history.
+            LOG=$(git log --oneline --no-merges)
+          else
+            LOG=$(git log "${PREVIOUS_TAG}..HEAD" --oneline --no-merges)
+          fi
+
+          # Extract commits that match a given conventional-commit type prefix.
+          # The pattern matches lines like: "abc1234 feat(scope): message"
+          # or "abc1234 feat!: breaking message".
+          extract_type() {
+            local type_pattern="$1"
+            echo "$LOG" | grep -E "^[a-f0-9]+ ${type_pattern}[(:!]" \
+              | sed 's/^[a-f0-9]* //' \
+              || true
+          }
+
+          FEATS=$(extract_type "feat")
+          FIXES=$(extract_type "fix")
+          PERF=$(extract_type "perf")
+          REFACTORS=$(extract_type "refactor")
+          DOCS=$(extract_type "docs")
+          TESTS=$(extract_type "test")
+          CHORES=$(extract_type "chore\|build\|ci\|style")
+
+          # Build the markdown release body section by section.
+          BODY=""
+
+          if [[ -n "$FEATS" ]]; then
+            BODY+=$'## New Features\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$FEATS"
+            BODY+=$'\n'
+          fi
+
+          if [[ -n "$FIXES" ]]; then
+            BODY+=$'## Bug Fixes\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$FIXES"
+            BODY+=$'\n'
+          fi
+
+          if [[ -n "$PERF" ]]; then
+            BODY+=$'## Performance\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$PERF"
+            BODY+=$'\n'
+          fi
+
+          if [[ -n "$REFACTORS" ]]; then
+            BODY+=$'## Refactoring\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$REFACTORS"
+            BODY+=$'\n'
+          fi
+
+          if [[ -n "$DOCS" ]]; then
+            BODY+=$'## Documentation\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$DOCS"
+            BODY+=$'\n'
+          fi
+
+          if [[ -n "$TESTS" ]]; then
+            BODY+=$'## Tests\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$TESTS"
+            BODY+=$'\n'
+          fi
+
+          if [[ -n "$CHORES" ]]; then
+            BODY+=$'## Maintenance\n\n'
+            while IFS= read -r line; do
+              BODY+="- ${line}"$'\n'
+            done <<< "$CHORES"
+            BODY+=$'\n'
+          fi
+
+          if [[ -z "$BODY" ]]; then
+            BODY="No conventional commits found since ${PREVIOUS_TAG:-the beginning of the repository}."$'\n'
+          fi
+
+          # Append a compare link when there is a known base tag.
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            COMPARE_URL="https://github.com/${REPO}/compare/${PREVIOUS_TAG}...${CURRENT_TAG}"
+            BODY+="**Full diff:** [${PREVIOUS_TAG} → ${CURRENT_TAG}](${COMPARE_URL})"$'\n'
+          fi
+
+          # Write to a file; avoids length/quoting issues in GITHUB_OUTPUT.
+          echo "$BODY" > release_notes.md
+          echo "notes_file=release_notes.md" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------
+      # Download all build artifacts into a staging directory.
+      # actions/download-artifact places each artifact in its own
+      # subdirectory under artifacts/ using the artifact name as the
+      # directory name.
+      # -----------------------------------------------------------------
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      # -----------------------------------------------------------------
+      # Determine whether this is a pre-release.
+      # Tags containing a hyphen (e.g. v0.4.0-beta.1) are pre-releases.
+      # -----------------------------------------------------------------
+      - name: Detect pre-release
+        id: prerelease
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$TAG" == *"-"* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------
+      # Create the GitHub Release and attach all artifacts.
+      # softprops/action-gh-release globs the artifacts directory so every
+      # file under artifacts/**/* is attached automatically.
+      # -----------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "foxstash ${{ github.ref_name }}"
+          body_path: ${{ steps.changelog.outputs.notes_file }}
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+          # Attach every file found inside the artifacts staging directory.
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
