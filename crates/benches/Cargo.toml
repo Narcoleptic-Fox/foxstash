@@ -5,13 +5,21 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-foxstash-core = { path = "../core", features = ["onnx", "compression-all"] }
+foxstash-core = { path = "../core" }
+bincode.workspace = true
 criterion.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 tempfile = "3.8"
 
 # Comparison benchmarks
 instant-distance = "0.6"
+
+[features]
+default = []
+onnx = ["foxstash-core/onnx"]
+compression-all = ["foxstash-core/compression-all"]
+all = ["onnx", "compression-all"]
 
 [[bench]]
 name = "embedding"
