@@ -1,11 +1,11 @@
-package com.nexus.rag
+package com.foxstash.rag
 
 /**
- * Kotlin wrapper for Nexus RAG native library
+ * Kotlin wrapper for foxstash native library
  *
  * Provides idiomatic Kotlin API for Android applications with automatic memory management.
  */
-class NexusRAG(
+class FoxstashRAG(
     embeddingDim: Int,
     useHNSW: Boolean = true
 ) : AutoCloseable {
@@ -13,7 +13,7 @@ class NexusRAG(
     private var handle: Long = 0
 
     init {
-        System.loadLibrary("nexus_rag_native")
+        System.loadLibrary("foxstash_rag_native")
         handle = create(embeddingDim, if (useHNSW) 1 else 0)
         if (handle == 0L) {
             throw RAGException("Failed to create RAG index")
@@ -118,15 +118,15 @@ class NexusRAG(
          *
          * @param path File path to load the index from
          * @param useHNSW Use HNSW index (approximate) vs Flat (exact)
-         * @return Loaded NexusRAG instance
+         * @return Loaded FoxstashRAG instance
          * @throws RAGException if loading fails
          */
-        fun load(path: String, useHNSW: Boolean = true): NexusRAG {
+        fun load(path: String, useHNSW: Boolean = true): FoxstashRAG {
             val handle = loadNative(path, if (useHNSW) 1 else 0)
             if (handle == 0L) {
                 throw RAGException("Failed to load: ${getLastError()}")
             }
-            return NexusRAG(handle)
+            return FoxstashRAG(handle)
         }
 
         // JNI native method declarations

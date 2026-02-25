@@ -1,7 +1,7 @@
 /**
- * Nexus RAG Demo Application
+ * foxstash Demo Application
  *
- * Main application logic for the Nexus RAG web demo.
+ * Main application logic for the foxstash web demo.
  * Handles WASM initialization, document management, search, and persistence.
  */
 
@@ -89,7 +89,7 @@ class RAGApp {
             // Note: The actual WASM module will be built by other agents
             // This is a placeholder that will be replaced with the real module
             try {
-                wasmModule = await import('./pkg/nexus_rag_wasm.js');
+                wasmModule = await import('./pkg/foxstash_rag_wasm.js');
                 await wasmModule.default(); // Initialize WASM
                 console.log('WASM module loaded successfully');
             } catch (error) {
@@ -840,7 +840,7 @@ class MockStorage {
         this.storage.set(key, JSON.stringify(data));
         // Also save to localStorage as backup
         try {
-            localStorage.setItem(`nexus-rag-${key}`, JSON.stringify(data));
+            localStorage.setItem(`foxstash-rag-${key}`, JSON.stringify(data));
         } catch (e) {
             console.warn('localStorage not available');
         }
@@ -852,7 +852,7 @@ class MockStorage {
 
         // Try loading from localStorage
         try {
-            const lsData = localStorage.getItem(`nexus-rag-${key}`);
+            const lsData = localStorage.getItem(`foxstash-rag-${key}`);
             if (lsData) {
                 const parsed = JSON.parse(lsData);
                 this.storage.set(key, lsData);
@@ -868,7 +868,7 @@ class MockStorage {
     async delete(key) {
         this.storage.delete(key);
         try {
-            localStorage.removeItem(`nexus-rag-${key}`);
+            localStorage.removeItem(`foxstash-rag-${key}`);
         } catch (e) {
             console.warn('localStorage not available');
         }
@@ -881,8 +881,8 @@ class MockStorage {
         try {
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
-                if (key && key.startsWith('nexus-rag-')) {
-                    const shortKey = key.replace('nexus-rag-', '');
+                if (key && key.startsWith('foxstash-rag-')) {
+                    const shortKey = key.replace('foxstash-rag-', '');
                     if (!keys.includes(shortKey)) {
                         keys.push(shortKey);
                     }
