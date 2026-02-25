@@ -1,0 +1,362 @@
+name: Benchmarks
+
+# Strategy: use critcmp to compare criterion JSON output between main and PR.
+#
+# Criterion writes machine-readable results to target/criterion/<bench>/<case>/new/
+# in a specific directory layout. critcmp can consume these to produce diffs.
+#
+# Flow for PRs:
+#   1. Restore the baseline cache (results from the last push to main)
+#   2. Run benchmarks on the PR branch, saving results under the "pr-branch" label
+#   3. Run critcmp to compare "ci-baseline" vs "pr-branch" and post as a PR comment
+#   4. Fail the step (warning only) if any benchmark regressed by more than 10%
+#
+# Flow for main push:
+#   1. Run benchmarks and save results under the "ci-baseline" label
+#   2. Cache target/criterion so future PRs can compare against them
+#
+# CI-safe benchmark subset (no ONNX runtime required):
+#   - foxstash-core: vector_simd, quantization
+#   - foxstash-benches: embedding (active criterion_group is ONNX-free), storage
+#   Skipped: full (requires real FileStorage wrappers not yet wired up),
+#             comparison (100K vectors, runs for tens of minutes)
+#
+# Hardware consistency: ubuntu-latest only. Mixing OS runners introduces
+# measurement noise that makes regression detection meaningless.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Criterion baseline name stored on disk under target/criterion/
+  BASELINE_NAME: ci-baseline
+  # Regression threshold: percentage increase in time that counts as a regression
+  REGRESSION_THRESHOLD: "10"
+
+jobs:
+  # ============================================================================
+  # Main branch: run benchmarks and save as new baseline
+  # ============================================================================
+  benchmark-baseline:
+    name: Update Baseline (main)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate cache key for benchmarks — they build with release profile
+          # which differs from regular CI debug builds.
+          prefix-key: "bench"
+
+      - name: Install critcmp
+        # critcmp reads criterion's JSON output and produces human-readable diffs.
+        run: cargo install critcmp --version "0.1.1" --locked
+
+      - name: Run core benchmarks (vector_simd)
+        run: |
+          cargo bench \
+            -p foxstash-core \
+            --bench vector_simd \
+            --features "" \
+            -- --save-baseline "$BASELINE_NAME"
+
+      - name: Run core benchmarks (quantization)
+        run: |
+          cargo bench \
+            -p foxstash-core \
+            --bench quantization \
+            --features "" \
+            -- --save-baseline "$BASELINE_NAME"
+
+      - name: Run benches crate (embedding — ONNX-free groups only)
+        # foxstash-benches/Cargo.toml declares onnx in its foxstash-core dep,
+        # but the active criterion_group! only wires up ONNX-free benchmark
+        # functions. We explicitly exclude the onnx feature here so the build
+        # does not require the ONNX Runtime shared library to be present.
+        run: |
+          cargo bench \
+            -p foxstash-benches \
+            --bench embedding \
+            --no-default-features \
+            --features "compression-all" \
+            -- --save-baseline "$BASELINE_NAME"
+
+      - name: Run benches crate (storage)
+        run: |
+          cargo bench \
+            -p foxstash-benches \
+            --bench storage \
+            --no-default-features \
+            --features "compression-all" \
+            -- --save-baseline "$BASELINE_NAME"
+
+      - name: Save baseline results to cache
+        # Cache key includes the commit SHA so each main commit produces a
+        # deterministic cache entry. The restore-keys fallback in the PR job
+        # picks the most recent main baseline when the exact key is absent.
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.sha }}
+
+  # ============================================================================
+  # PR: compare against baseline and comment with diff
+  # ============================================================================
+  benchmark-compare:
+    name: Benchmark Comparison (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    # Allow posting PR comments
+    permissions:
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "bench"
+
+      - name: Install critcmp
+        run: cargo install critcmp --version "0.1.1" --locked
+
+      # Restore the most recent baseline from main. The restore-keys prefix
+      # match returns the newest cache entry whose key starts with
+      # "criterion-baseline-", which corresponds to the latest main push.
+      - name: Restore baseline criterion results
+        id: restore-baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.sha }}
+          restore-keys: |
+            criterion-baseline-
+
+      - name: Check baseline availability
+        id: baseline-check
+        run: |
+          if [ -d "target/criterion" ] && [ "$(ls -A target/criterion 2>/dev/null)" ]; then
+            echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+            echo "Baseline found — will compare results."
+          else
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "No baseline found. Benchmarks will run but no comparison will be made."
+            echo "Push to main first to establish a baseline."
+          fi
+
+      # Rename the restored baseline directories so criterion can save new
+      # PR results under the "ci-baseline" name without overwriting the old data.
+      # After the PR benchmarks run, we rename back so critcmp can find both.
+      - name: Preserve baseline data before PR run
+        if: steps.baseline-check.outputs.has_baseline == 'true'
+        run: |
+          find target/criterion -type d -name "$BASELINE_NAME" | while read -r dir; do
+            mv "$dir" "$(dirname "$dir")/saved-baseline"
+          done
+
+      - name: Run core benchmarks (vector_simd) on PR branch
+        run: |
+          cargo bench \
+            -p foxstash-core \
+            --bench vector_simd \
+            --features "" \
+            -- --save-baseline pr-branch
+
+      - name: Run core benchmarks (quantization) on PR branch
+        run: |
+          cargo bench \
+            -p foxstash-core \
+            --bench quantization \
+            --features "" \
+            -- --save-baseline pr-branch
+
+      - name: Run benches crate (embedding) on PR branch
+        run: |
+          cargo bench \
+            -p foxstash-benches \
+            --bench embedding \
+            --no-default-features \
+            --features "compression-all" \
+            -- --save-baseline pr-branch
+
+      - name: Run benches crate (storage) on PR branch
+        run: |
+          cargo bench \
+            -p foxstash-benches \
+            --bench storage \
+            --no-default-features \
+            --features "compression-all" \
+            -- --save-baseline pr-branch
+
+      - name: Restore baseline directory names for critcmp
+        if: steps.baseline-check.outputs.has_baseline == 'true'
+        run: |
+          find target/criterion -type d -name "saved-baseline" | while read -r dir; do
+            mv "$dir" "$(dirname "$dir")/$BASELINE_NAME"
+          done
+
+      - name: Generate comparison report
+        if: steps.baseline-check.outputs.has_baseline == 'true'
+        id: compare
+        run: |
+          # critcmp prints a side-by-side table of baseline vs pr-branch timings.
+          # We capture the raw output into a file to avoid any shell quoting issues
+          # when passing multi-line text between steps.
+          critcmp "$BASELINE_NAME" pr-branch > /tmp/critcmp-report.txt 2>&1 || true
+          cat /tmp/critcmp-report.txt
+
+      - name: Detect regressions
+        if: steps.baseline-check.outputs.has_baseline == 'true'
+        id: regressions
+        run: |
+          # critcmp marks regressions with "(+X.XX%)" — a positive percentage
+          # means the PR is slower. We extract lines where the increase exceeds
+          # the configured threshold and write them to a file for the comment step.
+          THRESHOLD="${REGRESSION_THRESHOLD}"
+
+          grep -E '\(\+[0-9]+\.[0-9]+%\)' /tmp/critcmp-report.txt \
+            | awk -v threshold="$THRESHOLD" '
+                {
+                  match($0, /\(\+([0-9]+\.[0-9]+)%\)/, arr)
+                  pct = arr[1] + 0
+                  if (pct > threshold) print $0
+                }
+              ' > /tmp/regressions.txt || true
+
+          if [ -s /tmp/regressions.txt ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post comparison comment on PR
+        if: steps.baseline-check.outputs.has_baseline == 'true'
+        uses: actions/github-script@v7
+        env:
+          # Pass file contents via env to avoid shell injection from critcmp output.
+          # critcmp output is generated by our own code but may contain backticks
+          # or other characters that would break template literal interpolation.
+          CRITCMP_REPORT_FILE: /tmp/critcmp-report.txt
+          REGRESSIONS_FILE: /tmp/regressions.txt
+          HAS_REGRESSIONS: ${{ steps.regressions.outputs.found }}
+          THRESHOLD: ${{ env.REGRESSION_THRESHOLD }}
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync(process.env.CRITCMP_REPORT_FILE, 'utf8');
+            const hasRegressions = process.env.HAS_REGRESSIONS === 'true';
+            const threshold = process.env.THRESHOLD;
+
+            let status = hasRegressions
+              ? `:warning: **Performance regressions detected** (>${threshold}% slower than baseline)`
+              : ':white_check_mark: No significant regressions detected';
+
+            let body = `## Benchmark Results\n\n${status}\n\n`;
+
+            if (hasRegressions) {
+              const regressions = fs.readFileSync(process.env.REGRESSIONS_FILE, 'utf8');
+              body += `### Regressions (>${threshold}% slower)\n\`\`\`\n${regressions}\n\`\`\`\n\n`;
+            }
+
+            body += `### Full Comparison (baseline \`main\` vs this PR)\n\`\`\`\n${report}\n\`\`\`\n\n`;
+            body += `_Benchmarks run: \`vector_simd\`, \`quantization\` (foxstash-core), `;
+            body += `\`embedding\`, \`storage\` (foxstash-benches). `;
+            body += `ONNX-dependent benchmarks and the \`comparison\` bench (100K vectors) `;
+            body += `are excluded from CI to keep runtime manageable._`;
+
+            // Update existing bot comment rather than creating a new one on each push
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = '## Benchmark Results';
+            const existing = comments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Post no-baseline notice on PR
+        if: steps.baseline-check.outputs.has_baseline == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body =
+              `## Benchmark Results\n\n` +
+              `:information_source: No baseline available yet.\n\n` +
+              `Benchmarks ran successfully on this PR, but no comparison is possible ` +
+              `because no baseline exists from \`main\`. Once this PR merges and the ` +
+              `benchmark baseline job runs on \`main\`, future PRs will show performance diffs.`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = '## Benchmark Results';
+            const existing = comments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail on regressions
+        # This step exits non-zero when regressions are detected, which marks
+        # the CI job as failed. To make this blocking for merges, require the
+        # "Benchmark Comparison (PR)" job to pass in your branch protection rules.
+        if: |
+          steps.baseline-check.outputs.has_baseline == 'true' &&
+          steps.regressions.outputs.found == 'true'
+        run: |
+          echo "::warning::Performance regressions detected exceeding ${REGRESSION_THRESHOLD}% threshold."
+          echo "Regressed benchmarks:"
+          cat /tmp/regressions.txt
+          exit 1
