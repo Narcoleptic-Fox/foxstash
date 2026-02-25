@@ -69,9 +69,9 @@ impl VectorStore {
 
     /// Get or create a collection by name.
     ///
-    /// If the collection already exists it is returned. Otherwise a new
-    /// empty collection is created on disk.
-    pub fn collection(&self, name: &str) -> Result<Arc<Collection>> {
+    /// If the collection already exists it is returned from the registry.
+    /// Otherwise a new empty collection is created on disk and registered.
+    pub fn get_or_create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         // Fast path: read lock.
         {
             let map = self.collections.read();
@@ -96,6 +96,28 @@ impl VectorStore {
         Ok(col)
     }
 
+    /// Alias for [`get_or_create_collection`].
+    #[deprecated(since = "0.4.0", note = "Use get_or_create_collection() instead")]
+    pub fn collection(&self, name: &str) -> Result<Arc<Collection>> {
+        self.get_or_create_collection(name)
+    }
+
+    /// Create a new collection. Returns error if it already exists.
+    pub fn create_collection(&self, name: &str) -> Result<Arc<Collection>> {
+        let mut map = self.collections.write();
+        if map.contains_key(name) {
+            return Err(DbError::CollectionExists(name.to_string()));
+        }
+
+        let col_path = self.base_path.join("collections").join(name);
+        std::fs::create_dir_all(&col_path)?;
+        let col = Arc::new(Collection::create(name, &col_path, self.config.clone())?);
+        map.insert(name.to_string(), Arc::clone(&col));
+
+        info!(name, "collection created (explicit)");
+        Ok(col)
+    }
+
     /// Get an existing collection. Returns error if not found.
     pub fn get_collection(&self, name: &str) -> Result<Arc<Collection>> {
         let map = self.collections.read();
@@ -109,16 +131,33 @@ impl VectorStore {
         self.collections.read().keys().cloned().collect()
     }
 
-    /// Drop a collection, removing it from the registry.
+    /// Unload a collection, removing it from the in-memory registry.
     ///
-    /// **Does not** delete files from disk — call this then remove the
-    /// directory manually if permanent deletion is desired.
-    pub fn drop_collection(&self, name: &str) -> Result<()> {
+    /// **Does not** delete files from disk — the collection can be recovered
+    /// by calling [`get_or_create_collection`] again. To permanently delete,
+    /// use [`delete_collection`] or remove the directory manually after unloading.
+    pub fn unload_collection(&self, name: &str) -> Result<()> {
         let mut map = self.collections.write();
         if map.remove(name).is_none() {
             return Err(DbError::CollectionNotFound(name.to_string()));
         }
-        info!(name, "collection dropped");
+        info!(name, "collection unloaded");
+        Ok(())
+    }
+
+    /// Permanently delete a collection: unload from registry and remove files from disk.
+    pub fn delete_collection(&self, name: &str) -> Result<()> {
+        {
+            let mut map = self.collections.write();
+            if map.remove(name).is_none() {
+                return Err(DbError::CollectionNotFound(name.to_string()));
+            }
+        }
+        let col_path = self.base_path.join("collections").join(name);
+        if col_path.exists() {
+            std::fs::remove_dir_all(&col_path)?;
+        }
+        info!(name, "collection deleted");
         Ok(())
     }
 
@@ -157,13 +196,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
 
-        let col = store.collection("memories").unwrap();
+        let col = store.get_or_create_collection("memories").unwrap();
         col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0], None)
             .unwrap();
         assert_eq!(col.len(), 1);
 
         // Getting the same collection returns the cached instance.
-        let col2 = store.collection("memories").unwrap();
+        let col2 = store.get_or_create_collection("memories").unwrap();
         assert_eq!(col2.len(), 1);
     }
 
@@ -172,8 +211,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
 
-        store.collection("alpha").unwrap();
-        store.collection("beta").unwrap();
+        store.get_or_create_collection("alpha").unwrap();
+        store.get_or_create_collection("beta").unwrap();
 
         let mut names = store.collections();
         names.sort();
@@ -181,22 +220,22 @@ mod tests {
     }
 
     #[test]
-    fn drop_collection() {
+    fn unload_collection() {
         let dir = TempDir::new().unwrap();
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
 
-        store.collection("temp").unwrap();
+        store.get_or_create_collection("temp").unwrap();
         assert_eq!(store.collections().len(), 1);
 
-        store.drop_collection("temp").unwrap();
+        store.unload_collection("temp").unwrap();
         assert!(store.collections().is_empty());
     }
 
     #[test]
-    fn drop_nonexistent() {
+    fn unload_nonexistent() {
         let dir = TempDir::new().unwrap();
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
-        assert!(store.drop_collection("nope").is_err());
+        assert!(store.unload_collection("nope").is_err());
     }
 
     #[test]
@@ -213,7 +252,7 @@ mod tests {
         // Session 1.
         {
             let store = VectorStore::open(dir.path(), cfg()).unwrap();
-            let col = store.collection("memories").unwrap();
+            let col = store.get_or_create_collection("memories").unwrap();
             col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0], None)
                 .unwrap();
             col.insert("b".into(), "world".into(), vec![0.0, 1.0, 0.0], None)
@@ -240,7 +279,7 @@ mod tests {
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
 
         // Create collection, insert, search.
-        let col = store.collection("test").unwrap();
+        let col = store.get_or_create_collection("test").unwrap();
         col.insert("x".into(), "ex".into(), vec![1.0, 0.0, 0.0], None)
             .unwrap();
         col.insert("y".into(), "why".into(), vec![0.0, 1.0, 0.0], None)
@@ -271,7 +310,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
-        let col = store.collection("hybrid").unwrap();
+        let col = store.get_or_create_collection("hybrid").unwrap();
 
         // ── Phase 1: Insert 10 docs with varied content + embeddings + metadata ──
         let docs = [
@@ -412,7 +451,7 @@ mod tests {
 
         // ── Phase 1: Create, bulk insert 12 docs with metadata ─────
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
-        let col = store.collection("docs").unwrap();
+        let col = store.get_or_create_collection("docs").unwrap();
 
         let categories = ["rust", "python", "go"];
         for i in 0..12 {
@@ -493,5 +532,54 @@ mod tests {
         // Search still works.
         let results = col2.search(&[0.0, 1.0, 0.0], 2, None).unwrap();
         assert!(!results.is_empty());
+    }
+
+    // ── P2.3 + P3.1: Lifecycle and access API tests ─────────────────
+
+    #[test]
+    fn create_collection_errors_if_exists() {
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::open(dir.path(), cfg()).unwrap();
+        store.create_collection("alpha").unwrap();
+        assert!(store.create_collection("alpha").is_err());
+    }
+
+    #[test]
+    fn delete_collection_removes_files() {
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::open(dir.path(), cfg()).unwrap();
+        let col = store.get_or_create_collection("temp").unwrap();
+        col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.flush().unwrap();
+
+        store.delete_collection("temp").unwrap();
+        assert!(store.collections().is_empty());
+
+        let col_path = dir.path().join("collections").join("temp");
+        assert!(!col_path.exists());
+    }
+
+    #[test]
+    fn unload_collection_leaves_files() {
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::open(dir.path(), cfg()).unwrap();
+        let col = store.get_or_create_collection("temp").unwrap();
+        col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.flush().unwrap();
+
+        store.unload_collection("temp").unwrap();
+        assert!(store.collections().is_empty());
+
+        let col_path = dir.path().join("collections").join("temp");
+        assert!(col_path.exists());
+    }
+
+    #[test]
+    fn delete_nonexistent_collection() {
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::open(dir.path(), cfg()).unwrap();
+        assert!(store.delete_collection("nope").is_err());
     }
 }
