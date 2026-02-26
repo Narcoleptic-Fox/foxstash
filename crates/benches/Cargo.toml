@@ -17,6 +17,7 @@ instant-distance = "0.6"
 
 [features]
 default = []
+ci = []  # Reduces dataset sizes for CI runners (caps at 1K docs instead of 10K)
 onnx = ["foxstash-core/onnx"]
 compression-all = ["foxstash-core/compression-all"]
 all = ["onnx", "compression-all"]
