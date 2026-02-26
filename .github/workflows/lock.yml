@@ -1,0 +1,32 @@
+name: Lock Closed Issues and PRs
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # Daily at midnight UTC
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dessant/lock-threads@v5
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # Lock issues closed for 30+ days
+          issue-inactive-days: 30
+          issue-comment: ""  # No comment when locking — avoids noise
+          issue-lock-reason: resolved
+
+          # Lock PRs closed for 14+ days
+          pr-inactive-days: 14
+          pr-comment: ""     # No comment when locking — avoids noise
+          pr-lock-reason: resolved
+
+          # Do not lock items that carry these labels
+          exclude-any-issue-labels: "pinned,security"
+          exclude-any-pr-labels: "pinned,security"

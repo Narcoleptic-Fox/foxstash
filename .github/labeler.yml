@@ -1,0 +1,33 @@
+# Label PRs automatically based on which files changed.
+# Used by .github/workflows/auto-label.yml (actions/labeler@v5).
+
+core:
+  - changed-files:
+    - any-glob-to-any-file: "crates/core/**"
+
+db:
+  - changed-files:
+    - any-glob-to-any-file: "crates/db/**"
+
+wasm:
+  - changed-files:
+    - any-glob-to-any-file: "crates/wasm/**"
+
+native:
+  - changed-files:
+    - any-glob-to-any-file: "crates/native/**"
+
+benches:
+  - changed-files:
+    - any-glob-to-any-file: "crates/benches/**"
+
+ci:
+  - changed-files:
+    - any-glob-to-any-file: ".github/workflows/**"
+
+docs:
+  - changed-files:
+    - any-glob-to-any-file:
+      - "*.md"
+      - "docs/**"
+      - "examples/**"

@@ -1,0 +1,49 @@
+name: Welcome First-Time Contributors
+
+on:
+  issues:
+    types: [opened]
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  welcome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/first-interaction@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+          issue-message: |
+            Welcome, and thank you for opening your first issue in foxstash!
+
+            To help us address this as quickly as possible, please make sure your
+            issue includes all the relevant details from the issue template. If you
+            have a question rather than a bug or feature request, feel free to use
+            the blank issue option or start a discussion.
+
+            If you are looking for something to work on, check out issues labelled
+            [`good first issue`](https://github.com/Narcoleptic-Fox/foxstash/labels/good%20first%20issue).
+
+            We appreciate your contribution!
+
+          pr-message: |
+            Thank you for opening your first pull request in foxstash — we are glad
+            you are here!
+
+            Our CI pipeline will run automatically and check formatting, linting,
+            and tests across the workspace. Please make sure:
+
+            - `cargo fmt --all` has been run
+            - `cargo clippy --workspace` is clean
+            - `cargo test --workspace` passes locally
+
+            If you have not already, please review our
+            [contributing guide](https://github.com/Narcoleptic-Fox/foxstash/blob/main/CONTRIBUTING.md)
+            for tips on keeping things smooth.
+
+            We will review your PR as soon as we can. Thanks again!
