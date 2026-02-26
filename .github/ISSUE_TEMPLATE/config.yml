@@ -1,0 +1,12 @@
+# Issue template chooser configuration.
+# Allows blank issues so users can ask questions or raise topics
+# that do not fit the structured templates.
+
+blank_issues_enabled: true
+
+contact_links:
+  - name: Ask a Question / Start a Discussion
+    url: https://github.com/Narcoleptic-Fox/foxstash/discussions
+    about: >
+      For general questions, ideas, or usage help, please use GitHub Discussions
+      rather than opening an issue.

@@ -1,0 +1,58 @@
+name: Mark Stale Issues and PRs
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # Daily at midnight UTC
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # --- Issues ---
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          stale-issue-label: stale
+          stale-issue-message: >
+            This issue has been automatically marked as stale because it has not had
+            any activity in the last 60 days. It will be closed in 14 days if no
+            further activity occurs.
+
+            If this issue is still relevant, please leave a comment or update it
+            so we know it is still being tracked. Thank you for your contribution
+            to foxstash!
+          close-issue-message: >
+            This issue has been closed due to inactivity. If you believe it is still
+            relevant, please reopen it or open a new issue with updated information.
+
+          # --- Pull Requests ---
+          days-before-pr-stale: 30
+          days-before-pr-close: 7
+          stale-pr-label: stale
+          stale-pr-message: >
+            This pull request has been automatically marked as stale because it has
+            not had any activity in the last 30 days. It will be closed in 7 days
+            if no further activity occurs.
+
+            If this PR is still in progress, please leave a comment or push an
+            update so we know it is still being worked on. We appreciate your
+            contribution to foxstash!
+          close-pr-message: >
+            This pull request has been closed due to inactivity. If you would like
+            to continue this work, please reopen the PR or open a new one. Thank
+            you for your effort!
+
+          # Labels that prevent stale processing
+          exempt-issue-labels: "pinned,security,help wanted,good first issue"
+          exempt-pr-labels: "pinned,security,help wanted,good first issue"
+
+          # Do not mark issues/PRs stale if they have been assigned
+          exempt-all-assignees: true

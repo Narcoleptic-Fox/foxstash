@@ -1,0 +1,54 @@
+name: Feature Request
+description: Suggest a new feature or improvement for foxstash
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting an improvement to foxstash! Please describe your
+        idea in as much detail as possible so we can evaluate and prioritize it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: >
+        What problem does this feature solve? Describe the use case or pain point
+        that motivated this request.
+      placeholder: >
+        I am trying to do X, but the current API makes it difficult because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: >
+        Describe the feature or change you would like to see. Include proposed
+        API signatures, configuration options, or behavior changes if applicable.
+      placeholder: >
+        Add a method `Index::search_batch()` that accepts a slice of query
+        vectors and returns results for all of them in a single call...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: >
+        Have you considered any alternative approaches or workarounds? Why do
+        those fall short compared to the proposed solution?
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: >
+        Any other context, references, links to prior art, or examples that
+        would help evaluate this request.
+    validations:
+      required: false

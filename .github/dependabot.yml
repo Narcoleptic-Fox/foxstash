@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  # --- Cargo (Rust dependencies) ---
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    target-branch: main
+    open-pull-requests-limit: 5
+    # Group minor and patch bumps into a single PR to reduce noise.
+    # Security updates are always opened as individual PRs by GitHub.
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - cargo
+    commit-message:
+      prefix: "build(deps)"
+
+  # --- GitHub Actions ---
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    target-branch: main
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci(deps)"
