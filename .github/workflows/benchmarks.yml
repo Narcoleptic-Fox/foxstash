@@ -88,6 +88,7 @@ jobs:
           cargo bench \
             -p foxstash-benches \
             --bench embedding \
+            --features ci \
             -- --save-baseline "$BASELINE_NAME"
 
       # Note: storage and full benches are excluded — they reference
@@ -185,6 +186,7 @@ jobs:
           cargo bench \
             -p foxstash-benches \
             --bench embedding \
+            --features ci \
             -- --save-baseline pr-branch
 
       - name: Restore baseline directory names for critcmp

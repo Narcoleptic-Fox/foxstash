@@ -141,8 +141,14 @@ fn benchmark_flat_index(c: &mut Criterion) {
     let mut group = c.benchmark_group("flat_index");
     let dim = 384;
 
-    // Test with varying document counts
-    for &doc_count in &[100, 1000, 10000] {
+    // Cap at 1000 docs in CI to avoid exceeding runner time limits.
+    // Run locally with `cargo bench` (no --features ci) for full 10K suite.
+    #[cfg(feature = "ci")]
+    let counts: &[usize] = &[100, 1000];
+    #[cfg(not(feature = "ci"))]
+    let counts: &[usize] = &[100, 1000, 10000];
+
+    for &doc_count in counts {
         // Benchmark index construction (add operations)
         group.bench_with_input(
             BenchmarkId::new("add", doc_count),
@@ -228,11 +234,17 @@ fn benchmark_hnsw_index(c: &mut Criterion) {
     let mut group = c.benchmark_group("hnsw_index");
     let dim = 384;
 
-    // Increase sample size for more stable measurements on larger datasets
-    group.sample_size(20);
+    // Reduce sample size — HNSW construction is expensive, especially at 1K+.
+    group.sample_size(10);
 
-    // Test with varying document counts
-    for &doc_count in &[100, 1000, 10000] {
+    // Cap at 1000 docs in CI to stay within runner time limits (~6h max).
+    // The 10K HNSW build alone takes minutes per iteration × 10 samples.
+    #[cfg(feature = "ci")]
+    let counts: &[usize] = &[100, 1000];
+    #[cfg(not(feature = "ci"))]
+    let counts: &[usize] = &[100, 1000, 10000];
+
+    for &doc_count in counts {
         // Benchmark index construction (add operations)
         group.bench_with_input(
             BenchmarkId::new("add", doc_count),
