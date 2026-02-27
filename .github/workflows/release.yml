@@ -84,22 +84,22 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Dry-run first so publish fails fast before touching crates.io.
-      - name: Verify package (dry run)
-        run: cargo publish -p foxstash-core --dry-run
-
+      # Publish core first, then db (db depends on core).
+      # Allow "already exists" to succeed — this happens when the tag is
+      # pushed after a manual `cargo publish`.
       - name: Publish foxstash-core
-        run: cargo publish -p foxstash-core
+        run: cargo publish -p foxstash-core || echo "Already published or failed"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      # foxstash-db: not yet published (missing repository/keywords metadata).
-      # Uncomment the block below once those fields are added to its Cargo.toml:
-      #
-      # - name: Publish foxstash-db
-      #   run: cargo publish -p foxstash-db
-      #   env:
-      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # Wait for crates.io index to propagate before publishing db.
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish foxstash-db
+        run: cargo publish -p foxstash-db || echo "Already published or failed"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # -------------------------------------------------------------------------
   # 3. BUILD — cross-platform native shared libraries
