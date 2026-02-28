@@ -92,13 +92,10 @@ fn build_flat_index(documents: &[Document]) -> FlatIndex {
 
 /// Build an HNSW index with given documents
 fn build_hnsw_index(documents: &[Document]) -> HNSWIndex {
-    let config = HNSWConfig {
-        m: 16,
-        m0: 32,
-        ef_construction: 200,
-        ef_search: 50,
-        ml: 1.0 / 16.0_f32.ln(),
-    };
+    let config = HNSWConfig::default()
+        .with_m(16)
+        .with_ef_construction(200)
+        .with_ef_search(50);
     let mut index = HNSWIndex::new(EMBEDDING_DIM, config);
     for doc in documents {
         index.add(doc.clone()).unwrap();
@@ -122,13 +119,10 @@ fn benchmark_index_construction(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::new("hnsw", size), &documents, |b, docs| {
             b.iter(|| {
-                let config = HNSWConfig {
-                    m: 16,
-                    m0: 32,
-                    ef_construction: 200,
-                    ef_search: 50,
-                    ml: 1.0 / 16.0_f32.ln(),
-                };
+                let config = HNSWConfig::default()
+                    .with_m(16)
+                    .with_ef_construction(200)
+                    .with_ef_search(50);
                 let mut index = HNSWIndex::new(EMBEDDING_DIM, config);
                 for doc in docs {
                     index.add(black_box(doc.clone())).unwrap();
@@ -318,14 +312,10 @@ fn benchmark_storage(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage");
     group.sample_size(20);
 
-    let codecs = vec![
-        Codec::None,
-        Codec::Gzip,
-        #[cfg(feature = "zstd")]
-        Codec::Zstd,
-        #[cfg(feature = "lz4")]
-        Codec::Lz4,
-    ];
+    #[cfg(feature = "compression-all")]
+    let codecs = vec![Codec::None, Codec::Gzip, Codec::Zstd, Codec::Lz4];
+    #[cfg(not(feature = "compression-all"))]
+    let codecs = vec![Codec::None, Codec::Gzip];
 
     for &size in &[100, 1_000] {
         let documents = create_test_documents(size, EMBEDDING_DIM, 6000);

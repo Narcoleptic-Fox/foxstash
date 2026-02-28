@@ -126,9 +126,7 @@ fn main() {
     let mut id_total_recall = 0.0;
     let mut recall_ctx = index.create_search_context();
 
-    for i in 0..recall_queries {
-        let q = &query_vecs[i];
-
+    for q in query_vecs.iter().take(recall_queries) {
         // Brute-force ground truth using Euclidean distance (same as instant-distance)
         let mut distances: Vec<(f32, usize)> = base_vecs
             .iter()
@@ -148,9 +146,7 @@ fn main() {
             distances.iter().take(K).map(|(_, j)| *j).collect();
 
         // Foxstash results (with context reuse)
-        let results = index
-            .search_with_context(q, K, &mut recall_ctx)
-            .unwrap();
+        let results = index.search_with_context(q, K, &mut recall_ctx).unwrap();
         let foxstash_ids: std::collections::HashSet<usize> =
             results.iter().map(|r| r.id.parse().unwrap()).collect();
 
@@ -178,10 +174,7 @@ fn main() {
 
     // === Summary ===
     println!("\n=== SUMMARY ===");
-    println!(
-        "{:<30} {:>12} {:>12}",
-        "Library", "Build Time", "QPS"
-    );
+    println!("{:<30} {:>12} {:>12}", "Library", "Build Time", "QPS");
     println!("{:-<56}", "");
     println!(
         "{:<30} {:>12.2?} {:>12.0}",

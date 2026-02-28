@@ -45,6 +45,7 @@ fn generate_random_embedding(dim: usize, seed: u64) -> Vec<f32> {
 }
 
 /// Generate multiple random embedding vectors
+#[allow(dead_code)]
 fn generate_random_embeddings(count: usize, dim: usize, seed_offset: u64) -> Vec<Vec<f32>> {
     (0..count)
         .map(|i| generate_random_embedding(dim, seed_offset + i as u64))

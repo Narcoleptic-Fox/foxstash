@@ -143,7 +143,7 @@ fn bench_foxstash(c: &mut Criterion) {
         b.iter(|| {
             for q in &query_vecs {
                 let results = index.search(q, K);
-                black_box(results);
+                let _ = black_box(results);
             }
         })
     });
