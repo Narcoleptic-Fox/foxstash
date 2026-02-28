@@ -57,18 +57,24 @@ impl Default for HybridConfig {
 }
 
 impl HybridConfig {
-    pub fn with_weights(mut self, vector: f32, keyword: f32) -> Self {
-        assert!(
-            vector.is_finite() && vector >= 0.0,
-            "vector_weight must be finite and non-negative, got {vector}"
-        );
-        assert!(
-            keyword.is_finite() && keyword >= 0.0,
-            "keyword_weight must be finite and non-negative, got {keyword}"
-        );
+    pub fn try_with_weights(mut self, vector: f32, keyword: f32) -> Result<Self, String> {
+        if !vector.is_finite() || vector < 0.0 {
+            return Err(format!(
+                "vector_weight must be finite and non-negative, got {vector}"
+            ));
+        }
+        if !keyword.is_finite() || keyword < 0.0 {
+            return Err(format!(
+                "keyword_weight must be finite and non-negative, got {keyword}"
+            ));
+        }
         self.vector_weight = vector;
         self.keyword_weight = keyword;
-        self
+        Ok(self)
+    }
+
+    pub fn with_weights(self, vector: f32, keyword: f32) -> Self {
+        self.try_with_weights(vector, keyword).unwrap()
     }
 
     pub fn with_strategy(mut self, strategy: MergeStrategy) -> Self {
@@ -76,13 +82,18 @@ impl HybridConfig {
         self
     }
 
-    pub fn with_rrf_k(mut self, rrf_k: f32) -> Self {
-        assert!(
-            rrf_k.is_finite() && rrf_k >= 0.0,
-            "rrf_k must be finite and non-negative, got {rrf_k}"
-        );
+    pub fn try_with_rrf_k(mut self, rrf_k: f32) -> Result<Self, String> {
+        if !rrf_k.is_finite() || rrf_k < 0.0 {
+            return Err(format!(
+                "rrf_k must be finite and non-negative, got {rrf_k}"
+            ));
+        }
         self.rrf_k = rrf_k;
-        self
+        Ok(self)
+    }
+
+    pub fn with_rrf_k(self, rrf_k: f32) -> Self {
+        self.try_with_rrf_k(rrf_k).unwrap()
     }
 }
 
@@ -411,5 +422,13 @@ mod tests {
     #[should_panic(expected = "rrf_k must be finite and non-negative")]
     fn config_validation_rejects_negative_rrf_k() {
         HybridConfig::default().with_rrf_k(-10.0);
+    }
+
+    #[test]
+    fn try_builders_return_errors_instead_of_panicking() {
+        assert!(HybridConfig::default()
+            .try_with_weights(f32::NAN, 0.5)
+            .is_err());
+        assert!(HybridConfig::default().try_with_rrf_k(-1.0).is_err());
     }
 }

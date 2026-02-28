@@ -36,6 +36,7 @@ pub struct Collection {
     config: DbConfig,
     inner: RwLock<CollectionInner>,
     storage: Mutex<IncrementalStorage>,
+    mutation_lock: Mutex<()>,
 }
 
 impl Collection {
@@ -64,6 +65,7 @@ impl Collection {
                 tokenizer: SimpleTokenizer::new(),
             }),
             storage: Mutex::new(storage),
+            mutation_lock: Mutex::new(()),
         })
     }
 
@@ -94,6 +96,7 @@ impl Collection {
             }),
             config,
             storage: Mutex::new(storage),
+            mutation_lock: Mutex::new(()),
         })
     }
 
@@ -105,6 +108,8 @@ impl Collection {
         embedding: Vec<f32>,
         metadata: Option<Value>,
     ) -> Result<()> {
+        let _mutation_guard = self.mutation_lock.lock();
+
         if embedding.len() != self.config.embedding_dim {
             return Err(DbError::DimensionMismatch {
                 expected: self.config.embedding_dim,
@@ -142,7 +147,7 @@ impl Collection {
             inner.documents.push(doc);
         }
 
-        self.maybe_auto_checkpoint()?;
+        self.maybe_auto_checkpoint_locked()?;
         Ok(())
     }
 
@@ -163,6 +168,8 @@ impl Collection {
 
     /// Soft-delete a document by ID. Returns `true` if the document existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
+        let _mutation_guard = self.mutation_lock.lock();
+
         // Hold write lock for the entire operation to prevent TOCTOU races.
         let mut inner = self.inner.write();
         if !inner.id_map.is_live(id) {
@@ -233,6 +240,8 @@ impl Collection {
 
     /// Compact: rebuild index from live documents only, checkpoint, reclaim tombstones.
     pub fn compact(&self) -> Result<()> {
+        let _mutation_guard = self.mutation_lock.lock();
+
         // Hold write lock for the entire operation to prevent concurrent mutations
         // from being silently dropped during the swap.
         let mut inner = self.inner.write();
@@ -510,7 +519,7 @@ impl Collection {
         live
     }
 
-    fn maybe_auto_checkpoint(&self) -> Result<()> {
+    fn maybe_auto_checkpoint_locked(&self) -> Result<()> {
         if !self.config.auto_checkpoint {
             return Ok(());
         }
@@ -547,6 +556,9 @@ mod tests {
     use super::*;
     use foxstash_core::storage::IncrementalConfig;
     use serde_json::json;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn cfg(dim: usize) -> DbConfig {
@@ -1465,5 +1477,111 @@ mod tests {
         let results = col.search_text("database", 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "a");
+    }
+
+    #[test]
+    fn concurrent_inserts_with_auto_checkpoint_persist_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let config = DbConfig {
+            embedding_dim: 3,
+            auto_checkpoint: true,
+            storage: IncrementalConfig::default().with_checkpoint_threshold(1),
+            ..Default::default()
+        };
+        let col = Arc::new(Collection::create("test", dir.path(), config.clone()).unwrap());
+
+        let threads = 4usize;
+        let inserts_per_thread = 50usize;
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::new();
+
+        for t in 0..threads {
+            let col = Arc::clone(&col);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..inserts_per_thread {
+                    let id = format!("t{t}-{i}");
+                    col.insert(
+                        id,
+                        format!("content-{t}-{i}"),
+                        vec![1.0, 0.0, 0.0],
+                        Some(json!({ "thread": t, "idx": i })),
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        col.flush().unwrap();
+        drop(col);
+
+        let reopened = Collection::open("test", dir.path(), config).unwrap();
+        assert_eq!(reopened.len(), threads * inserts_per_thread);
+        for t in 0..threads {
+            for i in 0..inserts_per_thread {
+                let id = format!("t{t}-{i}");
+                assert!(
+                    reopened.get(&id).unwrap().is_some(),
+                    "missing persisted document {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_during_concurrent_inserts_keeps_all_writes() {
+        let dir = TempDir::new().unwrap();
+        let config = cfg(3);
+        let col = Arc::new(Collection::create("test", dir.path(), config.clone()).unwrap());
+
+        for i in 0..20 {
+            col.insert(
+                format!("seed-{i}"),
+                format!("seed-content-{i}"),
+                vec![1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+
+        let writer_col = Arc::clone(&col);
+        let writer = thread::spawn(move || {
+            for i in 0..120 {
+                writer_col
+                    .insert(
+                        format!("live-{i}"),
+                        format!("live-content-{i}"),
+                        vec![1.0, 0.0, 0.0],
+                        None,
+                    )
+                    .unwrap();
+                if i % 8 == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        });
+
+        for _ in 0..24 {
+            col.compact().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        writer.join().unwrap();
+        col.flush().unwrap();
+        drop(col);
+
+        let reopened = Collection::open("test", dir.path(), config).unwrap();
+        assert_eq!(reopened.len(), 140);
+        for i in 0..20 {
+            assert!(reopened.get(&format!("seed-{i}")).unwrap().is_some());
+        }
+        for i in 0..120 {
+            assert!(reopened.get(&format!("live-{i}")).unwrap().is_some());
+        }
     }
 }

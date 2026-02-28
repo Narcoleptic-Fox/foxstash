@@ -14,6 +14,7 @@ use crate::collection::Collection;
 use crate::{DbConfig, DbError, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
@@ -35,6 +36,20 @@ pub struct VectorStore {
 }
 
 impl VectorStore {
+    fn validate_collection_name(name: &str) -> Result<()> {
+        let mut components = Path::new(name).components();
+        let valid_single_segment =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+
+        if valid_single_segment {
+            Ok(())
+        } else {
+            Err(DbError::Validation(format!(
+                "invalid collection name '{name}': must be a single path segment"
+            )))
+        }
+    }
+
     /// Open a store, recovering all existing collections from disk.
     pub fn open(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
         let base_path = path.as_ref().to_path_buf();
@@ -72,6 +87,8 @@ impl VectorStore {
     /// If the collection already exists it is returned from the registry.
     /// Otherwise a new empty collection is created on disk and registered.
     pub fn get_or_create_collection(&self, name: &str) -> Result<Arc<Collection>> {
+        Self::validate_collection_name(name)?;
+
         // Fast path: read lock.
         {
             let map = self.collections.read();
@@ -98,6 +115,8 @@ impl VectorStore {
 
     /// Create a new collection. Returns error if it already exists.
     pub fn create_collection(&self, name: &str) -> Result<Arc<Collection>> {
+        Self::validate_collection_name(name)?;
+
         let mut map = self.collections.write();
         if map.contains_key(name) {
             return Err(DbError::CollectionExists(name.to_string()));
@@ -114,6 +133,8 @@ impl VectorStore {
 
     /// Get an existing collection. Returns error if not found.
     pub fn get_collection(&self, name: &str) -> Result<Arc<Collection>> {
+        Self::validate_collection_name(name)?;
+
         let map = self.collections.read();
         map.get(name)
             .cloned()
@@ -131,6 +152,8 @@ impl VectorStore {
     /// by calling [`get_or_create_collection`] again. To permanently delete,
     /// use [`delete_collection`] or remove the directory manually after unloading.
     pub fn unload_collection(&self, name: &str) -> Result<()> {
+        Self::validate_collection_name(name)?;
+
         let mut map = self.collections.write();
         if map.remove(name).is_none() {
             return Err(DbError::CollectionNotFound(name.to_string()));
@@ -141,6 +164,8 @@ impl VectorStore {
 
     /// Permanently delete a collection: unload from registry and remove files from disk.
     pub fn delete_collection(&self, name: &str) -> Result<()> {
+        Self::validate_collection_name(name)?;
+
         {
             let mut map = self.collections.write();
             if map.remove(name).is_none() {
@@ -575,5 +600,30 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = VectorStore::open(dir.path(), cfg()).unwrap();
         assert!(store.delete_collection("nope").is_err());
+    }
+
+    #[test]
+    fn rejects_path_traversal_collection_names() {
+        let dir = TempDir::new().unwrap();
+        let store = VectorStore::open(dir.path(), cfg()).unwrap();
+
+        let invalid = [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "../outside",
+            "..\\outside",
+            "/absolute",
+        ];
+
+        for name in invalid {
+            match store.create_collection(name) {
+                Err(DbError::Validation(_)) => {}
+                Err(other) => panic!("expected Validation for name '{name}', got {other:?}"),
+                Ok(_) => panic!("expected error for invalid collection name '{name}'"),
+            }
+        }
     }
 }
