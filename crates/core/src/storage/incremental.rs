@@ -78,7 +78,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ============================================================================
 // Configuration
@@ -386,9 +389,11 @@ impl WalReader {
 
             let len = u32::from_le_bytes(len_buf) as usize;
             let mut data = vec![0u8; len];
-            self.file
-                .read_exact(&mut data)
-                .map_err(|e| RagError::StorageError(format!("WAL read failed: {}", e)))?;
+            match self.file.read_exact(&mut data) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(RagError::StorageError(format!("WAL read failed: {}", e))),
+            }
 
             let entry: WalEntry = serde_json::from_slice(&data)
                 .map_err(|e| RagError::StorageError(format!("WAL deserialize failed: {}", e)))?;
@@ -536,7 +541,7 @@ impl IncrementalStorage {
         let checkpoint_path = self
             .base_path
             .join(format!("checkpoint_{:05}.bin", checkpoint_id));
-        fs::write(&checkpoint_path, &compressed)
+        Self::write_atomic_file(&checkpoint_path, &compressed)
             .map_err(|e| RagError::StorageError(format!("Failed to write checkpoint: {}", e)))?;
 
         // Create checkpoint metadata
@@ -561,7 +566,7 @@ impl IncrementalStorage {
             .join(format!("checkpoint_{:05}.meta", checkpoint_id));
         let meta_json = serde_json::to_string_pretty(&checkpoint_meta)
             .map_err(|e| RagError::StorageError(format!("Failed to serialize meta: {}", e)))?;
-        fs::write(&meta_path, &meta_json).map_err(|e| {
+        Self::write_atomic_file(&meta_path, meta_json.as_bytes()).map_err(|e| {
             RagError::StorageError(format!("Failed to write checkpoint meta: {}", e))
         })?;
 
@@ -700,8 +705,32 @@ impl IncrementalStorage {
         let manifest_path = self.base_path.join("manifest.json");
         let json = serde_json::to_string_pretty(&self.manifest)
             .map_err(|e| RagError::StorageError(format!("Failed to serialize manifest: {}", e)))?;
-        fs::write(&manifest_path, &json)
+        Self::write_atomic_file(&manifest_path, json.as_bytes())
             .map_err(|e| RagError::StorageError(format!("Failed to write manifest: {}", e)))?;
+        Ok(())
+    }
+
+    fn atomic_tmp_path(path: &Path) -> PathBuf {
+        let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
+        let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        path.with_file_name(format!(
+            "{}.{}.{}.tmp",
+            file_name,
+            std::process::id(),
+            counter
+        ))
+    }
+
+    fn write_atomic_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        let tmp_path = Self::atomic_tmp_path(path);
+        {
+            let mut file = File::create(&tmp_path)?;
+            file.write_all(data)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, path).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
         Ok(())
     }
 
@@ -1206,5 +1235,63 @@ mod tests {
 
         assert_eq!(loaded[1].id, "d2");
         assert!(loaded[1].metadata.is_none());
+    }
+
+    #[test]
+    fn test_recovery_ignores_truncated_tail_entry() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut storage =
+                IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+            storage.log_add(&create_test_document("doc1", 4)).unwrap();
+            storage.sync().unwrap();
+        }
+
+        let wal_path = dir.path().join("wal_00000.log");
+        let torn_entry = WalEntry::new(2, WalOperation::Add(create_test_document("doc2", 4)));
+        let torn_payload = serde_json::to_vec(&torn_entry).unwrap();
+        let torn_len = torn_payload.len() as u32;
+
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&torn_len.to_le_bytes()).unwrap();
+        file.write_all(&torn_payload[..torn_payload.len() / 2])
+            .unwrap();
+        file.sync_all().unwrap();
+
+        let storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let entries = storage.get_wal_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0].operation {
+            WalOperation::Add(doc) => assert_eq!(doc.id, "doc1"),
+            _ => panic!("expected Add operation"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_writes_leave_no_tmp_files_after_repeated_checkpoints() {
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+
+        for i in 0..8 {
+            let payload = vec![format!("doc-{i}")];
+            storage
+                .checkpoint(
+                    &payload,
+                    IndexMetadata {
+                        document_count: 1,
+                        embedding_dim: 128,
+                        index_type: "hnsw".to_string(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let has_tmp = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .any(|name| name.ends_with(".tmp"));
+        assert!(!has_tmp);
     }
 }

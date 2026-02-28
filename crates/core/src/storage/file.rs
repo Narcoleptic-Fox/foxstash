@@ -53,12 +53,14 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STORAGE_VERSION: u32 = 2;
 const DATA_EXTENSION: &str = "data";
 const META_EXTENSION: &str = "meta";
 const TMP_EXTENSION: &str = "tmp";
+static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Metadata for stored items
 ///
@@ -812,7 +814,15 @@ impl FileStorage {
     /// Returns error if write or rename fails.
     fn write_atomic(&self, path: &Path, data: &[u8]) -> Result<()> {
         // Create temp file path
-        let tmp_path = path.with_extension(TMP_EXTENSION);
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("item");
+        let counter = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_file_name(format!(
+            "{}.{}.{}.{}",
+            filename,
+            std::process::id(),
+            counter,
+            TMP_EXTENSION
+        ));
 
         // Write to temp file
         {
@@ -1041,6 +1051,8 @@ impl HNSWIndexWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     fn create_test_document(id: &str) -> Document {
@@ -1168,8 +1180,46 @@ mod tests {
         assert_eq!(read_data, data);
 
         // Verify no temp files left behind
-        let tmp_path = dir.path().join("test.tmp");
-        assert!(!tmp_path.exists());
+        let has_tmp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .any(|name| name.ends_with(".tmp"));
+        assert!(!has_tmp);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_sibling_paths_do_not_cross_contaminate() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(FileStorage::new(dir.path()).unwrap());
+        let data_path = dir.path().join("doc.data");
+        let meta_path = dir.path().join("doc.meta");
+
+        for _ in 0..128 {
+            let barrier = Arc::new(Barrier::new(3));
+            let s1 = Arc::clone(&storage);
+            let b1 = Arc::clone(&barrier);
+            let data_path_1 = data_path.clone();
+            let t1 = thread::spawn(move || {
+                b1.wait();
+                s1.write_atomic(&data_path_1, b"DATA").unwrap();
+            });
+
+            let s2 = Arc::clone(&storage);
+            let b2 = Arc::clone(&barrier);
+            let meta_path_1 = meta_path.clone();
+            let t2 = thread::spawn(move || {
+                b2.wait();
+                s2.write_atomic(&meta_path_1, b"META").unwrap();
+            });
+
+            barrier.wait();
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(std::fs::read(&data_path).unwrap(), b"DATA");
+            assert_eq!(std::fs::read(&meta_path).unwrap(), b"META");
+        }
     }
 
     #[test]

@@ -1082,6 +1082,7 @@ impl HNSWIndex {
                 // mispredictions.
                 let mut batch_buf: [(f32, usize); 64] = [(0.0, 0); 64];
                 let mut batch_count = 0usize;
+                let mut overflow = Vec::new();
 
                 for (i, &neighbor_u32) in neighbors.iter().enumerate() {
                     let neighbor_id = neighbor_u32 as usize;
@@ -1115,12 +1116,14 @@ impl HNSWIndex {
                         if batch_count < batch_buf.len() {
                             batch_buf[batch_count] = (dist, neighbor_id);
                             batch_count += 1;
+                        } else {
+                            overflow.push((dist, neighbor_id));
                         }
                     }
                 }
 
                 // Phase 2: Batch heap updates from the computed distances.
-                for &(dist, neighbor_id) in &batch_buf[..batch_count] {
+                let mut consider = |dist: f32, neighbor_id: usize| {
                     let dist_ord = OrderedFloat(dist);
 
                     if ctx.best.len() < ef {
@@ -1136,6 +1139,13 @@ impl HNSWIndex {
                             }
                         }
                     }
+                };
+
+                for &(dist, neighbor_id) in &batch_buf[..batch_count] {
+                    consider(dist, neighbor_id);
+                }
+                for &(dist, neighbor_id) in &overflow {
+                    consider(dist, neighbor_id);
                 }
             }
         }
@@ -2058,6 +2068,44 @@ mod tests {
         assert_eq!(index.embedding_dim, 128);
         assert_eq!(index.len(), 0);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn search_layer_considers_neighbors_beyond_fixed_stack_batch() {
+        let mut config = HNSWConfig::default().with_m(64);
+        config.m0 = 128;
+
+        let mut index = HNSWIndex::new(2, config);
+        let total_nodes = 66usize; // node 0 + 65 neighbors
+        index.embeddings = Vec::with_capacity(total_nodes * 2);
+        index.norms = Vec::with_capacity(total_nodes);
+        index.connections = vec![vec![Vec::new()]; total_nodes];
+        index.ids = Vec::with_capacity(total_nodes);
+        index.contents = Vec::with_capacity(total_nodes);
+        index.metadata = vec![None; total_nodes];
+        index.entry_point = Some(0);
+        index.max_layer = 0;
+
+        for node in 0..total_nodes {
+            if node == 65 {
+                // Best possible match for query [1, 0].
+                index.embeddings.extend_from_slice(&[1.0, 0.0]);
+            } else {
+                // Orthogonal to query, distance is worse.
+                index.embeddings.extend_from_slice(&[0.0, 1.0]);
+            }
+            index.norms.push(1.0);
+            index.ids.push(format!("doc-{node}"));
+            index.contents.push(String::new());
+        }
+
+        index.connections[0][0] = (1..=65).map(|n| n as u32).collect();
+        let mut ctx = index.create_search_context();
+        let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, 1.0);
+        assert!(
+            candidates.contains(&65),
+            "best neighbor from position >64 should be considered"
+        );
     }
 
     #[test]
