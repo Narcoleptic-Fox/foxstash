@@ -39,10 +39,31 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
+use foxstash_core::storage::file::{FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::{Document, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::Duration;
+
+fn serialize_flat_index(index: &FlatIndex) -> Vec<u8> {
+    let wrapper = FlatIndexWrapper::from_index(index);
+    bincode::serialize(&wrapper).unwrap()
+}
+
+fn deserialize_flat_index(data: &[u8]) -> FlatIndex {
+    let wrapper: FlatIndexWrapper = bincode::deserialize(data).unwrap();
+    wrapper.to_index().unwrap()
+}
+
+fn serialize_hnsw_index(index: &HNSWIndex) -> Vec<u8> {
+    let wrapper = HNSWIndexWrapper::from_index(index);
+    serde_json::to_vec(&wrapper).unwrap()
+}
+
+fn deserialize_hnsw_index(data: &[u8]) -> HNSWIndex {
+    let wrapper: HNSWIndexWrapper = serde_json::from_slice(data).unwrap();
+    wrapper.to_index().unwrap()
+}
 
 // ============================================================================
 // Data Generation Helpers
@@ -453,7 +474,7 @@ fn benchmark_file_storage(c: &mut Criterion) {
                 b.iter_batched(
                     || tempfile::tempdir().unwrap(),
                     |temp_dir| {
-                        let serialized = bincode::serialize(black_box(index)).unwrap();
+                        let serialized = serialize_flat_index(black_box(index));
                         let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                         let path = temp_dir.path().join("flat_index.bin");
                         std::fs::write(path, compressed).unwrap();
@@ -464,7 +485,7 @@ fn benchmark_file_storage(c: &mut Criterion) {
             },
         );
 
-        let serialized = bincode::serialize(&flat_index).unwrap();
+        let serialized = serialize_flat_index(&flat_index);
         let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
 
         group.bench_with_input(
@@ -481,7 +502,7 @@ fn benchmark_file_storage(c: &mut Criterion) {
                     |(temp_dir, path)| {
                         let compressed = std::fs::read(black_box(&path)).unwrap();
                         let serialized = MockCodec::Zstd.decompress(&compressed).unwrap();
-                        let _index: FlatIndex = bincode::deserialize(&serialized).unwrap();
+                        let _index = deserialize_flat_index(&serialized);
                         temp_dir
                     },
                     criterion::BatchSize::SmallInput,
@@ -499,7 +520,7 @@ fn benchmark_file_storage(c: &mut Criterion) {
                 b.iter_batched(
                     || tempfile::tempdir().unwrap(),
                     |temp_dir| {
-                        let serialized = serde_json::to_vec(black_box(index)).unwrap();
+                        let serialized = serialize_hnsw_index(black_box(index));
                         let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                         let path = temp_dir.path().join("hnsw_index.bin");
                         std::fs::write(path, compressed).unwrap();
@@ -510,7 +531,7 @@ fn benchmark_file_storage(c: &mut Criterion) {
             },
         );
 
-        let serialized = serde_json::to_vec(&hnsw_index).unwrap();
+        let serialized = serialize_hnsw_index(&hnsw_index);
         let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
 
         group.bench_with_input(
@@ -527,7 +548,7 @@ fn benchmark_file_storage(c: &mut Criterion) {
                     |(temp_dir, path)| {
                         let compressed = std::fs::read(black_box(&path)).unwrap();
                         let serialized = MockCodec::Zstd.decompress(&compressed).unwrap();
-                        let _index: HNSWIndex = serde_json::from_slice(&serialized).unwrap();
+                        let _index = deserialize_hnsw_index(&serialized);
                         temp_dir
                     },
                     criterion::BatchSize::SmallInput,
@@ -658,7 +679,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 }
 
                 // Save index to disk
-                let serialized = bincode::serialize(&index).unwrap();
+                let serialized = serialize_flat_index(&index);
                 let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                 let path = temp_dir.path().join("index.bin");
                 std::fs::write(path, compressed).unwrap();
@@ -677,7 +698,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 // Setup: create and save index
                 let temp_dir = tempfile::tempdir().unwrap();
                 let index = data_gen::test_flat_index(1000, dim, 7000);
-                let serialized = bincode::serialize(&index).unwrap();
+                let serialized = serialize_flat_index(&index);
                 let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                 let path = temp_dir.path().join("index.bin");
                 std::fs::write(&path, compressed).unwrap();
@@ -690,7 +711,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 // Load index
                 let compressed = std::fs::read(black_box(&path)).unwrap();
                 let serialized = MockCodec::Zstd.decompress(&compressed).unwrap();
-                let index: FlatIndex = bincode::deserialize(&serialized).unwrap();
+                let index = deserialize_flat_index(&serialized);
 
                 // Perform search
                 let _results = index.search(black_box(&query), 10).unwrap();
@@ -709,7 +730,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 // Setup: create and save initial index
                 let temp_dir = tempfile::tempdir().unwrap();
                 let index = data_gen::test_flat_index(100, dim, 8000);
-                let serialized = bincode::serialize(&index).unwrap();
+                let serialized = serialize_flat_index(&index);
                 let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                 let path = temp_dir.path().join("index.bin");
                 std::fs::write(&path, compressed).unwrap();
@@ -731,7 +752,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 // Load index
                 let compressed = std::fs::read(black_box(&path)).unwrap();
                 let serialized = MockCodec::Zstd.decompress(&compressed).unwrap();
-                let mut index: FlatIndex = bincode::deserialize(&serialized).unwrap();
+                let mut index = deserialize_flat_index(&serialized);
 
                 // Add new documents
                 for doc in black_box(new_docs) {
@@ -739,7 +760,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 }
 
                 // Save updated index
-                let serialized = bincode::serialize(&index).unwrap();
+                let serialized = serialize_flat_index(&index);
                 let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                 std::fs::write(black_box(&path), compressed).unwrap();
 
@@ -760,7 +781,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
             },
             |(temp_dir, index)| {
                 // Save index
-                let serialized = serde_json::to_vec(&index).unwrap();
+                let serialized = serialize_hnsw_index(&index);
                 let compressed = MockCodec::Zstd.compress(&serialized).unwrap();
                 let path = temp_dir.path().join("hnsw_index.bin");
                 std::fs::write(&path, compressed).unwrap();
@@ -768,7 +789,7 @@ fn benchmark_realistic_workloads(c: &mut Criterion) {
                 // Load it back
                 let compressed = std::fs::read(black_box(&path)).unwrap();
                 let serialized = MockCodec::Zstd.decompress(&compressed).unwrap();
-                let _loaded_index: HNSWIndex = serde_json::from_slice(&serialized).unwrap();
+                let _loaded_index = deserialize_hnsw_index(&serialized);
 
                 temp_dir
             },
