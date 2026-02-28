@@ -421,9 +421,30 @@ impl IndexedDBStore {
         // Setup upgrade handler
         let store_name = self.store_name.clone();
         let onupgradeneeded = Closure::once(move |event: IdbVersionChangeEvent| {
-            let target = event.target().unwrap();
-            let request: IdbOpenDbRequest = target.dyn_into().unwrap();
-            let db = request.result().unwrap().dyn_into::<IdbDatabase>().unwrap();
+            let Some(target) = event.target() else {
+                web_sys::console::error_1(&JsValue::from_str(
+                    "IndexedDB upgrade event did not provide a target",
+                ));
+                return;
+            };
+            let Ok(request) = target.dyn_into::<IdbOpenDbRequest>() else {
+                web_sys::console::error_1(&JsValue::from_str(
+                    "IndexedDB upgrade target was not an open request",
+                ));
+                return;
+            };
+            let Ok(db_value) = request.result() else {
+                web_sys::console::error_1(&JsValue::from_str(
+                    "IndexedDB upgrade request had no result",
+                ));
+                return;
+            };
+            let Ok(db) = db_value.dyn_into::<IdbDatabase>() else {
+                web_sys::console::error_1(&JsValue::from_str(
+                    "IndexedDB upgrade result could not be cast to IdbDatabase",
+                ));
+                return;
+            };
 
             // Create object store if it doesn't exist
             if !db.object_store_names().contains(&store_name) {
@@ -447,11 +468,11 @@ impl IndexedDBStore {
     async fn wait_for_transaction(transaction: &IdbTransaction) -> Result<(), JsValue> {
         let promise = js_sys::Promise::new(&mut |resolve, reject| {
             let oncomplete = Closure::once(move || {
-                resolve.call0(&JsValue::NULL).unwrap();
+                let _ = resolve.call0(&JsValue::NULL);
             });
 
             let onerror = Closure::once(move || {
-                reject.call0(&JsValue::NULL).unwrap();
+                let _ = reject.call0(&JsValue::NULL);
             });
 
             transaction.set_oncomplete(Some(oncomplete.as_ref().unchecked_ref()));
@@ -617,17 +638,30 @@ pub fn deserialize_hnsw_index(
     use foxstash_core::index::HNSWConfig;
     use foxstash_core::Document;
 
-    let config = HNSWConfig {
-        m: data.config.m,
-        m0: data.config.m0,
-        ef_construction: data.config.ef_construction,
-        ef_search: data.config.ef_search,
-        ml: data.config.ml,
-        use_heuristic: data.config.use_heuristic,
-        extend_candidates: data.config.extend_candidates,
-        keep_pruned_connections: data.config.keep_pruned_connections,
-        ..HNSWConfig::default()
-    };
+    if data.config.m == 0 || data.config.m > 127 {
+        return Err(format!(
+            "invalid HNSW config: m must be in 1..=127, got {}",
+            data.config.m
+        ));
+    }
+    if data.config.ef_construction == 0 {
+        return Err("invalid HNSW config: ef_construction must be > 0".to_string());
+    }
+    if data.config.ef_search == 0 {
+        return Err("invalid HNSW config: ef_search must be > 0".to_string());
+    }
+
+    let mut config = HNSWConfig::default()
+        .with_m(data.config.m)
+        .with_ef_construction(data.config.ef_construction)
+        .with_ef_search(data.config.ef_search);
+    if !data.config.use_heuristic {
+        config = config.with_simple_selection();
+    }
+    if data.config.extend_candidates {
+        config = config.with_extended_candidates();
+    }
+    config.keep_pruned_connections = data.config.keep_pruned_connections;
 
     let mut index = foxstash_core::index::HNSWIndex::new(data.embedding_dim, config);
 
@@ -704,6 +738,60 @@ mod tests {
             }
             _ => panic!("Expected Flat index"),
         }
+    }
+
+    #[test]
+    fn deserialize_hnsw_rejects_invalid_m() {
+        let bad = SerializedHNSWIndex {
+            embedding_dim: 3,
+            config: SerializedHNSWConfig {
+                m: 999,
+                m0: 1998,
+                ef_construction: 100,
+                ef_search: 100,
+                ml: 1.0,
+                use_heuristic: true,
+                extend_candidates: false,
+                keep_pruned_connections: true,
+            },
+            nodes: vec![],
+            entry_point: None,
+            max_layer: 0,
+        };
+
+        match deserialize_hnsw_index(bad) {
+            Err(err) => assert!(err.contains("m must be in 1..=127")),
+            Ok(_) => panic!("expected invalid HNSW config to return an error"),
+        }
+    }
+
+    #[test]
+    fn deserialize_hnsw_accepts_valid_config() {
+        let ok = SerializedHNSWIndex {
+            embedding_dim: 3,
+            config: SerializedHNSWConfig {
+                m: 16,
+                m0: 32,
+                ef_construction: 100,
+                ef_search: 64,
+                ml: 1.0,
+                use_heuristic: true,
+                extend_candidates: false,
+                keep_pruned_connections: true,
+            },
+            nodes: vec![SerializedHNSWNode {
+                id: "doc1".to_string(),
+                content: "hello".to_string(),
+                embedding: vec![1.0, 0.0, 0.0],
+                metadata: None,
+                connections: vec![],
+            }],
+            entry_point: None,
+            max_layer: 0,
+        };
+
+        let index = deserialize_hnsw_index(ok).unwrap();
+        assert_eq!(index.len(), 1);
     }
 
     #[test]
