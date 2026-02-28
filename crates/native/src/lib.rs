@@ -57,11 +57,12 @@ use foxstash_core::index::{FlatIndex, HNSWIndex};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::{Document, SearchResult as CoreSearchResult};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 // =============================================================================
 // Thread-local Error Storage
@@ -69,6 +70,11 @@ use std::sync::{Mutex, RwLock};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+fn results_allocations() -> &'static Mutex<HashMap<usize, usize>> {
+    static RESULTS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    RESULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Set the last error message for this thread
@@ -493,6 +499,9 @@ pub extern "C" fn rag_search(
         }
 
         unsafe {
+            *results_out = ptr::null_mut();
+            *count_out = 0;
+
             let handle = &*handle;
 
             // Validate query dimension
@@ -549,6 +558,20 @@ pub extern "C" fn rag_search(
                 ptr::null_mut()
             };
 
+            if !results_ptr.is_null() {
+                match results_allocations().lock() {
+                    Ok(mut allocations) => {
+                        allocations.insert(results_ptr as usize, count);
+                    }
+                    Err(_) => {
+                        set_last_error("Results allocation tracker lock poisoned".to_string());
+                        let boxed_ptr = std::ptr::slice_from_raw_parts_mut(results_ptr, count);
+                        let _ = Box::from_raw(boxed_ptr);
+                        return -1;
+                    }
+                }
+            }
+
             *results_out = results_ptr;
             *count_out = count;
 
@@ -569,7 +592,7 @@ pub extern "C" fn rag_search(
 ///
 /// # Arguments
 /// * `results` - Results array to free
-/// * `count` - Number of results in array
+/// * `count` - Number of results in array (ignored; kept for ABI compatibility)
 ///
 /// # Safety
 /// * `results` must be from `rag_search()`
@@ -586,18 +609,27 @@ pub extern "C" fn rag_search(
 /// rag_free_results(results, count);
 /// ```
 #[no_mangle]
-pub extern "C" fn rag_free_results(results: *mut SearchResult, count: usize) {
-    if results.is_null() || count == 0 {
+pub extern "C" fn rag_free_results(results: *mut SearchResult, _count: usize) {
+    if results.is_null() {
         return;
     }
 
     let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+        let actual_count = match results_allocations().lock() {
+            Ok(mut allocations) => match allocations.remove(&(results as usize)) {
+                Some(saved) => saved,
+                None => return,
+            },
+            Err(_) => return,
+        };
+
         unsafe {
             // Reconstruct the boxed slice
-            let results_slice = Vec::from_raw_parts(results, count, count);
+            let boxed_ptr = std::ptr::slice_from_raw_parts_mut(results, actual_count);
+            let results_slice = Box::from_raw(boxed_ptr);
 
             // Free each result's strings
-            for result in results_slice {
+            for result in results_slice.iter() {
                 if !result.id.is_null() {
                     let _ = CString::from_raw(result.id);
                 }
@@ -1019,7 +1051,7 @@ mod tests {
 
         let id = CString::new("doc1").unwrap();
         let content = CString::new("Test document").unwrap();
-        let embedding = vec![0.1f32, 0.2, 0.3];
+        let embedding = [0.1f32, 0.2, 0.3];
 
         let ret = rag_add_document(
             handle,
@@ -1042,7 +1074,7 @@ mod tests {
 
         let id = CString::new("doc1").unwrap();
         let content = CString::new("Test").unwrap();
-        let embedding = vec![0.1f32, 0.2]; // Wrong dimension
+        let embedding = [0.1f32, 0.2]; // Wrong dimension
 
         let ret = rag_add_document(
             handle,
@@ -1087,7 +1119,7 @@ mod tests {
         }
 
         // Search
-        let query = vec![1.0f32, 0.0, 0.0];
+        let query = [1.0f32, 0.0, 0.0];
         let mut results: *mut SearchResult = ptr::null_mut();
         let mut count: usize = 0;
 
@@ -1124,7 +1156,7 @@ mod tests {
         let handle = rag_create(3, 0);
         assert!(!handle.is_null());
 
-        let query = vec![1.0f32, 0.0, 0.0];
+        let query = [1.0f32, 0.0, 0.0];
         let mut results: *mut SearchResult = ptr::null_mut();
         let mut count: usize = 0;
 
@@ -1143,6 +1175,31 @@ mod tests {
         rag_destroy(handle);
     }
 
+    #[test]
+    fn test_search_error_initializes_outputs() {
+        let handle = rag_create(3, 0);
+        assert!(!handle.is_null());
+
+        let query = [1.0f32, 0.0]; // wrong dimension
+        let mut results: *mut SearchResult = std::ptr::dangling_mut::<SearchResult>();
+        let mut count: usize = usize::MAX;
+
+        let ret = rag_search(
+            handle,
+            query.as_ptr(),
+            query.len(),
+            5,
+            &mut results,
+            &mut count,
+        );
+
+        assert_eq!(ret, -1);
+        assert!(results.is_null());
+        assert_eq!(count, 0);
+
+        rag_destroy(handle);
+    }
+
     /// Verify `rag_search` accepts `*const RagHandle` (shared/read-only access).
     #[test]
     fn test_search_accepts_const_handle() {
@@ -1152,7 +1209,7 @@ mod tests {
         // Add a document via the mutable handle
         let id = CString::new("doc1").unwrap();
         let content = CString::new("Test document").unwrap();
-        let embedding = vec![1.0f32, 0.0, 0.0];
+        let embedding = [1.0f32, 0.0, 0.0];
 
         let ret = rag_add_document(
             handle,
@@ -1166,7 +1223,7 @@ mod tests {
         // Cast to *const to prove search works through a shared pointer
         let const_handle: *const RagHandle = handle;
 
-        let query = vec![1.0f32, 0.0, 0.0];
+        let query = [1.0f32, 0.0, 0.0];
         let mut results: *mut SearchResult = ptr::null_mut();
         let mut count: usize = 0;
 
@@ -1201,7 +1258,7 @@ mod tests {
         // Add document
         let id = CString::new("doc1").unwrap();
         let content = CString::new("Test").unwrap();
-        let embedding = vec![0.1f32, 0.2, 0.3];
+        let embedding = [0.1f32, 0.2, 0.3];
 
         rag_add_document(
             handle,
@@ -1232,7 +1289,7 @@ mod tests {
 
         assert_eq!(rag_clear(ptr::null_mut()), -1);
 
-        let query = vec![1.0f32];
+        let query = [1.0f32];
         let mut results: *mut SearchResult = ptr::null_mut();
         let mut count: usize = 0;
 
@@ -1252,6 +1309,48 @@ mod tests {
     }
 
     #[test]
+    fn test_free_results_ignores_incorrect_count() {
+        let handle = rag_create(3, 0);
+        assert!(!handle.is_null());
+
+        let id = CString::new("doc1").unwrap();
+        let content = CString::new("Test document").unwrap();
+        let embedding = [1.0f32, 0.0, 0.0];
+        assert_eq!(
+            rag_add_document(
+                handle,
+                id.as_ptr(),
+                content.as_ptr(),
+                embedding.as_ptr(),
+                embedding.len(),
+            ),
+            0
+        );
+
+        let query = [1.0f32, 0.0, 0.0];
+        let mut results: *mut SearchResult = ptr::null_mut();
+        let mut count: usize = 0;
+        assert_eq!(
+            rag_search(
+                handle,
+                query.as_ptr(),
+                query.len(),
+                1,
+                &mut results,
+                &mut count,
+            ),
+            0
+        );
+        assert_eq!(count, 1);
+        assert!(!results.is_null());
+
+        // Wrong count should not cause UB or crash.
+        rag_free_results(results, count + 10);
+
+        rag_destroy(handle);
+    }
+
+    #[test]
     fn test_persistence_flat() {
         use tempfile::tempdir;
 
@@ -1265,7 +1364,7 @@ mod tests {
 
         let id = CString::new("doc1").unwrap();
         let content = CString::new("Test").unwrap();
-        let embedding = vec![0.1f32, 0.2, 0.3];
+        let embedding = [0.1f32, 0.2, 0.3];
 
         rag_add_document(
             handle,
@@ -1302,7 +1401,7 @@ mod tests {
 
         let id = CString::new("doc1").unwrap();
         let content = CString::new("Test").unwrap();
-        let embedding = vec![0.1f32, 0.2, 0.3];
+        let embedding = [0.1f32, 0.2, 0.3];
 
         rag_add_document(
             handle,

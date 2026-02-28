@@ -623,7 +623,12 @@ impl LocalRAG {
     /// rag.set_hybrid_config(0.6, 0.4, false);
     /// ```
     #[wasm_bindgen]
-    pub fn set_hybrid_config(&mut self, vector_weight: f32, keyword_weight: f32, use_rrf: bool) {
+    pub fn set_hybrid_config(
+        &mut self,
+        vector_weight: f32,
+        keyword_weight: f32,
+        use_rrf: bool,
+    ) -> Result<(), JsValue> {
         let strategy = if use_rrf {
             MergeStrategy::Rrf
         } else {
@@ -631,8 +636,10 @@ impl LocalRAG {
         };
 
         self.hybrid_config = HybridConfig::default()
-            .with_weights(vector_weight, keyword_weight)
+            .try_with_weights(vector_weight, keyword_weight)
+            .map_err(|e| JsValue::from_str(&e))?
             .with_strategy(strategy);
+        Ok(())
     }
 
     /// Remove a document from the index by ID
@@ -1380,6 +1387,22 @@ mod native_tests {
             config.merge_strategy(),
             MergeStrategy::WeightedSum
         ));
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn set_hybrid_config_rejects_invalid_weights() {
+        let mut rag = LocalRAG::new(3, false);
+        let err = rag.set_hybrid_config(f32::NAN, 0.5, true).unwrap_err();
+        let msg = err.as_string().unwrap_or_default();
+        assert!(msg.contains("vector_weight"));
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn set_hybrid_config_accepts_valid_weights() {
+        let mut rag = LocalRAG::new(3, false);
+        rag.set_hybrid_config(0.2, 0.8, false).unwrap();
     }
 
     #[test]
