@@ -3,6 +3,7 @@
 # and extract it to demo/pkg/ so the static site can serve it.
 #
 # Requires: curl, python3 (standard on Vercel build images and most Linux systems).
+# Optional: set GITHUB_TOKEN to avoid the 60 req/hr anonymous rate limit.
 
 set -euo pipefail
 
@@ -13,14 +14,29 @@ API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Build curl auth header if a token is available.
+AUTH_HEADER=""
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  AUTH_HEADER="Authorization: Bearer ${GITHUB_TOKEN}"
+fi
+
 echo "Fetching latest release metadata from ${API_URL}..."
-RELEASE_JSON=$(curl -fsSL "$API_URL")
+if [[ -n "$AUTH_HEADER" ]]; then
+  RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" -H "$AUTH_HEADER" "$API_URL")
+else
+  RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github+json" "$API_URL")
+fi
 
-# Extract the browser_download_url for the WASM tarball using python3 (always available).
-WASM_URL=$(python3 - <<'EOF'
-import sys, json
+# Pass the JSON via env var so the heredoc can supply the Python source via stdin
+# without conflicting with sys.stdin.read().
+WASM_URL=$(RELEASE_DATA="$RELEASE_JSON" python3 - <<'PYEOF'
+import os, json, sys
 
-data = json.loads(sys.stdin.read())
+try:
+    data = json.loads(os.environ["RELEASE_DATA"])
+except json.JSONDecodeError as e:
+    sys.exit(f"Failed to parse GitHub API response: {e}\nResponse was: {os.environ['RELEASE_DATA'][:200]}")
+
 assets = data.get("assets", [])
 asset = next(
     (a for a in assets
@@ -29,10 +45,11 @@ asset = next(
 )
 if not asset:
     names = [a["name"] for a in assets]
-    raise SystemExit(f"No WASM .tar.gz asset found in latest release. Available: {names}")
+    sys.exit(f"No WASM .tar.gz asset found in latest release. Available assets: {names}")
+
 print(asset["browser_download_url"])
-EOF
-<<< "$RELEASE_JSON")
+PYEOF
+)
 
 echo "Downloading ${WASM_URL}..."
 curl -fsSL "$WASM_URL" | tar -xz -C "$DEMO_DIR"
