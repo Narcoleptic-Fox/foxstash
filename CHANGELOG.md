@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-01
+
+### Added
+
+- **Parallel batch search** (`Collection::search_batch`): search multiple queries concurrently via rayon with an optional metadata filter, mirroring the single-query `search(query, k, filter)` signature. Uses thread-local pooled `SearchContext`s to minimise allocation overhead. Filtered paths apply the same progressive over-fetch semantics (`2×`, `4×`, `8×`, full scan) as single-query filtered search.
+- **Reusable search context** (`Collection::create_search_context`, `Collection::search_with_context`): allocate a `SearchContext` once and reuse it across repeated single-query searches in tight loops, reducing per-query allocation overhead.
+
+### Changed
+
+- SIMD kernels migrated to pulp 0.22 idiomatic API. Manual `while`-loop + `f32s_partial_load`/`cast_lossy` workarounds replaced with `S::as_simd_f32s()` (proper chunk/tail splitting). All renamed intrinsics updated (`f32s_splat` → `splat_f32s`, `f32s_mul_add_e` → `mul_add_e_f32s`, etc.).
+
+### Fixed
+
+- Collection name validation now rejects backslash (`\`) on all platforms. Previously `\` was accepted on Linux because it is a valid filename character there, while being rejected on Windows as a path separator.
+
+### Dependencies
+
+- `pulp` updated from `0.18` to `0.22`
+- `tokenizers` updated from `0.19` to `0.22`
+- `lru` updated from `0.12` to `0.16`
+- `ndarray` updated from `0.15` to `0.17`
+
 ## [0.4.1] - 2026-03-01
 
 ### Fixed
@@ -60,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ONNX embedding support available but may have platform-specific limitations on Windows
 - WASM support is experimental
 
-[Unreleased]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.0...v0.4.1
 [0.1.0]: https://github.com/Narcoleptic-Fox/foxstash/releases/tag/v0.1.0
