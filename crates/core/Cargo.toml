@@ -25,7 +25,7 @@ rayon = "1.10"
 parking_lot = "0.12"
 
 # SIMD dependencies
-pulp = "0.18"
+pulp = "0.22"
 
 # Compression dependencies
 flate2 = "1.0"
