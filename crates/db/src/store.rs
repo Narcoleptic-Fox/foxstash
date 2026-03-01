@@ -37,6 +37,14 @@ pub struct VectorStore {
 
 impl VectorStore {
     fn validate_collection_name(name: &str) -> Result<()> {
+        // Reject backslash explicitly: on Linux it is a valid filename character
+        // so the Path-based component check below would miss it on non-Windows.
+        if name.contains('\\') {
+            return Err(DbError::Validation(format!(
+                "invalid collection name '{name}': must be a single path segment"
+            )));
+        }
+
         let mut components = Path::new(name).components();
         let valid_single_segment =
             matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
