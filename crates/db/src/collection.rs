@@ -1644,9 +1644,7 @@ mod tests {
             vec![0.0, 0.0, 1.0],
         ];
 
-        let batch = col
-            .search_batch(&queries, 3, Some(&filter))
-            .unwrap();
+        let batch = col.search_batch(&queries, 3, Some(&filter)).unwrap();
         assert_eq!(batch.len(), queries.len());
 
         for (query, batch_results) in queries.iter().zip(batch.iter()) {
