@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-foxstash-core = "0.3"
+foxstash-core = "0.5"
 ```
 
 ### Basic Usage
@@ -191,7 +191,7 @@ Enable the `onnx` feature:
 
 ```toml
 [dependencies]
-foxstash-core = { version = "0.3", features = ["onnx"] }
+foxstash-core = { version = "0.5", features = ["onnx"] }
 ```
 
 ```rust
@@ -212,7 +212,7 @@ For production use, `foxstash-db` provides a high-level document store with name
 
 ```toml
 [dependencies]
-foxstash-db = "0.3"
+foxstash-db = "0.5"
 ```
 
 ### VectorStore and Collections
@@ -311,8 +311,11 @@ store.flush_all()?;
 | `delete(id)` | Tombstone a document by ID |
 | `get(id)` | Retrieve a document by ID |
 | `search(query, k, filter)` | Vector similarity search with optional metadata filter |
+| `search_batch(queries, k, filter)` | Parallel vector search for multiple queries via rayon |
 | `search_text(query, k, filter)` | BM25 keyword search with optional metadata filter |
 | `search_hybrid(query, text, k, filter, config)` | Hybrid vector + BM25 search |
+| `create_search_context()` | Allocate a reusable `SearchContext` for tight query loops |
+| `search_with_context(query, k, ctx)` | Vector search reusing a caller-managed context |
 | `flush()` | Flush WAL to disk |
 | `compact()` | Remove tombstoned entries and rebuild index |
 
