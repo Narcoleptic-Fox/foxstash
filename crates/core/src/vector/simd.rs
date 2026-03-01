@@ -206,36 +206,23 @@ impl pulp::WithSimd for FusedCosineDistance<'_> {
         let a = self.a;
         let b = self.b;
         let norm_b = self.norm_b;
-        let n = a.len();
+        let (a_chunks, a_tail) = S::as_simd_f32s(a);
+        let (b_chunks, b_tail) = S::as_simd_f32s(b);
 
-        let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
-        let simd_end = n - n % lane_count;
-
-        let mut dot_acc = simd.f32s_splat(0.0);
-        let mut norm_a_acc = simd.f32s_splat(0.0);
-
-        let mut i = 0;
-        while i < simd_end {
-            // f32s_partial_load is safe to use for full-width loads here: pulp's
-            // AVX2 impl uses _mm256_maskload_epi32 with a mask indexed by
-            // slice.len().min(lane_count), which saturates to the all-ones mask
-            // when slice.len() >= lane_count — equivalent to a full VMOVUPS load.
-            let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
-            let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
-
-            dot_acc = simd.f32s_mul_add_e(a_vec, b_vec, dot_acc);
-            norm_a_acc = simd.f32s_mul_add_e(a_vec, a_vec, norm_a_acc);
-
-            i += lane_count;
+        let mut dot_acc = simd.splat_f32s(0.0);
+        let mut norm_a_acc = simd.splat_f32s(0.0);
+        for (&a_vec, &b_vec) in a_chunks.iter().zip(b_chunks.iter()) {
+            dot_acc = simd.mul_add_e_f32s(a_vec, b_vec, dot_acc);
+            norm_a_acc = simd.mul_add_e_f32s(a_vec, a_vec, norm_a_acc);
         }
 
-        let mut dot = simd.f32s_reduce_sum(dot_acc);
-        let mut norm_a_sq = simd.f32s_reduce_sum(norm_a_acc);
+        let mut dot = simd.reduce_sum_f32s(dot_acc);
+        let mut norm_a_sq = simd.reduce_sum_f32s(norm_a_acc);
 
-        // Remainder
-        for i in simd_end..n {
-            dot += a[i] * b[i];
-            norm_a_sq += a[i] * a[i];
+        debug_assert_eq!(a_tail.len(), b_tail.len());
+        for (&a_scalar, &b_scalar) in a_tail.iter().zip(b_tail.iter()) {
+            dot += a_scalar * b_scalar;
+            norm_a_sq += a_scalar * a_scalar;
         }
 
         let norm_a = norm_a_sq.sqrt();
@@ -266,37 +253,18 @@ fn dot_product_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
         fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
             let a = self.a;
             let b = self.b;
-            let n = a.len();
+            let (a_chunks, a_tail) = S::as_simd_f32s(a);
+            let (b_chunks, b_tail) = S::as_simd_f32s(b);
 
-            // SIMD lane count (4 for SSE/NEON, 8 for AVX2)
-            let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
-
-            // Number of full SIMD chunks
-            let simd_end = n - n % lane_count;
-
-            // Process SIMD chunks
-            let mut sum = simd.f32s_splat(0.0);
-
-            let mut i = 0;
-            while i < simd_end {
-                // f32s_partial_load with slice.len() >= lane_count saturates the
-                // mask to all-ones, making this a full-width unmasked SIMD load.
-                // See FusedCosineDistance::with_simd for detailed explanation.
-                let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
-                let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
-
-                // Multiply and accumulate
-                sum = simd.f32s_mul_add_e(a_vec, b_vec, sum);
-
-                i += lane_count;
+            let mut sum = simd.splat_f32s(0.0);
+            for (&a_vec, &b_vec) in a_chunks.iter().zip(b_chunks.iter()) {
+                sum = simd.mul_add_e_f32s(a_vec, b_vec, sum);
             }
 
-            // Horizontal sum of SIMD accumulator
-            let mut result = simd.f32s_reduce_sum(sum);
-
-            // Handle remainder elements
-            for i in simd_end..n {
-                result += a[i] * b[i];
+            let mut result = simd.reduce_sum_f32s(sum);
+            debug_assert_eq!(a_tail.len(), b_tail.len());
+            for (&a_scalar, &b_scalar) in a_tail.iter().zip(b_tail.iter()) {
+                result += a_scalar * b_scalar;
             }
 
             result
@@ -321,35 +289,19 @@ fn l2_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
         fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
             let a = self.a;
             let b = self.b;
-            let n = a.len();
+            let (a_chunks, a_tail) = S::as_simd_f32s(a);
+            let (b_chunks, b_tail) = S::as_simd_f32s(b);
 
-            let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
-            let simd_end = n - n % lane_count;
-
-            let mut sum_squares = simd.f32s_splat(0.0);
-
-            let mut i = 0;
-            while i < simd_end {
-                // f32s_partial_load with slice.len() >= lane_count saturates the
-                // mask to all-ones, making this a full-width unmasked SIMD load.
-                // See FusedCosineDistance::with_simd for detailed explanation.
-                let a_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&a[i..]));
-                let b_vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&b[i..]));
-
-                // Compute difference
-                let diff = simd.f32s_sub(a_vec, b_vec);
-
-                // Multiply and accumulate: diff^2
-                sum_squares = simd.f32s_mul_add_e(diff, diff, sum_squares);
-
-                i += lane_count;
+            let mut sum_squares = simd.splat_f32s(0.0);
+            for (&a_vec, &b_vec) in a_chunks.iter().zip(b_chunks.iter()) {
+                let diff = simd.sub_f32s(a_vec, b_vec);
+                sum_squares = simd.mul_add_e_f32s(diff, diff, sum_squares);
             }
 
-            let mut result = simd.f32s_reduce_sum(sum_squares);
-
-            // Handle remainder
-            for i in simd_end..n {
-                let diff = a[i] - b[i];
+            let mut result = simd.reduce_sum_f32s(sum_squares);
+            debug_assert_eq!(a_tail.len(), b_tail.len());
+            for (&a_scalar, &b_scalar) in a_tail.iter().zip(b_tail.iter()) {
+                let diff = a_scalar - b_scalar;
                 result += diff * diff;
             }
 
@@ -371,27 +323,17 @@ impl pulp::WithSimd for Magnitude<'_> {
     #[inline(always)]
     fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
         let vector = self.vector;
-        let n = vector.len();
+        let (chunks, tail) = S::as_simd_f32s(vector);
 
-        let lane_count = std::mem::size_of::<S::f32s>() / std::mem::size_of::<f32>();
-        let simd_end = n - n % lane_count;
-
-        let mut sum_squares = simd.f32s_splat(0.0);
-
-        let mut i = 0;
-        while i < simd_end {
-            // f32s_partial_load with slice.len() >= lane_count saturates the
-            // mask to all-ones, making this a full-width unmasked SIMD load.
-            // See FusedCosineDistance::with_simd for detailed explanation.
-            let vec = pulp::cast_lossy::<_, S::f32s>(simd.f32s_partial_load(&vector[i..]));
-            sum_squares = simd.f32s_mul_add_e(vec, vec, sum_squares);
-            i += lane_count;
+        let mut sum_squares = simd.splat_f32s(0.0);
+        for &vector_chunk in chunks {
+            sum_squares = simd.mul_add_e_f32s(vector_chunk, vector_chunk, sum_squares);
         }
 
-        let mut result = simd.f32s_reduce_sum(sum_squares);
+        let mut result = simd.reduce_sum_f32s(sum_squares);
 
-        for i in simd_end..n {
-            result += vector[i] * vector[i];
+        for &value in tail {
+            result += value * value;
         }
 
         result.sqrt()
@@ -473,6 +415,24 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_product_simd_misaligned_subslice_regression() {
+        let size = 257;
+        let a_storage: Vec<f32> = (0..(size + 3))
+            .map(|i| ((i as f32) - 90.0) * 0.03125)
+            .collect();
+        let b_storage: Vec<f32> = (0..(size + 4))
+            .map(|i| ((size + 4 - i) as f32 - 120.0) * 0.0625)
+            .collect();
+
+        let a = &a_storage[1..(1 + size)];
+        let b = &b_storage[2..(2 + size)];
+
+        let simd_result = dot_product_simd(a, b);
+        let scalar_result = dot_product(a, b).unwrap();
+        assert!((simd_result - scalar_result).abs() < 1e-4);
+    }
+
+    #[test]
     fn test_l2_distance_simd_basic() {
         let a = vec![0.0, 0.0];
         let b = vec![3.0, 4.0];
@@ -519,6 +479,24 @@ mod tests {
                 scalar_result
             );
         }
+    }
+
+    #[test]
+    fn test_l2_distance_simd_misaligned_subslice_regression() {
+        let size = 257;
+        let a_storage: Vec<f32> = (0..(size + 3))
+            .map(|i| ((i as f32) - 30.0) * 0.125)
+            .collect();
+        let b_storage: Vec<f32> = (0..(size + 4))
+            .map(|i| ((i as f32) - 170.0) * -0.09375)
+            .collect();
+
+        let a = &a_storage[1..(1 + size)];
+        let b = &b_storage[2..(2 + size)];
+
+        let simd_result = l2_distance_simd(a, b);
+        let scalar_result = l2_distance(a, b).unwrap();
+        assert!((simd_result - scalar_result).abs() < 1e-4);
     }
 
     #[test]
@@ -584,6 +562,24 @@ mod tests {
                 scalar_result
             );
         }
+    }
+
+    #[test]
+    fn test_cosine_similarity_simd_misaligned_subslice_regression() {
+        let size = 257;
+        let a_storage: Vec<f32> = (0..(size + 3))
+            .map(|i| (((i as f32) % 17.0) - 8.0) * 0.37)
+            .collect();
+        let b_storage: Vec<f32> = (0..(size + 4))
+            .map(|i| (((i as f32) % 19.0) - 9.0) * -0.29)
+            .collect();
+
+        let a = &a_storage[1..(1 + size)];
+        let b = &b_storage[2..(2 + size)];
+
+        let simd_result = cosine_similarity_simd(a, b);
+        let scalar_result = cosine_similarity(a, b).unwrap();
+        assert!((simd_result - scalar_result).abs() < 1e-4);
     }
 
     #[test]
@@ -662,6 +658,25 @@ mod tests {
                 new_dist
             );
         }
+    }
+
+    #[test]
+    fn test_cosine_distance_prenorm_misaligned_subslice_regression() {
+        let size = 257;
+        let a_storage: Vec<f32> = (0..(size + 3))
+            .map(|i| (((i as f32) % 13.0) - 6.0) * 0.41)
+            .collect();
+        let b_storage: Vec<f32> = (0..(size + 4))
+            .map(|i| (((i as f32) % 11.0) - 5.0) * -0.23)
+            .collect();
+
+        let a = &a_storage[1..(1 + size)];
+        let b = &b_storage[2..(2 + size)];
+        let norm_b = norm_simd(b);
+
+        let simd_result = cosine_distance_prenorm(a, b, norm_b);
+        let scalar_result = 1.0 - cosine_similarity(a, b).unwrap();
+        assert!((simd_result - scalar_result).abs() < 1e-4);
     }
 
     #[test]
