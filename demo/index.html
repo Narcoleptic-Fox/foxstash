@@ -5,39 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Foxstash - Vector Search Demo</title>
     <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-        
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
         :root {
-            --deep-teal: #065465;
+            --deep-teal: #0e8fa6;
             --silver: #C0C0C0;
-            --lilac: #C8A2C8;
             --rust: #B7410E;
             --terracotta: #E2725B;
             --slate-950: #0f172a;
         }
-        
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: var(--slate-950);
             color: var(--silver);
             min-height: 100vh;
             padding: 2rem;
         }
-        
-        .container {
-            max-width: 900px;
-            margin: 0 auto;
-        }
-        
-        header {
-            text-align: center;
-            margin-bottom: 2rem;
-        }
-        
+
+        .container { max-width: 900px; margin: 0 auto; }
+
+        header { text-align: center; margin-bottom: 2rem; }
+
         h1 {
             font-size: 2.5rem;
             margin-bottom: 0.5rem;
@@ -46,12 +35,9 @@
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
-        
-        .subtitle {
-            color: var(--silver);
-            font-size: 1.1rem;
-        }
-        
+
+        .subtitle { color: var(--silver); font-size: 1.1rem; }
+
         .badges {
             margin-top: 1rem;
             display: flex;
@@ -59,7 +45,7 @@
             justify-content: center;
             flex-wrap: wrap;
         }
-        
+
         .badge {
             background: #374151;
             padding: 0.25rem 0.75rem;
@@ -67,52 +53,38 @@
             font-size: 0.8rem;
             color: #d1d5db;
         }
-        
+
         .card {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
             border-radius: 1rem;
             padding: 1.5rem;
             margin-bottom: 1.5rem;
         }
-        
-        .card h2 {
-            font-size: 1.25rem;
-            margin-bottom: 1rem;
-            color: var(--deep-teal);
-        }
-        
-        .input-group {
-            margin-bottom: 1rem;
-        }
-        
-        label {
-            display: block;
-            margin-bottom: 0.5rem;
-            color: #9ca3af;
-            font-size: 0.9rem;
-        }
-        
+
+        .card h2 { font-size: 1.25rem; margin-bottom: 1rem; color: var(--deep-teal); }
+
+        .input-group { margin-bottom: 1rem; }
+
+        label { display: block; margin-bottom: 0.5rem; color: #9ca3af; font-size: 0.9rem; }
+
         input[type="text"], textarea {
             width: 100%;
             padding: 0.75rem;
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255,255,255,0.2);
             border-radius: 0.5rem;
-            background: rgba(0, 0, 0, 0.3);
+            background: rgba(0,0,0,0.3);
             color: #e0e0e0;
             font-size: 1rem;
         }
-        
+
         input[type="text"]:focus, textarea:focus {
             outline: none;
             border-color: var(--deep-teal);
         }
-        
-        textarea {
-            min-height: 100px;
-            resize: vertical;
-        }
-        
+
+        textarea { min-height: 100px; resize: vertical; }
+
         button {
             background: linear-gradient(90deg, var(--rust), var(--terracotta));
             color: white;
@@ -123,65 +95,55 @@
             cursor: pointer;
             transition: transform 0.1s, box-shadow 0.1s;
         }
-        
-        button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(183, 65, 14, 0.3);
-        }
-        
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        .btn-secondary {
-            background: #374151;
-        }
-        
-        .btn-group {
-            display: flex;
-            gap: 0.5rem;
-            flex-wrap: wrap;
-        }
-        
+
+        button:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(183,65,14,0.3); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+        .btn-secondary { background: #374151; }
+        .btn-group { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
         .stats {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
             gap: 1rem;
             margin-bottom: 1rem;
         }
-        
+
         .stat {
             text-align: center;
             padding: 1rem;
-            background: rgba(0, 0, 0, 0.2);
+            background: rgba(0,0,0,0.2);
             border-radius: 0.5rem;
         }
-        
-        .stat-value {
-            font-size: 1.5rem;
-            font-weight: bold;
-            color: var(--deep-teal);
+
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: var(--deep-teal); }
+        .stat-label { font-size: 0.8rem; color: var(--silver); }
+
+        .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+
+        .tab {
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            background: #1e293b;
+            color: #9ca3af;
+            border: 1px solid rgba(255,255,255,0.1);
+            font-size: 0.9rem;
+            transition: all 0.1s;
         }
-        
-        .stat-label {
-            font-size: 0.8rem;
-            color: var(--silver);
-        }
-        
-        .results {
-            margin-top: 1rem;
-        }
-        
+
+        .tab.active { background: var(--rust); color: white; border-color: var(--rust); }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
         .result-item {
-            background: rgba(0, 0, 0, 0.2);
+            background: rgba(0,0,0,0.2);
             padding: 1rem;
             border-radius: 0.5rem;
             margin-bottom: 0.5rem;
             border-left: 3px solid var(--deep-teal);
         }
-        
+
         .result-score {
             float: right;
             background: var(--rust);
@@ -190,17 +152,10 @@
             border-radius: 0.25rem;
             font-size: 0.8rem;
         }
-        
-        .result-id {
-            font-weight: bold;
-            margin-bottom: 0.25rem;
-        }
-        
-        .result-content {
-            color: var(--silver);
-            font-size: 0.9rem;
-        }
-        
+
+        .result-id { font-weight: bold; margin-bottom: 0.25rem; font-size: 0.85rem; color: #9ca3af; }
+        .result-content { color: var(--silver); font-size: 0.95rem; }
+
         .log {
             background: #000;
             padding: 1rem;
@@ -210,50 +165,51 @@
             max-height: 200px;
             overflow-y: auto;
         }
-        
-        .log-entry {
-            margin-bottom: 0.25rem;
-        }
-        
-        .log-time {
-            color: #6b7280;
-        }
-        
+
+        .log-entry { margin-bottom: 0.25rem; }
+        .log-time { color: #6b7280; }
         .log-info { color: #60a5fa; }
         .log-success { color: #34d399; }
         .log-error { color: #f87171; }
-        
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 2px solid #374151;
-            border-top-color: var(--rust);
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
+        .log-warn { color: #fbbf24; }
+
+        #init-overlay {
+            background: rgba(0,0,0,0.85);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 1rem;
+            padding: 2rem;
+            text-align: center;
+            margin-bottom: 1.5rem;
         }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+
+        .progress-bar-track {
+            background: #1e293b;
+            border-radius: 9999px;
+            height: 8px;
+            margin: 1rem 0;
+            overflow: hidden;
         }
-        
+
+        .progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--rust), var(--terracotta));
+            border-radius: 9999px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+
+        .init-status { color: #9ca3af; font-size: 0.9rem; margin-top: 0.5rem; }
         .hidden { display: none; }
-        
+
         footer {
             text-align: center;
             margin-top: 2rem;
             color: #6b7280;
             font-size: 0.9rem;
         }
-        
-        footer a {
-            color: var(--deep-teal);
-            text-decoration: none;
-        }
-        
-        footer a:hover {
-            text-decoration: underline;
-        }
+
+        footer a { color: var(--deep-teal); text-decoration: none; }
+        footer a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -265,79 +221,126 @@
                 <span class="badge">WASM Powered</span>
                 <span class="badge">HNSW Index</span>
                 <span class="badge">SIMD Accelerated</span>
-                <span class="badge">192x Compression</span>
+                <span class="badge">Real Embeddings</span>
             </div>
         </header>
-        
-        <div class="card">
-            <h2>Index Status</h2>
-            <div class="stats">
-                <div class="stat">
-                    <div class="stat-value" id="doc-count">0</div>
-                    <div class="stat-label">Documents</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="dim-count">384</div>
-                    <div class="stat-label">Dimensions</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="index-type">HNSW</div>
-                    <div class="stat-label">Index Type</div>
-                </div>
-                <div class="stat">
-                    <div class="stat-value" id="memory-usage">0 KB</div>
-                    <div class="stat-label">Memory</div>
+
+        <!-- Initialisation progress -->
+        <div id="init-overlay">
+            <h2 style="color: var(--deep-teal); margin-bottom: 0.5rem;">Loading</h2>
+            <p style="color:#9ca3af; font-size:0.9rem;">
+                Downloading <strong>all-MiniLM-L6-v2</strong> (~23 MB, cached after first load)
+            </p>
+            <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="progress-fill"></div>
+            </div>
+            <div class="init-status" id="init-status">Initialising WASM…</div>
+        </div>
+
+        <!-- Main UI -->
+        <div id="main-ui" class="hidden">
+
+            <div class="card">
+                <h2>Index Status</h2>
+                <div class="stats">
+                    <div class="stat">
+                        <div class="stat-value" id="doc-count">0</div>
+                        <div class="stat-label">Documents</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">384</div>
+                        <div class="stat-label">Dimensions</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value">HNSW</div>
+                        <div class="stat-label">Index Type</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="memory-usage">0 KB</div>
+                        <div class="stat-label">Est. Memory</div>
+                    </div>
                 </div>
             </div>
-        </div>
-        
-        <div class="card">
-            <h2>Add Documents</h2>
-            <div class="input-group">
-                <label>Document Content (one per line)</label>
-                <textarea id="doc-input" placeholder="The quick brown fox jumps over the lazy dog.
+
+            <div class="card">
+                <h2>Add Documents</h2>
+                <div class="input-group">
+                    <label>Document content — one per line</label>
+                    <textarea id="doc-input" placeholder="The quick brown fox jumps over the lazy dog.
 Foxes are clever animals that cache food for later.
 Vector search enables semantic similarity matching.
 Machine learning models generate embeddings from text."></textarea>
+                </div>
+                <div class="btn-group">
+                    <button id="add-btn" onclick="addDocuments()">Add Documents</button>
+                    <button class="btn-secondary" onclick="loadSampleData()">Load Sample Data</button>
+                    <button class="btn-secondary" onclick="clearIndex()">Clear Index</button>
+                </div>
             </div>
-            <div class="btn-group">
-                <button id="add-docs-btn" onclick="addDocuments()">Add Documents</button>
-                <button class="btn-secondary" onclick="loadSampleData()">Load Sample Data</button>
-                <button class="btn-secondary" onclick="clearIndex()">Clear Index</button>
+
+            <div class="card">
+                <h2>Search</h2>
+                <div class="tabs">
+                    <div class="tab active" data-tab="vector" onclick="switchTab(this)">Vector</div>
+                    <div class="tab" data-tab="text" onclick="switchTab(this)">BM25 Text</div>
+                    <div class="tab" data-tab="hybrid" onclick="switchTab(this)">Hybrid</div>
+                </div>
+
+                <div id="tab-vector" class="tab-panel active">
+                    <div class="input-group">
+                        <label>Semantic query — finds documents by meaning, not keywords</label>
+                        <input type="text" id="vector-query" placeholder="e.g. clever animals that hide food"
+                               onkeypress="if(event.key==='Enter') search('vector')">
+                    </div>
+                    <button onclick="search('vector')">Search</button>
+                </div>
+
+                <div id="tab-text" class="tab-panel">
+                    <div class="input-group">
+                        <label>Keyword query — BM25 full-text search</label>
+                        <input type="text" id="text-query" placeholder="e.g. fox cache food"
+                               onkeypress="if(event.key==='Enter') search('text')">
+                    </div>
+                    <button onclick="search('text')">Search</button>
+                </div>
+
+                <div id="tab-hybrid" class="tab-panel">
+                    <div class="input-group">
+                        <label>Query — vector + BM25 combined via Reciprocal Rank Fusion</label>
+                        <input type="text" id="hybrid-query" placeholder="e.g. fox cache food"
+                               onkeypress="if(event.key==='Enter') search('hybrid')">
+                    </div>
+                    <button onclick="search('hybrid')">Search</button>
+                </div>
+
+                <div id="results" style="margin-top: 1rem;"></div>
+            </div>
+
+            <div class="card">
+                <h2>Console</h2>
+                <div class="log" id="log"></div>
             </div>
         </div>
-        
-        <div class="card">
-            <h2>Search</h2>
-            <div class="input-group">
-                <label>Query</label>
-                <input type="text" id="query-input" placeholder="Enter search query..." onkeypress="if(event.key==='Enter')search()">
-            </div>
-            <div class="btn-group">
-                <button id="search-btn" onclick="search()">Search</button>
-            </div>
-            <div class="results" id="results"></div>
-        </div>
-        
-        <div class="card">
-            <h2>Console</h2>
-            <div class="log" id="log"></div>
-        </div>
-        
+
         <footer>
             Built with <a href="https://github.com/Narcoleptic-Fox/foxstash">Foxstash</a> |
             <a href="https://crates.io/crates/foxstash-core">crates.io</a> |
             <a href="https://docs.rs/foxstash-core">docs.rs</a>
         </footer>
     </div>
-    
+
     <script type="module">
-        // Simple mock implementation until WASM is fully integrated
-        // This demonstrates the UI and will be replaced with real WASM calls
-        
-        let documents = [];
-        let nextId = 1;
-        
+        import init, { LocalRAG, JsDocument, init_panic_hook } from './pkg/foxstash_wasm.js';
+        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2/dist/transformers.min.js';
+
+        env.allowLocalModels = false;
+
+        let rag = null;
+        let embedder = null;
+        let activeTab = 'vector';
+
+        // ── Logging ───────────────────────────────────────────────────────────
+
         function log(message, type = 'info') {
             const logEl = document.getElementById('log');
             const time = new Date().toLocaleTimeString();
@@ -347,77 +350,133 @@ Machine learning models generate embeddings from text."></textarea>
             logEl.appendChild(entry);
             logEl.scrollTop = logEl.scrollHeight;
         }
-        
+
+        // ── Init ──────────────────────────────────────────────────────────────
+
+        function setProgress(pct, status) {
+            document.getElementById('progress-fill').style.width = `${pct}%`;
+            document.getElementById('init-status').textContent = status;
+        }
+
+        async function initialise() {
+            try {
+                setProgress(10, 'Initialising WASM…');
+                await init();
+                init_panic_hook();
+
+                setProgress(25, 'Creating HNSW index…');
+                rag = new LocalRAG(384, true);
+
+                setProgress(35, 'Loading all-MiniLM-L6-v2 (first load ~23 MB, then cached)…');
+                embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+                    progress_callback: (p) => {
+                        if (p.status === 'progress' && p.total) {
+                            const pct = 35 + Math.round((p.loaded / p.total) * 60);
+                            setProgress(pct, `Downloading model… ${Math.round(p.loaded / 1024 / 1024)} MB / ${Math.round(p.total / 1024 / 1024)} MB`);
+                        }
+                    }
+                });
+
+                setProgress(100, 'Ready');
+                document.getElementById('init-overlay').classList.add('hidden');
+                document.getElementById('main-ui').classList.remove('hidden');
+                log('Foxstash WASM + all-MiniLM-L6-v2 ready', 'success');
+                log('Load sample data or add your own documents, then search', 'info');
+            } catch (err) {
+                setProgress(0, `Error: ${err.message}`);
+                document.getElementById('init-status').style.color = '#f87171';
+                console.error(err);
+            }
+        }
+
+        // ── Embed ─────────────────────────────────────────────────────────────
+
+        async function embed(text) {
+            const out = await embedder(text, { pooling: 'mean', normalize: true });
+            return Array.from(out.data);
+        }
+
+        // ── Stats ─────────────────────────────────────────────────────────────
+
         function updateStats() {
-            document.getElementById('doc-count').textContent = documents.length;
-            const memKB = Math.round(documents.length * 384 * 4 / 1024);
-            document.getElementById('memory-usage').textContent = `${memKB} KB`;
+            const count = rag.document_count();
+            document.getElementById('doc-count').textContent = count;
+            const kb = Math.round(count * 384 * 4 / 1024);
+            document.getElementById('memory-usage').textContent =
+                kb < 1024 ? `${kb} KB` : `${(kb / 1024).toFixed(1)} MB`;
         }
-        
-        // Simple embedding simulation (in real version, would use ONNX or pre-computed)
-        function simpleEmbed(text) {
-            const hash = text.split('').reduce((a, c) => ((a << 5) - a) + c.charCodeAt(0), 0);
-            const embedding = [];
-            for (let i = 0; i < 384; i++) {
-                embedding.push(Math.sin(hash * (i + 1) * 0.001) * 0.5);
-            }
-            return embedding;
-        }
-        
-        function cosineSimilarity(a, b) {
-            let dot = 0, normA = 0, normB = 0;
-            for (let i = 0; i < a.length; i++) {
-                dot += a[i] * b[i];
-                normA += a[i] * a[i];
-                normB += b[i] * b[i];
-            }
-            return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-        }
-        
-        window.addDocuments = function() {
+
+        // ── Add documents ─────────────────────────────────────────────────────
+
+        window.addDocuments = async function () {
             const input = document.getElementById('doc-input').value.trim();
             if (!input) return;
-            
+
             const lines = input.split('\n').filter(l => l.trim());
-            const startTime = performance.now();
-            
-            for (const line of lines) {
-                const doc = {
-                    id: `doc_${nextId++}`,
-                    content: line.trim(),
-                    embedding: simpleEmbed(line)
-                };
-                documents.push(doc);
+            const btn = document.getElementById('add-btn');
+            btn.disabled = true;
+
+            const t0 = performance.now();
+            let added = 0;
+
+            for (let i = 0; i < lines.length; i++) {
+                const content = lines[i].trim();
+                btn.textContent = `Embedding ${i + 1} / ${lines.length}…`;
+                try {
+                    const embedding = await embed(content);
+                    const id = `doc_${Date.now()}_${i}`;
+                    rag.add_document(new JsDocument(id, content, embedding, null));
+                    added++;
+                } catch (e) {
+                    log(`Failed to embed "${content.slice(0, 40)}…": ${e.message}`, 'error');
+                }
             }
-            
-            const elapsed = (performance.now() - startTime).toFixed(2);
-            log(`Added ${lines.length} documents in ${elapsed}ms`, 'success');
+
+            const elapsed = (performance.now() - t0).toFixed(0);
+            log(`Added ${added} document${added !== 1 ? 's' : ''} in ${elapsed}ms`, 'success');
             updateStats();
             document.getElementById('doc-input').value = '';
+            btn.disabled = false;
+            btn.textContent = 'Add Documents';
         };
-        
-        window.search = function() {
-            const query = document.getElementById('query-input').value.trim();
-            if (!query || documents.length === 0) {
-                log('No query or empty index', 'error');
+
+        // ── Search ────────────────────────────────────────────────────────────
+
+        window.search = async function (mode) {
+            mode = mode || activeTab;
+            const query = document.getElementById(`${mode}-query`).value.trim();
+            if (!query) return;
+
+            if (rag.document_count() === 0) {
+                log('Index is empty — add some documents first', 'warn');
                 return;
             }
-            
-            const startTime = performance.now();
-            const queryEmbed = simpleEmbed(query);
-            
-            const results = documents
-                .map(doc => ({
-                    ...doc,
-                    score: cosineSimilarity(queryEmbed, doc.embedding)
-                }))
-                .sort((a, b) => b.score - a.score)
-                .slice(0, 5);
-            
-            const elapsed = (performance.now() - startTime).toFixed(2);
-            log(`Search completed in ${elapsed}ms`, 'success');
-            
+
+            const t0 = performance.now();
+            let results = [];
+
+            try {
+                if (mode === 'vector') {
+                    results = rag.search(await embed(query), 5);
+                } else if (mode === 'text') {
+                    results = rag.search_text(query, 5);
+                } else if (mode === 'hybrid') {
+                    results = rag.search_hybrid(await embed(query), query, 5);
+                }
+            } catch (e) {
+                log(`Search error: ${e.message}`, 'error');
+                return;
+            }
+
+            const elapsed = (performance.now() - t0).toFixed(0);
+            log(`${mode} search "${query}" → ${results.length} result${results.length !== 1 ? 's' : ''} in ${elapsed}ms`, 'success');
+
             const resultsEl = document.getElementById('results');
+            if (results.length === 0) {
+                resultsEl.innerHTML = '<p style="color:#6b7280; padding: 1rem 0;">No results found.</p>';
+                return;
+            }
+
             resultsEl.innerHTML = results.map(r => `
                 <div class="result-item">
                     <span class="result-score">${(r.score * 100).toFixed(1)}%</span>
@@ -426,36 +485,46 @@ Machine learning models generate embeddings from text."></textarea>
                 </div>
             `).join('');
         };
-        
-        window.loadSampleData = function() {
-            const samples = [
-                "Foxes are small-to-medium-sized omnivorous mammals belonging to several genera of the family Canidae.",
-                "The red fox is the largest of the true foxes and one of the most widely distributed members of the order Carnivora.",
-                "Vector databases store high-dimensional vectors for similarity search and retrieval.",
-                "HNSW (Hierarchical Navigable Small World) is an algorithm for approximate nearest neighbor search.",
-                "Product quantization compresses vectors by dividing them into subvectors and quantizing each independently.",
-                "SIMD (Single Instruction, Multiple Data) enables parallel processing of vector operations.",
-                "Embeddings are dense vector representations of data that capture semantic meaning.",
-                "RAG (Retrieval-Augmented Generation) combines retrieval systems with language models.",
-                "Cosine similarity measures the angle between two vectors, commonly used for text similarity.",
-                "WebAssembly enables running high-performance code in web browsers."
-            ];
-            
-            document.getElementById('doc-input').value = samples.join('\n');
-            log('Loaded 10 sample documents', 'info');
+
+        // ── Tabs ──────────────────────────────────────────────────────────────
+
+        window.switchTab = function (el) {
+            activeTab = el.dataset.tab;
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(t => t.classList.remove('active'));
+            el.classList.add('active');
+            document.getElementById(`tab-${activeTab}`).classList.add('active');
+            document.getElementById('results').innerHTML = '';
         };
-        
-        window.clearIndex = function() {
-            documents = [];
-            nextId = 1;
+
+        // ── Sample data ───────────────────────────────────────────────────────
+
+        window.loadSampleData = function () {
+            document.getElementById('doc-input').value = [
+                "Foxes are small-to-medium-sized omnivorous mammals belonging to the family Canidae.",
+                "The red fox is the largest of the true foxes and one of the most widely distributed members of the order Carnivora.",
+                "Foxes are known for caching food — burying surplus prey to retrieve later.",
+                "Vector databases store high-dimensional embeddings for similarity search and retrieval.",
+                "HNSW (Hierarchical Navigable Small World) is an algorithm for approximate nearest neighbour search.",
+                "SIMD instructions allow a single CPU operation to process multiple data elements simultaneously.",
+                "Embeddings are dense vector representations that capture semantic meaning of text.",
+                "RAG (Retrieval-Augmented Generation) combines vector retrieval with large language models.",
+                "Cosine similarity measures the angle between two vectors, commonly used for semantic search.",
+                "WebAssembly enables near-native performance code to run securely inside a web browser.",
+            ].join('\n');
+            log('Sample data loaded — click Add Documents to embed and index', 'info');
+        };
+
+        // ── Clear ─────────────────────────────────────────────────────────────
+
+        window.clearIndex = function () {
+            rag.clear();
             updateStats();
             document.getElementById('results').innerHTML = '';
             log('Index cleared', 'info');
         };
-        
-        // Initialize
-        log('Foxstash WASM demo loaded', 'success');
-        log('Note: This demo uses simplified embeddings. Full version uses ONNX models.', 'info');
+
+        initialise();
     </script>
 </body>
 </html>
