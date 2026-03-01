@@ -11,6 +11,7 @@ use crate::inverted_index::InvertedIndex;
 use crate::recovery;
 use crate::tokenizer::{SimpleTokenizer, Tokenizer};
 use crate::{DbConfig, DbError, Result};
+use foxstash_core::index::hnsw::SearchContext;
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::storage::incremental::{IncrementalStorage, IndexMetadata};
 use foxstash_core::{Document, SearchResult};
@@ -219,6 +220,93 @@ impl Collection {
             None => self.search_unfiltered(&inner, query, k),
             Some(f) => self.search_filtered(&inner, query, k, f),
         }
+    }
+
+    /// Search multiple queries in parallel with an optional metadata filter.
+    ///
+    /// Uses thread-local reusable contexts for the ANN search phase, preserving
+    /// db-level tombstone filtering semantics. When a filter is provided, applies
+    /// progressive over-fetch: `2×`, `4×`, `8×`, then full scan.
+    pub fn search_batch(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<Vec<SearchResult>>> {
+        if k == 0 {
+            return Ok(vec![Vec::new(); queries.len()]);
+        }
+
+        self.validate_query_batch_dims(queries)?;
+
+        let inner = self.inner.read();
+        if inner.index.is_empty() {
+            return Ok(vec![Vec::new(); queries.len()]);
+        }
+
+        match filter {
+            None => {
+                let fetch = self.unfiltered_fetch_count(&inner, k);
+                let raw_batch = inner
+                    .index
+                    .search_batch_fast(queries, fetch)
+                    .map_err(DbError::Core)?;
+
+                Ok(raw_batch
+                    .into_iter()
+                    .map(|raw| {
+                        raw.into_iter()
+                            .filter(|r| inner.id_map.is_live(&r.id))
+                            .take(k)
+                            .collect()
+                    })
+                    .collect())
+            }
+            Some(filter) => self.search_batch_filtered_impl(&inner, queries, k, filter),
+        }
+    }
+
+    /// Create a reusable search context for repeated unfiltered searches.
+    pub fn create_search_context(&self) -> SearchContext {
+        self.inner.read().index.create_search_context()
+    }
+
+    /// Search with a reusable context (unfiltered).
+    ///
+    /// Use this in tight query loops to reduce allocation overhead.
+    pub fn search_with_context(
+        &self,
+        query: &[f32],
+        k: usize,
+        ctx: &mut SearchContext,
+    ) -> Result<Vec<SearchResult>> {
+        if query.len() != self.config.embedding_dim {
+            return Err(DbError::DimensionMismatch {
+                expected: self.config.embedding_dim,
+                actual: query.len(),
+            });
+        }
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let inner = self.inner.read();
+        if inner.index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let fetch = self.unfiltered_fetch_count(&inner, k);
+        let raw = inner
+            .index
+            .search_with_context(query, fetch, ctx)
+            .map_err(DbError::Core)?;
+
+        Ok(raw
+            .into_iter()
+            .filter(|r| inner.id_map.is_live(&r.id))
+            .take(k)
+            .collect())
     }
 
     /// Get a document by ID.
@@ -455,6 +543,96 @@ impl Collection {
     }
 
     // ── private helpers ─────────────────────────────────────────────
+
+    #[inline]
+    fn unfiltered_fetch_count(&self, inner: &CollectionInner, k: usize) -> usize {
+        k.saturating_add(inner.id_map.tombstone_count())
+            .min(inner.index.len())
+    }
+
+    #[inline]
+    fn validate_query_batch_dims(&self, queries: &[Vec<f32>]) -> Result<()> {
+        for query in queries {
+            if query.len() != self.config.embedding_dim {
+                return Err(DbError::DimensionMismatch {
+                    expected: self.config.embedding_dim,
+                    actual: query.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn filtered_fetch_sizes(&self, inner: &CollectionInner, k: usize) -> Vec<usize> {
+        let index_len = inner.index.len();
+        let candidates = [
+            k.saturating_mul(2).min(index_len),
+            k.saturating_mul(4).min(index_len),
+            k.saturating_mul(8).min(index_len),
+            index_len,
+        ];
+
+        let mut fetch_sizes = Vec::with_capacity(4);
+        for fetch in candidates {
+            if !fetch_sizes.contains(&fetch) {
+                fetch_sizes.push(fetch);
+            }
+        }
+        fetch_sizes
+    }
+
+    fn search_batch_filtered_impl(
+        &self,
+        inner: &CollectionInner,
+        queries: &[Vec<f32>],
+        k: usize,
+        filter: &Filter,
+    ) -> Result<Vec<Vec<SearchResult>>> {
+        let fetch_sizes = self.filtered_fetch_sizes(inner, k);
+        let mut results: Vec<Option<Vec<SearchResult>>> = vec![None; queries.len()];
+        let mut pending: Vec<usize> = (0..queries.len()).collect();
+
+        for fetch in fetch_sizes {
+            if pending.is_empty() {
+                break;
+            }
+
+            let pending_queries: Vec<Vec<f32>> = pending
+                .iter()
+                .map(|&query_idx| queries[query_idx].clone())
+                .collect();
+
+            let raw_batch = inner
+                .index
+                .search_batch_fast(&pending_queries, fetch)
+                .map_err(DbError::Core)?;
+
+            let mut next_pending = Vec::new();
+            let is_last_round = fetch >= inner.index.len();
+
+            for (query_idx, raw) in pending.into_iter().zip(raw_batch.into_iter()) {
+                let filtered: Vec<SearchResult> = raw
+                    .into_iter()
+                    .filter(|r| inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref()))
+                    .take(k)
+                    .collect();
+
+                if filtered.len() >= k || is_last_round {
+                    results[query_idx] = Some(filtered);
+                } else {
+                    next_pending.push(query_idx);
+                }
+            }
+
+            pending = next_pending;
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|result| result.unwrap_or_default())
+            .collect())
+    }
 
     /// Unfiltered search: query HNSW, exclude tombstones.
     fn search_unfiltered(
@@ -1392,6 +1570,184 @@ mod tests {
 
         let results = col.search(&[1.0, 0.0, 0.0], 100, None).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn search_batch_matches_single_search() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
+            .unwrap();
+        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None)
+            .unwrap();
+        col.insert("d".into(), "delta".into(), vec![0.9, 0.1, 0.0], None)
+            .unwrap();
+
+        let queries = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+
+        let batch = col.search_batch(&queries, 2, None).unwrap();
+        assert_eq!(batch.len(), queries.len());
+
+        for (query, batch_results) in queries.iter().zip(batch.iter()) {
+            let single = col.search(query, 2, None).unwrap();
+            let single_ids: Vec<&str> = single.iter().map(|r| r.id.as_str()).collect();
+            let batch_ids: Vec<&str> = batch_results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(batch_ids, single_ids);
+        }
+    }
+
+    #[test]
+    fn search_batch_with_filter_matches_single_filtered_search() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert(
+            "a".into(),
+            "alpha".into(),
+            vec![1.0, 0.0, 0.0],
+            Some(json!({"scope": "workspace"})),
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "beta".into(),
+            vec![0.0, 1.0, 0.0],
+            Some(json!({"scope": "session"})),
+        )
+        .unwrap();
+        col.insert(
+            "c".into(),
+            "gamma".into(),
+            vec![0.0, 0.0, 1.0],
+            Some(json!({"scope": "workspace"})),
+        )
+        .unwrap();
+        col.insert(
+            "d".into(),
+            "delta".into(),
+            vec![0.9, 0.1, 0.0],
+            Some(json!({"scope": "workspace"})),
+        )
+        .unwrap();
+
+        let filter = Filter::eq("scope", "workspace");
+        let queries = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+
+        let batch = col
+            .search_batch(&queries, 3, Some(&filter))
+            .unwrap();
+        assert_eq!(batch.len(), queries.len());
+
+        for (query, batch_results) in queries.iter().zip(batch.iter()) {
+            let single = col.search(query, 3, Some(&filter)).unwrap();
+            let single_ids: Vec<&str> = single.iter().map(|r| r.id.as_str()).collect();
+            let batch_ids: Vec<&str> = batch_results.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(batch_ids, single_ids);
+        }
+    }
+
+    #[test]
+    fn search_batch_filter_excludes_non_matching_docs() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        for i in 0..48usize {
+            let mut emb = vec![0.0f32; 3];
+            emb[i % 3] = 1.0;
+            emb[(i + 1) % 3] = (i as f32) * 0.001;
+            let scope = if i % 2 == 0 { "workspace" } else { "session" };
+            col.insert(
+                format!("doc-{i}"),
+                format!("doc content {i}"),
+                emb,
+                Some(json!({ "scope": scope })),
+            )
+            .unwrap();
+        }
+
+        let filter = Filter::eq("scope", "workspace");
+        let queries = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.8, 0.2, 0.0],
+            vec![0.2, 0.8, 0.0],
+        ];
+
+        let results = col.search_batch(&queries, 6, Some(&filter)).unwrap();
+
+        for per_query in &results {
+            assert!(per_query.iter().all(|r| {
+                r.metadata
+                    .as_ref()
+                    .and_then(|m| m.get("scope"))
+                    .and_then(|v| v.as_str())
+                    == Some("workspace")
+            }));
+        }
+    }
+
+    #[test]
+    fn search_with_context_matches_search() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
+            .unwrap();
+        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None)
+            .unwrap();
+        col.insert("d".into(), "delta".into(), vec![0.7, 0.3, 0.0], None)
+            .unwrap();
+
+        let mut ctx = col.create_search_context();
+        for query in [
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ] {
+            let regular = col.search(&query, 3, None).unwrap();
+            let with_ctx = col.search_with_context(&query, 3, &mut ctx).unwrap();
+            let regular_ids: Vec<&str> = regular.iter().map(|r| r.id.as_str()).collect();
+            let ctx_ids: Vec<&str> = with_ctx.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ctx_ids, regular_ids);
+        }
+    }
+
+    #[test]
+    fn parallel_paths_exclude_tombstones() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
+
+        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
+            .unwrap();
+        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None)
+            .unwrap();
+        col.delete("b").unwrap();
+
+        let queries = vec![vec![0.0, 1.0, 0.0], vec![1.0, 0.0, 0.0]];
+        let batch = col.search_batch(&queries, 3, None).unwrap();
+        let mut ctx = col.create_search_context();
+        let with_ctx = col
+            .search_with_context(&[0.0, 1.0, 0.0], 3, &mut ctx)
+            .unwrap();
+
+        assert!(batch.iter().flatten().all(|r| r.id != "b"));
+        assert!(with_ctx.iter().all(|r| r.id != "b"));
     }
 
     // ── P2.2: Create guard ──────────────────────────────────────────
