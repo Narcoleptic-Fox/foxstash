@@ -29,7 +29,7 @@ bincode = "1.3"
 # errors. load-dynamic sidesteps this by loading onnxruntime at runtime
 # via dlopen/LoadLibrary instead of linking at compile time.
 ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
-tokenizers = "0.19"
+tokenizers = "0.22"
 
 # Caching
 lru = "0.16"
