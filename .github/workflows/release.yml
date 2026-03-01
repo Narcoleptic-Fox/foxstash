@@ -128,7 +128,7 @@ jobs:
             asset_name: foxstash-native-linux-x86_64.so
 
           - target: x86_64-apple-darwin
-            runner: macos-13          # Intel runner
+            runner: macos-latest      # Apple Silicon runner, cross-compiles for Intel
             artifact_name: libfoxstash_native.dylib
             asset_name: foxstash-native-macos-x86_64.dylib
 
