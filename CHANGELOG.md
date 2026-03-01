@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-01
+
+### Fixed
+
+- Blocked path traversal in collection names to prevent filesystem escape in create/get/delete paths.
+- Removed durability races between WAL appends and checkpoint/compaction snapshots that could lose acknowledged writes.
+- Hardened atomic persistence writes for manifests/checkpoints and made WAL recovery tolerate torn/truncated tail entries.
+- Fixed HNSW search-layer neighbor truncation when `m0 > 64`.
+- Hardened WASM/native boundaries by replacing panic-prone paths with validated error returns.
+- Restored strict `clippy -D warnings` compatibility across bench/native targets.
+
 ## [0.1.1] - 2025-01-31
 
 ### Fixed
@@ -49,5 +60,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ONNX embedding support available but may have platform-specific limitations on Windows
 - WASM support is experimental
 
-[Unreleased]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.0...v0.4.1
 [0.1.0]: https://github.com/Narcoleptic-Fox/foxstash/releases/tag/v0.1.0
