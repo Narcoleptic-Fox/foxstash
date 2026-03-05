@@ -12,7 +12,7 @@
 use crate::{Document, Result, SearchResult};
 use parking_lot::{Mutex, RwLock};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rayon::prelude::*;
 use std::cmp::{max, Reverse};
 use std::collections::{BinaryHeap, HashSet};
@@ -444,7 +444,7 @@ impl HNSWIndex {
         // Pre-generate all node levels (clamp to EPSILON to prevent ln(0) = -inf)
         let levels: Vec<usize> = (0..n)
             .map(|_| {
-                let r: f32 = rng.gen::<f32>().max(f32::EPSILON);
+                let r: f32 = rng.random::<f32>().max(f32::EPSILON);
                 (-r.ln() * ml).floor() as usize
             })
             .collect();
@@ -887,8 +887,8 @@ impl HNSWIndex {
     ///
     /// Clamps the uniform sample to `[EPSILON, 1)` to prevent `ln(0.0) = -inf`.
     fn random_level(&self) -> usize {
-        let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
+        let mut rng = rand::rng();
+        let uniform: f32 = rng.random::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
@@ -1344,7 +1344,7 @@ impl HNSWIndex {
 
         // Shuffle points randomly for insertion order
         assert!(n < u32::MAX as usize);
-        let mut shuffled: Vec<(u32, usize)> = (0..n).map(|i| (rng.gen::<u32>(), i)).collect();
+        let mut shuffled: Vec<(u32, usize)> = (0..n).map(|i| (rng.random::<u32>(), i)).collect();
         shuffled.sort_unstable_by_key(|&(r, _)| r);
 
         // Reorder embeddings according to shuffle
@@ -2027,9 +2027,9 @@ mod tests {
     }
 
     fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
-        use rand::SeedableRng;
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
+        (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
     }
 
     #[test]

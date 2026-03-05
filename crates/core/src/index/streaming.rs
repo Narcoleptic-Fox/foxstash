@@ -629,7 +629,7 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..dim)
-            .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+            .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
             .collect()
     }
 

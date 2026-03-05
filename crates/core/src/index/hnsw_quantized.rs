@@ -347,8 +347,8 @@ impl SQ8HNSWIndex {
     }
 
     fn random_level(&self) -> usize {
-        let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
+        let mut rng = rand::rng();
+        let uniform: f32 = rng.random::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
@@ -812,8 +812,8 @@ impl BinaryHNSWIndex {
     }
 
     fn random_level(&self) -> usize {
-        let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
+        let mut rng = rand::rng();
+        let uniform: f32 = rng.random::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
@@ -1020,7 +1020,7 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..dim)
-            .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+            .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
             .collect()
     }
 
@@ -1188,7 +1188,7 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..num_docs)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
                     .collect()
             })
             .collect();

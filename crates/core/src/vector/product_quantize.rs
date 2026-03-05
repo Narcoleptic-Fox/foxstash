@@ -41,7 +41,7 @@
 //! ```
 
 use crate::{RagError, Result};
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
@@ -204,7 +204,7 @@ impl ProductQuantizer {
 
         let mut rng = match config.seed {
             Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
-            None => rand::rngs::StdRng::from_entropy(),
+            None => rand::rngs::StdRng::from_os_rng(),
         };
 
         // Sample training data if too large
@@ -493,7 +493,7 @@ fn kmeans_plusplus_init(
     let mut centroids = Vec::with_capacity(k);
 
     // Choose first centroid uniformly at random
-    let first_idx = rng.gen_range(0..n);
+    let first_idx = rng.random_range(0..n);
     centroids.push(data[first_idx].clone());
 
     // Choose remaining centroids with probability proportional to D(x)^2
@@ -510,12 +510,12 @@ fn kmeans_plusplus_init(
         let total: f32 = distances.iter().sum();
         if total == 0.0 {
             // All points are centroids, pick randomly
-            let idx = rng.gen_range(0..n);
+            let idx = rng.random_range(0..n);
             centroids.push(data[idx].clone());
             continue;
         }
 
-        let threshold = rng.gen::<f32>() * total;
+        let threshold = rng.random::<f32>() * total;
         let mut cumsum = 0.0f32;
         let mut chosen_idx = 0;
 
@@ -608,7 +608,7 @@ mod tests {
         use rand::Rng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..n)
-            .map(|_| (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect())
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect()
     }
 

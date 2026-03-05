@@ -36,9 +36,9 @@ serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = "0.6"
 
-# Enable JS feature for getrandom (required for rand in WASM)
+# Enable wasm_js feature for getrandom (required for rand 0.10 in WASM)
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
