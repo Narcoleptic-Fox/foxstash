@@ -1188,7 +1188,7 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..num_docs)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
+                    .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
                     .collect()
             })
             .collect();
