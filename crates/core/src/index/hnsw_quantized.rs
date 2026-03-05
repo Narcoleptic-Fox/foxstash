@@ -1020,7 +1020,7 @@ mod tests {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..dim)
-            .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
+            .map(|_| rng.random_range(-1.0..1.0))
             .collect()
     }
 
@@ -1177,7 +1177,7 @@ mod tests {
 
     #[test]
     fn test_recall_comparison() {
-        use rand::SeedableRng;
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         let dim = 128;
@@ -1188,7 +1188,7 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..num_docs)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
+                    .map(|_| rng.random_range(-1.0..1.0))
                     .collect()
             })
             .collect();

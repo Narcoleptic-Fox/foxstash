@@ -750,7 +750,7 @@ mod tests {
         (0..n)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
+                    .map(|_| rng.random_range(-1.0..1.0))
                     .collect()
             })
             .collect()
