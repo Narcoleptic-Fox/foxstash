@@ -41,7 +41,7 @@ web-sys = { version = "0.3", features = ["console"] }
 console_error_panic_hook = "0.1"
 
 # Testing
-criterion = "0.5"
+criterion = "0.8"
 
 [profile.release]
 opt-level = 3
