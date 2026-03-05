@@ -100,7 +100,7 @@ jobs:
         # Cache key includes the commit SHA so each main commit produces a
         # deterministic cache entry. The restore-keys fallback in the PR job
         # picks the most recent main baseline when the exact key is absent.
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: target/criterion
           key: criterion-baseline-${{ github.sha }}
@@ -136,7 +136,7 @@ jobs:
       # "criterion-baseline-", which corresponds to the latest main push.
       - name: Restore baseline criterion results
         id: restore-baseline
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/criterion
           key: criterion-baseline-${{ github.sha }}
