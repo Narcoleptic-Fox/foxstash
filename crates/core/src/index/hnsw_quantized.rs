@@ -50,7 +50,7 @@ use crate::vector::quantize::{
     BinaryQuantizedVector, BinaryQuantizer, Quantizer, ScalarQuantizedVector, ScalarQuantizer,
 };
 use crate::{Document, RagError, Result, SearchResult};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -1017,10 +1017,10 @@ mod tests {
     }
 
     fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
-        use rand::SeedableRng;
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..dim)
-            .map(|_| rand::Rng::random_range(&mut rng, -1.0..1.0))
+            .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
             .collect()
     }
 

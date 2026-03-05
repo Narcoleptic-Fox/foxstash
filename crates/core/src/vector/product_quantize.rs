@@ -204,13 +204,13 @@ impl ProductQuantizer {
 
         let mut rng = match config.seed {
             Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
-            None => rand::rngs::StdRng::from_os_rng(),
+            None => rand::make_rng(),
         };
 
         // Sample training data if too large
         let samples: Vec<&Vec<f32>> = if training_data.len() > config.kmeans_samples {
             training_data
-                .choose_multiple(&mut rng, config.kmeans_samples)
+                .sample(&mut rng, config.kmeans_samples)
                 .collect()
         } else {
             training_data.iter().collect()
@@ -487,7 +487,7 @@ fn kmeans_plusplus_init(
     k: usize,
     rng: &mut rand::rngs::StdRng,
 ) -> Vec<Vec<f32>> {
-    use rand::Rng;
+    use rand::RngExt;
 
     let n = data.len();
     let mut centroids = Vec::with_capacity(k);
@@ -605,7 +605,7 @@ mod tests {
     use super::*;
 
     fn generate_random_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
-        use rand::Rng;
+        use rand::RngExt;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..n)
             .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())

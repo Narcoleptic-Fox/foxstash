@@ -51,7 +51,7 @@ const VECTOR_DIMS: &[usize] = &[384, 768, 1024];
 /// Generate a random embedding vector with given dimension
 fn generate_random_embedding(dim: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
-    (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
+    (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
 }
 
 /// Generate multiple random embedding vectors

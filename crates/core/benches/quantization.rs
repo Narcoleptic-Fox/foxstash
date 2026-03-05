@@ -22,13 +22,13 @@ use rand::{Rng, SeedableRng};
 fn create_test_vectors(size: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     (0..1000)
-        .map(|_| (0..size).map(|_| rng.gen_range(-1.0..1.0)).collect())
+        .map(|_| (0..size).map(|_| rng.random_range(-1.0..1.0)).collect())
         .collect()
 }
 
 fn create_single_vector(size: usize, seed: u64) -> Vec<f32> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    (0..size).map(|_| rng.gen_range(-1.0..1.0)).collect()
+    (0..size).map(|_| rng.random_range(-1.0..1.0)).collect()
 }
 
 // ============================================================================
