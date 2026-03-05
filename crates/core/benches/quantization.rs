@@ -17,7 +17,7 @@ use foxstash_core::vector::quantize::{
     hamming_distance_simd, sq8_l2_distance_simd, BinaryQuantizer, Quantizer, ScalarQuantizer,
 };
 use foxstash_core::vector::{cosine_similarity, l2_distance};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn create_test_vectors(size: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
