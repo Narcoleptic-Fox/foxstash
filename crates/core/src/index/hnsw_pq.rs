@@ -748,11 +748,7 @@ mod tests {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..n)
-            .map(|_| {
-                (0..dim)
-                    .map(|_| rng.random_range(-1.0..1.0))
-                    .collect()
-            })
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect()
     }
 

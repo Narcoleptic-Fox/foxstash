@@ -873,11 +873,7 @@ mod tests {
         let num_vectors = 100;
 
         let vectors: Vec<Vec<f32>> = (0..num_vectors)
-            .map(|_| {
-                (0..dim)
-                    .map(|_| rng.random_range(-1.0..1.0))
-                    .collect()
-            })
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect();
 
         let sq = ScalarQuantizer::fit(&vectors);
@@ -934,11 +930,7 @@ mod tests {
         let num_vectors = 100;
 
         let vectors: Vec<Vec<f32>> = (0..num_vectors)
-            .map(|_| {
-                (0..dim)
-                    .map(|_| rng.random_range(-1.0..1.0))
-                    .collect()
-            })
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect();
 
         let bq = BinaryQuantizer::new(dim);

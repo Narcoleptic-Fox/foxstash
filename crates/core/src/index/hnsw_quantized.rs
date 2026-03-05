@@ -1019,9 +1019,7 @@ mod tests {
     fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..dim)
-            .map(|_| rng.random_range(-1.0..1.0))
-            .collect()
+        (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect()
     }
 
     // ========================================================================
@@ -1186,11 +1184,7 @@ mod tests {
 
         // Generate random vectors
         let vectors: Vec<Vec<f32>> = (0..num_docs)
-            .map(|_| {
-                (0..dim)
-                    .map(|_| rng.random_range(-1.0..1.0))
-                    .collect()
-            })
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect())
             .collect();
 
         // Build indices

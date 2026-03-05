@@ -628,9 +628,7 @@ mod tests {
     fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        (0..dim)
-            .map(|_| rng.random_range(-1.0..1.0))
-            .collect()
+        (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect()
     }
 
     #[test]
