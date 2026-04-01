@@ -178,7 +178,7 @@ jobs:
         run: Copy-Item "target\$env:TARGET\release\$env:ARTIFACT_NAME" "$env:ASSET_NAME"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
@@ -227,7 +227,7 @@ jobs:
           echo "WASM_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload WASM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: foxstash-wasm
           path: ${{ env.WASM_ARCHIVE }}
