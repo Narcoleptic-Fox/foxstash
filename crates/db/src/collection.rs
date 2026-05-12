@@ -611,7 +611,7 @@ impl Collection {
             let mut next_pending = Vec::new();
             let is_last_round = fetch >= inner.index.len();
 
-            for (query_idx, raw) in pending.into_iter().zip(raw_batch.into_iter()) {
+            for (query_idx, raw) in pending.into_iter().zip(raw_batch) {
                 let filtered: Vec<SearchResult> = raw
                     .into_iter()
                     .filter(|r| inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref()))
