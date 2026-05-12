@@ -875,7 +875,7 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..num_vectors)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
                     .collect()
             })
             .collect();
@@ -936,7 +936,7 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..num_vectors)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
                     .collect()
             })
             .collect();

@@ -32,7 +32,7 @@ use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
 use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 // ============================================================================
 // Helper Functions
@@ -41,7 +41,7 @@ use rand::{Rng, SeedableRng};
 /// Generate a random embedding vector with given dimension
 fn generate_random_embedding(dim: usize, seed: u64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
-    (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
+    (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
 }
 
 /// Generate multiple random embedding vectors

@@ -42,7 +42,7 @@ use foxstash_core::index::hnsw::HNSWIndex;
 use foxstash_core::storage::file::{FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::{Document, Result};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::time::Duration;
 
 fn serialize_flat_index(index: &FlatIndex) -> Vec<u8> {
@@ -78,7 +78,7 @@ mod data_gen {
     /// providing a baseline for compression performance testing.
     pub fn random_bytes(size: usize, seed: u64) -> Vec<u8> {
         let mut rng = StdRng::seed_from_u64(seed);
-        (0..size).map(|_| rng.gen::<u8>()).collect()
+        (0..size).map(|_| rng.random::<u8>()).collect()
     }
 
     /// Generate JSON documents (realistic text data)
@@ -99,7 +99,7 @@ mod data_gen {
                         The content should compress reasonably well because text \
                         has natural redundancy and patterns. Random value: {}",
                         i,
-                        rng.gen::<f64>()
+                        rng.random::<f64>()
                     ),
                     "metadata": {
                         "category": categories[i % 3],
@@ -123,7 +123,7 @@ mod data_gen {
 
         for _ in 0..count {
             for _ in 0..dim {
-                let value = rng.gen::<f32>() * 2.0 - 1.0; // Range [-1, 1]
+                let value = rng.random::<f32>() * 2.0 - 1.0; // Range [-1, 1]
                 data.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -156,7 +156,7 @@ mod data_gen {
         };
 
         // Generate random embedding
-        let embedding: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+        let embedding: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
 
         Document {
             id: id.to_string(),
