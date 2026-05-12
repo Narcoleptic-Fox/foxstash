@@ -48,7 +48,7 @@
 
 use crate::vector::product_quantize::{PQCode, PQConfig, PQDistanceCache, ProductQuantizer};
 use crate::{Document, RagError, Result, SearchResult};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -410,8 +410,8 @@ impl PQHNSWIndex {
     }
 
     fn random_level(&self) -> usize {
-        let mut rng = rand::thread_rng();
-        let uniform: f32 = rng.gen::<f32>().max(f32::EPSILON);
+        let mut rng = rand::rng();
+        let uniform: f32 = rng.random::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
@@ -750,7 +750,7 @@ mod tests {
         (0..n)
             .map(|_| {
                 (0..dim)
-                    .map(|_| rand::Rng::gen_range(&mut rng, -1.0..1.0))
+                    .map(|_| rand::RngExt::random_range(&mut rng, -1.0..1.0))
                     .collect()
             })
             .collect()
