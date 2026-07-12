@@ -996,6 +996,15 @@ pub struct HNSWConfigWrapper {
     pub extend_candidates: bool,
     #[serde(default = "default_keep_pruned")]
     pub keep_pruned_connections: bool,
+    /// Absent from indexes persisted before this field existed; `serde(default)` gives them
+    /// `None`, which is what they had.
+    ///
+    /// This used to be dropped on deserialize — hardcoded to `None` no matter what was
+    /// written. `seed` drives `random_level()` on every `add()`, so a reloaded index assigned
+    /// its nodes to *different layers* than the original: a save/load round-trip silently
+    /// destroyed reproducibility for anyone who had explicitly asked for it.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 fn default_use_heuristic() -> bool {
@@ -1019,6 +1028,7 @@ impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
             metric: config.metric,
             storage: config.storage,
             rerank_candidates: config.rerank_candidates,
+            seed: config.seed,
         }
     }
 }
@@ -1041,8 +1051,14 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             keep_pruned_connections: wrapper.keep_pruned_connections,
             storage: wrapper.storage,
             rerank_candidates: wrapper.rerank_candidates,
+            seed: wrapper.seed,
+            // NOT persisted, and that is deliberate rather than an oversight: `to_index`
+            // rebuilds the graph by looping `add()`, which never consults `build_strategy`.
+            // Persisting it would record a value that had no bearing on the index being
+            // loaded. (`seed` above IS persisted — it drives `random_level()` on every
+            // `add()`, so dropping it silently changed which layer each node landed on and
+            // destroyed reproducibility across a save/load.)
             build_strategy: crate::index::BuildStrategy::default(),
-            seed: None,
         }
     }
 }
@@ -1060,7 +1076,25 @@ impl HNSWIndexWrapper {
     /// Convert wrapper to HNSWIndex
     pub fn to_index(&self) -> Result<crate::index::HNSWIndex> {
         let config: crate::index::HNSWConfig = self.config.clone().into();
+        let quantized = config.storage != crate::index::Storage::F32;
         let mut index = crate::index::HNSWIndex::new(self.embedding_dim, config);
+
+        // A quantized storage mode cannot encode a vector before it knows the data
+        // distribution, so `add()` on an untrained index is an error. `new()` does not train —
+        // only `build`/`build_parallel` do, and this path uses neither. So a `Storage::SQ8`
+        // index could be *saved* and never *loaded*: reload used to panic, and after the
+        // `train()` contract landed it returned `NotTrained` instead. Round-tripping quantized
+        // storage has in fact never worked, and nothing tested it.
+        //
+        // The corpus we are about to insert IS the training sample, so fit the codebook from
+        // it first. Skipped entirely for F32 — `train()` is a no-op there, and the clone is
+        // not free.
+        if quantized {
+            let sample: Vec<Vec<f32>> =
+                self.documents.iter().map(|d| d.embedding.clone()).collect();
+            index.train(&sample)?;
+        }
+
         for doc in &self.documents {
             index.add(doc.clone())?;
         }
@@ -1447,6 +1481,73 @@ mod tests {
         let query = vec![0.1, 0.2, 0.3, 0.4, 0.5];
         let results = restored.search(&query, 2).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn quantized_index_survives_a_save_load_roundtrip() {
+        // An SQ8 index could be saved and never loaded. `to_index()` rebuilds by calling
+        // `HNSWIndex::new()` (which does not fit a codebook) and then looping `add()` — which
+        // for quantized storage panicked, and later returned `NotTrained`. The round-trip has
+        // never worked, and the existing roundtrip test used the default F32 storage, so it
+        // could not fail on this.
+        //
+        // Asserting `len()` and "search returns 2 results" is NOT enough here: a reload that
+        // silently reinterpreted 8-bit codes as f32 would still return the right *count* of
+        // results, all of them wrong. So assert the restored index returns the SAME top-k as
+        // the original.
+        let dim = 16;
+        let docs: Vec<Document> = (0..40)
+            .map(|i| Document {
+                id: format!("doc-{i}"),
+                content: String::new(),
+                embedding: (0..dim)
+                    .map(|d| ((i * 7 + d * 3) % 23) as f32 / 23.0)
+                    .collect(),
+                metadata: None,
+            })
+            .collect();
+
+        let index = crate::index::HNSWIndex::build(
+            docs.iter().map(|d| d.embedding.clone()).collect(),
+            crate::index::HNSWConfig {
+                storage: crate::index::Storage::SQ8,
+                rerank_candidates: 100,
+                metric: crate::index::DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+
+        let wrapper = HNSWIndexWrapper::from_index(&index);
+        let restored = wrapper
+            .to_index()
+            .expect("a quantized index must survive a save/load roundtrip");
+
+        assert_eq!(restored.len(), index.len());
+        assert_eq!(
+            restored.config().storage,
+            crate::index::Storage::SQ8,
+            "storage mode must persist — reloading SQ8 as F32 would reinterpret 8-bit codes \
+             as f32 and return garbage"
+        );
+
+        let query: Vec<f32> = (0..dim).map(|d| ((d * 3) % 23) as f32 / 23.0).collect();
+        let before: Vec<String> = index
+            .search(&query, 5)
+            .unwrap()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+        let after: Vec<String> = restored
+            .search(&query, 5)
+            .unwrap()
+            .iter()
+            .map(|r| r.id.clone())
+            .collect();
+
+        assert_eq!(
+            after, before,
+            "restored SQ8 index returned different neighbours than the original"
+        );
     }
 
     #[test]
