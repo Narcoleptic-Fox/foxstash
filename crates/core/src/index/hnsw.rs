@@ -1466,8 +1466,13 @@ impl HNSWIndex {
             }
         }
 
-        // Get best candidates from search
-        let found = search.select_simple();
+        // Get best candidates from search, diversified via the Algorithm-4
+        // heuristic. Using the raw nearest set here (select_simple) connects each
+        // node only to its closest same-cluster neighbors, which leaves clusters
+        // poorly bridged and tanks recall on structured data. The heuristic keeps
+        // a diverse neighbor set so search can cross cluster boundaries — matching
+        // the sequential build path.
+        let found = Self::par_select_heuristic(search.select_simple(), points, M0_MAX);
 
         // Add connections: new node → neighbors (in zero layer)
         {
@@ -1485,6 +1490,45 @@ impl HNSWIndex {
         pool.push(search);
     }
 
+    /// Algorithm-4 diversity neighbor selection for the parallel build path.
+    ///
+    /// `sorted` must be ascending by distance to the new point (as produced by
+    /// the search's `nearest` list). Mirrors the sequential `select_neighbors`
+    /// with `keep_pruned_connections = true`: keep a candidate only if it is
+    /// closer to the new point than to any already-selected neighbor, then
+    /// backfill from the pruned candidates (closest first) to reach `m`.
+    fn par_select_heuristic(sorted: &[Candidate], points: &[Vec<f32>], m: usize) -> Vec<Candidate> {
+        let mut selected: Vec<Candidate> = Vec::with_capacity(m);
+        for &cand in sorted {
+            if selected.len() >= m {
+                break;
+            }
+            // Keep `cand` unless it is closer to an already-selected neighbor
+            // than to the query point (i.e. it sits "behind" a selected node).
+            let cand_point = &points[cand.pid.as_usize()];
+            let diverse = selected.iter().all(|s| {
+                Self::parallel_distance(cand_point, &points[s.pid.as_usize()]) >= cand.distance
+            });
+            if diverse {
+                selected.push(cand);
+            }
+        }
+
+        // keep_pruned_connections: backfill to `m` with the closest remaining
+        // candidates so node degree stays high enough for connectivity.
+        if selected.len() < m {
+            for &cand in sorted {
+                if selected.len() >= m {
+                    break;
+                }
+                if !selected.iter().any(|s| s.pid == cand.pid) {
+                    selected.push(cand);
+                }
+            }
+        }
+        selected
+    }
+
     /// Add reverse connection from neighbor to new node, maintaining SORTED order by distance
     /// This is critical: UpperNode::from_zero takes the first M entries, so they must be the M closest
     fn add_reverse_connection(
@@ -1495,40 +1539,60 @@ impl HNSWIndex {
     ) {
         let mut node = zero[neighbor.as_usize()].write();
         let neighbor_point = &points[neighbor.as_usize()];
-        let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
-
         let count = node.count();
 
-        // Binary search for insertion position (sorted by distance, ascending)
-        let pos = {
-            let mut left = 0;
-            let mut right = count;
-            while left < right {
-                let mid = (left + right) / 2;
-                let mid_dist =
-                    Self::parallel_distance(neighbor_point, &points[node.nearest[mid].as_usize()]);
-                if mid_dist < new_dist {
-                    left = mid + 1;
-                } else {
-                    right = mid;
-                }
-            }
-            left
-        };
-
-        // If position is beyond capacity, this node is worse than all current neighbors
-        if pos >= M0_MAX {
+        // Skip if the edge already exists.
+        if node.nearest[..count].contains(&new) {
             return;
         }
 
-        // Shift elements right to make room, dropping the last if at capacity
-        let shift_end = count.min(M0_MAX - 1);
-        for i in (pos..shift_end).rev() {
-            node.nearest[i + 1] = node.nearest[i];
+        if count < M0_MAX {
+            // Room available: insert maintaining ascending-distance order.
+            let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
+            let pos = {
+                let mut left = 0;
+                let mut right = count;
+                while left < right {
+                    let mid = (left + right) / 2;
+                    let mid_dist = Self::parallel_distance(
+                        neighbor_point,
+                        &points[node.nearest[mid].as_usize()],
+                    );
+                    if mid_dist < new_dist {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                left
+            };
+            for i in (pos..count).rev() {
+                node.nearest[i + 1] = node.nearest[i];
+            }
+            node.nearest[pos] = new;
+            return;
         }
 
-        // Insert at sorted position
-        node.nearest[pos] = new;
+        // Full: re-diversify {existing neighbors ∪ new} with the Algorithm-4
+        // heuristic instead of dropping the furthest. Naive "keep M closest"
+        // leaves cluster boundaries unconnected — the core recall bug on
+        // structured data. This mirrors the sequential build's reverse-prune.
+        let mut cands: Vec<Candidate> = node
+            .iter()
+            .chain(std::iter::once(new))
+            .map(|pid| Candidate {
+                distance: Self::parallel_distance(neighbor_point, &points[pid.as_usize()]),
+                pid,
+            })
+            .collect();
+        cands.sort_unstable();
+        let selected = Self::par_select_heuristic(&cands, points, M0_MAX);
+
+        // |cands| = M0_MAX + 1 > M0_MAX, so the heuristic returns exactly M0_MAX
+        // (diverse picks + backfill) and every slot is overwritten.
+        for (slot, cand) in node.nearest.iter_mut().zip(selected.iter()) {
+            *slot = cand.pid;
+        }
     }
 
     /// Convert parallel construction data to final HNSWIndex format
