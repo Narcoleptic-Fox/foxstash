@@ -105,6 +105,33 @@ pub fn l2_distance_simd(a: &[f32], b: &[f32]) -> f32 {
     simd.dispatch(|| l2_distance_simd_impl(simd, a, b))
 }
 
+/// Squared L2 distance — the same kernel as [`l2_distance_simd`] without the final `sqrt`.
+///
+/// `sqrt` is monotonic, so squared L2 induces exactly the same *ordering* as L2. Nearest-
+/// neighbour search only ever compares distances, so the square root is pure overhead in
+/// the inner loop: a SIFT query at `ef_search=500` computes ~8,500 distances, and every
+/// one of those was paying for a root nobody reads.
+///
+/// Use this for ranking; take the root only on the handful of results you return.
+///
+/// # Examples
+///
+/// ```
+/// use foxstash_core::vector::simd::l2_squared_distance_simd;
+///
+/// let a = vec![0.0, 0.0];
+/// let b = vec![3.0, 4.0];
+/// assert!((l2_squared_distance_simd(&a, &b) - 25.0).abs() < 1e-5); // 5^2
+/// ```
+#[inline]
+pub fn l2_squared_distance_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "Vector dimensions must match");
+
+    let simd = pulp::Arch::new();
+
+    simd.dispatch(|| l2_squared_distance_simd_impl(simd, a, b))
+}
+
 /// Computes cosine similarity using SIMD acceleration.
 ///
 /// Calculates: dot(a, b) / (||a|| * ||b||)
@@ -310,6 +337,43 @@ fn l2_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
     }
 
     simd.dispatch(L2Distance { a, b })
+}
+
+#[inline(always)]
+fn l2_squared_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
+    struct L2Squared<'a> {
+        a: &'a [f32],
+        b: &'a [f32],
+    }
+
+    impl pulp::WithSimd for L2Squared<'_> {
+        type Output = f32;
+
+        #[inline(always)]
+        fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+            let a = self.a;
+            let b = self.b;
+            let (a_chunks, a_tail) = S::as_simd_f32s(a);
+            let (b_chunks, b_tail) = S::as_simd_f32s(b);
+
+            let mut sum_squares = simd.splat_f32s(0.0);
+            for (&a_vec, &b_vec) in a_chunks.iter().zip(b_chunks.iter()) {
+                let diff = simd.sub_f32s(a_vec, b_vec);
+                sum_squares = simd.mul_add_e_f32s(diff, diff, sum_squares);
+            }
+
+            let mut result = simd.reduce_sum_f32s(sum_squares);
+            debug_assert_eq!(a_tail.len(), b_tail.len());
+            for (&a_scalar, &b_scalar) in a_tail.iter().zip(b_tail.iter()) {
+                let diff = a_scalar - b_scalar;
+                result += diff * diff;
+            }
+
+            result // no sqrt: monotonic in L2, and callers only compare
+        }
+    }
+
+    simd.dispatch(L2Squared { a, b })
 }
 
 /// Vector magnitude WithSimd impl — used by both `magnitude_simd_impl` and `norm_simd`.

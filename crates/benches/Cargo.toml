@@ -15,6 +15,7 @@ tempfile = "3.8"
 
 # Comparison benchmarks
 instant-distance = "0.6"
+pulp = "0.22"
 
 [features]
 default = []

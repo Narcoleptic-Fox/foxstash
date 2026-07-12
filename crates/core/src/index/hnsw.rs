@@ -307,6 +307,28 @@ impl HNSWConfig {
     }
 }
 
+/// Where an [`HNSWIndex`]'s memory actually goes. See [`HNSWIndex::memory_breakdown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBreakdown {
+    /// Contiguous f32 vectors — the irreducible cost of the data itself.
+    pub embeddings: usize,
+    /// Precomputed L2 norms. Used by the cosine metric; dead weight under L2.
+    pub norms: usize,
+    /// Flat layer-0 adjacency plus its per-node counts. The hot path, and the bulk of the graph.
+    pub layer0_links: usize,
+    /// Nested adjacency for layers >= 1, including per-`Vec` headers.
+    pub upper_layer_links: usize,
+    /// Document ids and contents.
+    pub payload: usize,
+}
+
+impl MemoryBreakdown {
+    /// Total retained bytes.
+    pub fn total(&self) -> usize {
+        self.embeddings + self.norms + self.layer0_links + self.upper_layer_links + self.payload
+    }
+}
+
 /// HNSW index for efficient similarity search
 ///
 /// Uses Struct-of-Arrays (SoA) layout for better cache locality:
@@ -525,6 +547,7 @@ impl HNSWIndex {
         }
 
         index.build_l0_cache();
+        index.shrink_to_fit();
         index
     }
 
@@ -548,13 +571,55 @@ impl HNSWIndex {
         &self.embeddings[start..end]
     }
 
-    /// Get layer 0 neighbors from the flat cache (single indirection).
+    /// Stride of the flat layer-0 array: `m0` neighbours plus one spare slot.
+    ///
+    /// Insertion pushes a link and *then* prunes, so a node transiently holds `m0 + 1`
+    /// neighbours. The spare slot lets that happen in place instead of spilling to a Vec.
+    #[inline(always)]
+    fn l0_stride(&self) -> usize {
+        self.config.m0 + 1
+    }
+
+    /// Get layer 0 neighbors from the flat array (single indirection).
+    ///
+    /// This array is the *sole* owner of layer-0 connections; the nested `connections`
+    /// structure holds layers >= 1 only. Storing both cost ~26% of index memory for a
+    /// duplicate of the hottest data in the index.
     #[inline(always)]
     fn get_neighbors_l0(&self, node_id: usize) -> &[u32] {
-        let m0 = self.config.m0;
-        let start = node_id * m0;
+        let stride = self.l0_stride();
+        let start = node_id * stride;
         let count = self.connections_l0_count[node_id] as usize;
         &self.connections_l0[start..start + count]
+    }
+
+    /// True if `node_id` already links to `neighbor` at layer 0.
+    #[inline]
+    fn l0_contains(&self, node_id: usize, neighbor: u32) -> bool {
+        self.get_neighbors_l0(node_id).contains(&neighbor)
+    }
+
+    /// Append a layer-0 link. Capacity is `m0 + 1`; the caller prunes back to `m0`.
+    #[inline]
+    fn l0_push(&mut self, node_id: usize, neighbor: u32) {
+        let stride = self.l0_stride();
+        let count = self.connections_l0_count[node_id] as usize;
+        debug_assert!(
+            count < stride,
+            "layer-0 overflow: prune before pushing again"
+        );
+        self.connections_l0[node_id * stride + count] = neighbor;
+        self.connections_l0_count[node_id] = (count + 1) as u8;
+    }
+
+    /// Replace a node's entire layer-0 neighbour list (used after pruning).
+    #[inline]
+    fn l0_replace(&mut self, node_id: usize, neighbors: &[u32]) {
+        let stride = self.l0_stride();
+        let count = neighbors.len().min(self.config.m0);
+        let start = node_id * stride;
+        self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
+        self.connections_l0_count[node_id] = count as u8;
     }
 
     /// Build flat layer 0 cache from the nested `connections` structure.
@@ -562,15 +627,19 @@ impl HNSWIndex {
     fn build_l0_cache(&mut self) {
         let n = self.len();
         let m0 = self.config.m0;
-        debug_assert!(m0 <= 255, "m0 exceeds u8 capacity for connections_l0_count");
-        self.connections_l0 = vec![0u32; n * m0];
+        let stride = m0 + 1;
+        debug_assert!(
+            stride <= 255,
+            "m0 + 1 exceeds u8 capacity for connections_l0_count"
+        );
+        self.connections_l0 = vec![0u32; n * stride];
         self.connections_l0_count = vec![0u8; n];
 
         for i in 0..n {
             if !self.connections[i].is_empty() {
-                let neighbors = &self.connections[i][0];
+                let neighbors = std::mem::take(&mut self.connections[i][0]);
                 let count = neighbors.len().min(m0);
-                let start = i * m0;
+                let start = i * stride;
                 self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
                 self.connections_l0_count[i] = count as u8;
             }
@@ -579,9 +648,9 @@ impl HNSWIndex {
 
     /// Extend flat L0 cache to accommodate a new node (for incremental add).
     fn extend_l0_cache_for_new_node(&mut self) {
-        let m0 = self.config.m0;
+        let stride = self.l0_stride();
         self.connections_l0
-            .resize(self.connections_l0.len() + m0, 0);
+            .resize(self.connections_l0.len() + stride, 0);
         self.connections_l0_count.push(0);
     }
 
@@ -634,10 +703,7 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        let affected = self.insert_node(node_id, node_level);
-
-        // Update only the nodes whose L0 connections changed (O(m0) per node).
-        self.sync_l0_cache_for_nodes(&affected);
+        self.insert_node(node_id, node_level);
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -701,10 +767,7 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        let affected = self.insert_node(node_id, node_level);
-
-        // Update only the nodes whose L0 connections changed (O(m0) per node).
-        self.sync_l0_cache_for_nodes(&affected);
+        self.insert_node(node_id, node_level);
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -739,9 +802,16 @@ impl HNSWIndex {
     pub fn search_batch(&self, queries: &[Vec<f32>], k: usize) -> Result<Vec<Vec<SearchResult>>> {
         use rayon::prelude::*;
 
+        // One SearchContext per worker thread, not per query. `search()` allocates a fresh
+        // context (a whole-index visited bitset plus two heaps) on every call, which at
+        // batch sizes is pure allocator churn — `map_init` hands each rayon worker a context
+        // it reuses across all the queries it happens to receive.
         queries
             .par_iter()
-            .map(|query| self.search(query, k))
+            .map_init(
+                || self.create_search_context(),
+                |ctx, query| self.search_with_context(query, k, ctx),
+            )
             .collect()
     }
 
@@ -784,35 +854,33 @@ impl HNSWIndex {
         let entry_point = self.entry_point.unwrap();
         let mut current_nearest = vec![entry_point];
 
-        // Search from top layer to layer 1
+        // Search from top layer to layer 1 (ef=1 greedy descent — ids only)
         for layer in (1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(query, &current_nearest, 1, layer, ctx, query_norm);
+            current_nearest = self
+                .search_layer(query, &current_nearest, 1, layer, ctx, query_norm)
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
         }
 
         // Search layer 0 with ef_search candidates
         let ef = self.config.ef_search.max(k);
-        current_nearest = self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
+        let found = self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
 
-        // Convert to SearchResults (cold path — distances already computed above)
-        let mut results: Vec<SearchResult> = current_nearest
-            .iter()
-            .map(|&node_id| {
-                // Use fused distance for final scoring too
-                let dist = self.distance_to_node(query, node_id, query_norm);
-                let score = self.score_from_distance(dist);
-                SearchResult {
-                    id: self.ids[node_id].clone(),
-                    content: self.contents[node_id].clone(),
-                    score,
-                    metadata: self.metadata[node_id].clone(),
-                }
+        // `found` is already sorted nearest-first and carries its distances, so cut to k
+        // *before* materialising anything. Building a SearchResult per candidate would clone
+        // an id, a content string and a metadata blob for all `ef` of them (500 by default)
+        // only to discard all but k — and would recompute every distance to do it.
+        Ok(found
+            .into_iter()
+            .take(k)
+            .map(|(dist, node_id)| SearchResult {
+                id: self.ids[node_id].clone(),
+                content: self.contents[node_id].clone(),
+                score: self.score_from_distance(dist),
+                metadata: self.metadata[node_id].clone(),
             })
-            .collect();
-
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        results.truncate(k);
-
-        Ok(results)
+            .collect())
     }
 
     /// Fast batch search using reusable contexts
@@ -907,6 +975,70 @@ impl HNSWIndex {
         self.embedding_dim
     }
 
+    /// Release surplus allocation capacity.
+    ///
+    /// `Vec` growth doubles, so after a build the embedding array can hold ~2x the bytes it
+    /// needs (8.4 MB of capacity for 5.1 MB of vectors on SIFT10K). The build paths call
+    /// this for you; call it yourself after a run of `add()` if the index is now static.
+    pub fn shrink_to_fit(&mut self) {
+        self.embeddings.shrink_to_fit();
+        self.norms.shrink_to_fit();
+        self.connections_l0.shrink_to_fit();
+        self.connections_l0_count.shrink_to_fit();
+        self.ids.shrink_to_fit();
+        self.contents.shrink_to_fit();
+        self.metadata.shrink_to_fit();
+        for layers in &mut self.connections {
+            for l in layers.iter_mut() {
+                l.shrink_to_fit();
+            }
+            layers.shrink_to_fit();
+        }
+        self.connections.shrink_to_fit();
+    }
+
+    /// Bytes actually retained by this index, broken down by component.
+    ///
+    /// Counts allocated *capacity*, not just length, and includes the per-`Vec` headers in
+    /// the nested graph — those are easy to forget and, at one `Vec` per node per layer,
+    /// they are not small.
+    ///
+    /// Prefer this over measuring RSS: RSS around a build also captures the builder's
+    /// transient allocations and whatever the allocator declines to return to the OS.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        let vec_header = std::mem::size_of::<Vec<u32>>();
+
+        let nested: usize = self
+            .connections
+            .iter()
+            .map(|layers| {
+                vec_header
+                    + layers
+                        .iter()
+                        .map(|l| vec_header + l.capacity() * std::mem::size_of::<u32>())
+                        .sum::<usize>()
+            })
+            .sum();
+
+        MemoryBreakdown {
+            embeddings: self.embeddings.capacity() * std::mem::size_of::<f32>(),
+            norms: self.norms.capacity() * std::mem::size_of::<f32>(),
+            layer0_links: self.connections_l0.capacity() * std::mem::size_of::<u32>()
+                + self.connections_l0_count.capacity(),
+            upper_layer_links: nested,
+            payload: self
+                .ids
+                .iter()
+                .map(|s| s.capacity() + std::mem::size_of::<String>())
+                .sum::<usize>()
+                + self
+                    .contents
+                    .iter()
+                    .map(|s| s.capacity() + std::mem::size_of::<String>())
+                    .sum::<usize>(),
+        }
+    }
+
     /// Generates a random level for a new node using exponential decay.
     ///
     /// Clamps the uniform sample to `[EPSILON, 1)` to prevent `ln(0.0) = -inf`.
@@ -920,13 +1052,12 @@ impl HNSWIndex {
     ///
     /// Returns the IDs of all nodes whose layer-0 connections were modified
     /// (the new node itself plus all layer-0 neighbors it linked to). The caller
-    /// can pass this list to `sync_l0_cache_for_nodes` instead of doing a full
     /// `build_l0_cache` rebuild.
     ///
     /// # Arguments
     /// * `node_id` - ID of the node to insert
     /// * `node_level` - Maximum layer of the node
-    fn insert_node(&mut self, node_id: usize, node_level: usize) -> Vec<usize> {
+    fn insert_node(&mut self, node_id: usize, node_level: usize) {
         let entry_point = self.entry_point.unwrap();
         let mut current_nearest = vec![entry_point];
 
@@ -937,30 +1068,34 @@ impl HNSWIndex {
 
         // Search for nearest neighbors from top to target layer + 1
         for layer in (node_level + 1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(
-                &node_embedding,
-                &current_nearest,
-                1,
-                layer,
-                &mut ctx,
-                query_norm,
-            );
+            current_nearest = self
+                .search_layer(
+                    &node_embedding,
+                    &current_nearest,
+                    1,
+                    layer,
+                    &mut ctx,
+                    query_norm,
+                )
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
         }
-
-        // Collect L0-modified nodes for incremental cache update.
-        // The new node itself is always modified at layer 0.
-        let mut l0_modified: Vec<usize> = vec![node_id];
 
         // Insert into layers from top to bottom
         for layer in (0..=node_level).rev() {
-            current_nearest = self.search_layer(
-                &node_embedding,
-                &current_nearest,
-                self.config.ef_construction,
-                layer,
-                &mut ctx,
-                query_norm,
-            );
+            current_nearest = self
+                .search_layer(
+                    &node_embedding,
+                    &current_nearest,
+                    self.config.ef_construction,
+                    layer,
+                    &mut ctx,
+                    query_norm,
+                )
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
 
             // Determine M for this layer
             let m = if layer == 0 {
@@ -972,29 +1107,47 @@ impl HNSWIndex {
             // Select M nearest neighbors
             let neighbors = self.select_neighbors(&current_nearest, &node_embedding, m, layer);
 
-            // Add bidirectional links
+            // Add bidirectional links. Layer 0 is owned by the flat array; layers >= 1 by
+            // the nested structure. Keeping both would duplicate the hottest data in the index.
             for &neighbor_id in &neighbors {
-                // Add link from new node to neighbor (avoid duplicates)
                 let neighbor_u32 = neighbor_id as u32;
+                let node_u32 = node_id as u32;
+
+                if layer == 0 {
+                    if !self.l0_contains(node_id, neighbor_u32) {
+                        self.l0_push(node_id, neighbor_u32);
+                    }
+                    if !self.l0_contains(neighbor_id, node_u32) {
+                        self.l0_push(neighbor_id, node_u32);
+                    }
+
+                    let m0 = self.config.m0;
+                    if self.connections_l0_count[neighbor_id] as usize > m0 {
+                        let neighbor_embedding = self.get_embedding(neighbor_id).to_vec();
+                        let current: Vec<usize> = self
+                            .get_neighbors_l0(neighbor_id)
+                            .iter()
+                            .map(|&x| x as usize)
+                            .collect();
+                        let pruned =
+                            self.select_neighbors(&current, &neighbor_embedding, m0, layer);
+                        let pruned: Vec<u32> = pruned.into_iter().map(|x| x as u32).collect();
+                        self.l0_replace(neighbor_id, &pruned);
+                    }
+                    continue;
+                }
+
                 if !self.connections[node_id][layer].contains(&neighbor_u32) {
                     self.connections[node_id][layer].push(neighbor_u32);
                 }
 
                 // Only add bidirectional link if neighbor exists at this layer
                 if layer < self.connections[neighbor_id].len() {
-                    // Add link from neighbor to new node
-                    let node_u32 = node_id as u32;
                     if !self.connections[neighbor_id][layer].contains(&node_u32) {
                         self.connections[neighbor_id][layer].push(node_u32);
                     }
 
-                    // Prune neighbor's connections if needed
-                    let neighbor_m = if layer == 0 {
-                        self.config.m0
-                    } else {
-                        self.config.m
-                    };
-
+                    let neighbor_m = self.config.m;
                     if self.connections[neighbor_id][layer].len() > neighbor_m {
                         let neighbor_embedding = self.get_embedding(neighbor_id).to_vec();
                         let neighbor_connections: Vec<usize> = self.connections[neighbor_id][layer]
@@ -1011,41 +1164,7 @@ impl HNSWIndex {
                         self.connections[neighbor_id][layer] =
                             pruned.into_iter().map(|x| x as u32).collect();
                     }
-
-                    // Track layer-0 nodes modified by bidirectional linking.
-                    if layer == 0 {
-                        l0_modified.push(neighbor_id);
-                    }
                 }
-            }
-        }
-
-        l0_modified
-    }
-
-    /// Updates the flat L0 cache for a specific subset of nodes.
-    ///
-    /// Called after incremental insertions to avoid the O(n) full rebuild
-    /// that `build_l0_cache` performs. Each node update is O(m0).
-    fn sync_l0_cache_for_nodes(&mut self, node_ids: &[usize]) {
-        let m0 = self.config.m0;
-        // Ensure cache is large enough for all nodes.
-        let needed = self.connections.len() * m0;
-        if self.connections_l0.len() < needed {
-            self.connections_l0.resize(needed, 0u32);
-            self.connections_l0_count
-                .resize(self.connections.len(), 0u8);
-        }
-        for &node_id in node_ids {
-            if node_id < self.connections.len() && !self.connections[node_id].is_empty() {
-                let neighbors = &self.connections[node_id][0];
-                let count = neighbors.len().min(m0);
-                let start = node_id * m0;
-                self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
-                for j in count..m0 {
-                    self.connections_l0[start + j] = 0;
-                }
-                self.connections_l0_count[node_id] = count as u8;
             }
         }
     }
@@ -1062,7 +1181,7 @@ impl HNSWIndex {
         layer: usize,
         ctx: &mut SearchContext,
         query_norm: f32,
-    ) -> Vec<usize> {
+    ) -> Vec<(f32, usize)> {
         ctx.reset();
 
         // Initialize with entry points
@@ -1174,7 +1293,8 @@ impl HNSWIndex {
             }
         }
 
-        // Extract and return node IDs sorted by distance
+        // Return (distance, id) sorted nearest-first. The distances are already computed;
+        // handing back bare ids would force every caller to recompute all `ef` of them.
         let mut results: Vec<(f32, usize)> = ctx
             .best
             .drain()
@@ -1182,7 +1302,7 @@ impl HNSWIndex {
             .collect();
 
         results.sort_by(|a, b| a.0.total_cmp(&b.0));
-        results.into_iter().map(|(_, id)| id).collect()
+        results
     }
 
     /// Selects M best neighbors using a heuristic
@@ -1218,12 +1338,18 @@ impl HNSWIndex {
         if self.config.extend_candidates {
             let mut seen: HashSet<usize> = candidates.iter().copied().collect();
             for &candidate in candidates {
-                if layer < self.connections[candidate].len() {
-                    for &neighbor_u32 in &self.connections[candidate][layer] {
-                        let neighbor = neighbor_u32 as usize;
-                        if seen.insert(neighbor) {
-                            working_candidates.push(neighbor);
-                        }
+                // Layer 0 lives in the flat array; layers >= 1 in the nested structure.
+                let neighbors: Vec<u32> = if layer == 0 {
+                    self.get_neighbors_l0(candidate).to_vec()
+                } else if layer < self.connections[candidate].len() {
+                    self.connections[candidate][layer].clone()
+                } else {
+                    Vec::new()
+                };
+                for neighbor_u32 in neighbors {
+                    let neighbor = neighbor_u32 as usize;
+                    if seen.insert(neighbor) {
+                        working_candidates.push(neighbor);
                     }
                 }
             }
@@ -1312,7 +1438,9 @@ impl HNSWIndex {
     fn metric_distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
         match metric {
             DistanceMetric::Cosine => 1.0 - crate::vector::simd::cosine_similarity_simd(a, b),
-            DistanceMetric::L2 => crate::vector::simd::l2_distance_simd(a, b),
+            // Squared, not rooted: monotonic in L2, so ordering is identical and the
+            // inner loop skips ~8,500 sqrts per query. `score_from_distance` roots it back.
+            DistanceMetric::L2 => crate::vector::simd::l2_squared_distance_simd(a, b),
         }
     }
 
@@ -1332,7 +1460,7 @@ impl HNSWIndex {
                 }
                 crate::vector::simd::cosine_distance_prenorm(query, embedding, norm_b)
             }
-            DistanceMetric::L2 => crate::vector::simd::l2_distance_simd(query, embedding),
+            DistanceMetric::L2 => crate::vector::simd::l2_squared_distance_simd(query, embedding),
         }
     }
 
@@ -1345,7 +1473,9 @@ impl HNSWIndex {
     fn score_from_distance(&self, dist: f32) -> f32 {
         match self.config.metric {
             DistanceMetric::Cosine => 1.0 - dist,
-            DistanceMetric::L2 => 1.0 / (1.0 + dist.max(0.0)),
+            // `dist` is squared L2 here (see `metric_distance`); root it so the score
+            // reflects true Euclidean distance rather than its square.
+            DistanceMetric::L2 => 1.0 / (1.0 + dist.max(0.0).sqrt()),
         }
     }
 
@@ -1722,6 +1852,7 @@ impl HNSWIndex {
             max_layer: top.0,
         };
         index.build_l0_cache();
+        index.shrink_to_fit();
         index
     }
 
@@ -2238,7 +2369,7 @@ mod tests {
         let mut ctx = index.create_search_context();
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, 1.0);
         assert!(
-            candidates.contains(&65),
+            candidates.iter().any(|&(_, id)| id == 65),
             "best neighbor from position >64 should be considered"
         );
     }
