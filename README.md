@@ -13,7 +13,7 @@ Foxstash is a local-first Retrieval-Augmented Generation (RAG) library featuring
 
 - **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with runtime CPU detection
 - **HNSW Indexing** - Hierarchical Navigable Small World graphs for fast similarity search
-- **Vector Quantization** - Int8 (4x), Binary (32x), and Product Quantization (192x)
+- **Vector Quantization** - SQ8 8-bit traversal (beats hnswlib 1.20x at 99.5% recall), RaBitQ 1-bit, Product Quantization
 - **Hybrid Search** - Combine BM25 keyword search with vector similarity for best-of-both recall
 - **ONNX Embeddings** - Generate embeddings locally with MiniLM-L6-v2 or any ONNX model
 - **WASM Support** - Run in the browser with IndexedDB persistence
@@ -57,36 +57,39 @@ for result in results {
 }
 ```
 
-### Memory-Efficient Indexing with Quantization
+### Faster search with 8-bit traversal (`Storage::SQ8`)
 
-For large datasets, use quantized indexes to reduce memory by 4-192x:
+This is the configuration that beats hnswlib. The graph is built with **exact** distances;
+only the bytes read during traversal are quantized, so recall is unchanged.
 
 ```rust
-use foxstash_core::index::{SQ8HNSWIndex, BinaryHNSWIndex, QuantizedHNSWConfig};
-use foxstash_core::Document;
+use foxstash_core::index::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, Storage};
 
-// Scalar Quantization (4x compression, 71.4% recall on SIFT10K)
-let mut sq8_index = SQ8HNSWIndex::for_normalized(384, QuantizedHNSWConfig::default());
+let index = HNSWIndex::build(embeddings, HNSWConfig {
+    metric: DistanceMetric::L2,
+    storage: Storage::SQ8,     // 8-bit codes in the hot node block
+    rerank_candidates: 100,    // rescore the top 100 against exact vectors
+    build_strategy: BuildStrategy::Parallel,
+    ..Default::default()
+});
 
-// Binary Quantization (32x compression, use with reranking)
-let mut binary_index = BinaryHNSWIndex::with_full_precision(384, QuantizedHNSWConfig::default());
-
-// Add documents
-let doc = Document {
-    id: "doc1".to_string(),
-    content: "Foxes cache food for retrieval".to_string(),
-    embedding: vec![0.1; 384],
-    metadata: None,
-};
-sq8_index.add(doc.clone())?;
-binary_index.add_with_full_precision(doc)?;
-
-// Search with SQ8 (high quality, 4x memory savings)
-let results = sq8_index.search(&query, 10)?;
-
-// Two-phase search with Binary (fast filter, then precise rerank)
-let results = binary_index.search_and_rerank(&query, 100, 10)?;
+let results = index.search(&query, 10)?;
 ```
+
+Set `rerank_candidates: 0` to drop the full-precision vectors entirely — the smallest index
+foxstash can build, at the cost of a recall ceiling. Measure that trade on your own data.
+
+### Memory (SIFT1M, 1M x 128d)
+
+| configuration | index size | vs hnswlib |
+|---|---|---|
+| `Storage::SQ8`, `rerank_candidates: 0` | **564 MB** | **0.73x** |
+| `Storage::F32` | 948 MB | 1.22x |
+| `Storage::SQ8` + rerank (fastest) | 1,076 MB | 1.39x |
+| hnswlib / faiss | ~776 MB | 1.00x |
+
+Rerank needs the full-precision vectors, so the fastest configuration is also the largest.
+Speed crown or memory crown — not both, yet.
 
 ### Product Quantization (Extreme Compression)
 
@@ -112,17 +115,6 @@ for doc in documents {
 // Search using Asymmetric Distance Computation (ADC)
 let results = index.search(&query, 10)?;
 ```
-
-### Memory Comparison (1M vectors, 384 dimensions)
-
-| Index Type | Memory | Compression | Recall |
-|------------|--------|-------------|--------|
-| HNSW (f32) | 1.5 GB | 1x | ~98% |
-| SQ8 HNSW | 384 MB | 4x | ~95% |
-| Binary HNSW | 48 MB | 32x | ~90%* |
-| PQ HNSW (M=8) | 8 MB | 192x | ~80%** |
-
-*With two-phase reranking. **Using ADC search.
 
 ### Streaming Batch Ingestion
 
@@ -493,7 +485,7 @@ index scores far better on SIFT100K because the task is easier, not because it i
 
 ## Roadmap
 
-- [x] Int8/Binary quantization (4-32x memory reduction)
+- [x] SQ8 8-bit traversal (`Storage::SQ8`) — beats hnswlib 1.20x at 99.5% recall on SIFT1M
 - [x] Streaming add/search for large datasets
 - [x] Incremental persistence (WAL + checkpointing)
 - [x] Product quantization (PQ) - up to 192x compression
