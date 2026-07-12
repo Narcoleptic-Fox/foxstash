@@ -1240,7 +1240,7 @@ mod concurrent_access {
     }
 
     #[test]
-    fn search_batch_fast_produces_correct_count() {
+    fn search_batch_matches_search_query_for_query() {
         let dim = 32;
         let mut index = HNSWIndex::with_defaults(dim);
 
@@ -1252,21 +1252,22 @@ mod concurrent_access {
             .map(|i| deterministic_embedding(dim, i + 5000))
             .collect();
 
-        let batch_results = index.search_batch_fast(&queries, 5).unwrap();
+        let batch = index.search_batch(&queries, 5).unwrap();
+        assert_eq!(batch.len(), queries.len());
 
-        assert_eq!(batch_results.len(), 10);
-        for (i, results) in batch_results.iter().enumerate() {
-            assert_eq!(
-                results.len(),
-                5,
-                "Fast batch query {} should return 5 results",
-                i
-            );
+        // The parallel path must agree with the serial one exactly. Counting results (the
+        // old assertion) proves nothing: a batch search that shuffled its per-query scratch
+        // between rayon workers would still return 10 lists of 5, all of them wrong.
+        for (i, query) in queries.iter().enumerate() {
+            let serial = index.search(query, 5).unwrap();
+            let ids: Vec<&str> = batch[i].iter().map(|r| r.id.as_str()).collect();
+            let expected: Vec<&str> = serial.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, expected, "search_batch disagrees with search on query {i}");
         }
     }
 
     #[test]
-    fn search_with_context_matches_regular_search() {
+    fn a_reused_searcher_returns_identical_results_to_a_fresh_search() {
         let dim = 32;
         let mut index = HNSWIndex::with_defaults(dim);
 
@@ -1274,26 +1275,44 @@ mod concurrent_access {
             index.add(make_doc(&format!("doc_{}", i), dim, i)).unwrap();
         }
 
-        let query = deterministic_embedding(dim, 999);
+        let queries: Vec<Vec<f32>> = (0..20).map(|i| deterministic_embedding(dim, i + 999)).collect();
         let k = 5;
 
-        let regular_results = index.search(&query, k).unwrap();
-        let mut ctx = index.create_search_context();
-        let ctx_results = index.search_with_context(&query, k, &mut ctx).unwrap();
+        // The point of a Searcher is that it carries scratch (a visited bitset and two heaps)
+        // across queries. If `reset()` ever failed to clear that scratch, query N+1 would see
+        // query N's nodes already marked visited, skip them, and quietly return a worse
+        // result — a bug that degrades recall without ever erroring.
+        //
+        // So the assertion is EQUALITY, not overlap. The predecessor of this test asserted
+        // `overlap >= 3` of 5, which a fully broken bitset would still have passed.
+        let fresh: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| index.search(q, k).unwrap().iter().map(|r| r.id.clone()).collect())
+            .collect();
 
-        assert_eq!(regular_results.len(), ctx_results.len());
+        let mut searcher = index.searcher();
+        for (i, query) in queries.iter().enumerate() {
+            let reused: Vec<String> = searcher
+                .search(query, k)
+                .unwrap()
+                .iter()
+                .map(|r| r.id.clone())
+                .collect();
+            assert_eq!(
+                reused, fresh[i],
+                "reused searcher diverged from a fresh search on query {i} — stale scratch"
+            );
+        }
 
-        // Results should overlap substantially (both find top matches)
-        let regular_ids: HashSet<&str> = regular_results.iter().map(|r| r.id.as_str()).collect();
-        let ctx_ids: HashSet<&str> = ctx_results.iter().map(|r| r.id.as_str()).collect();
-        let overlap = regular_ids.intersection(&ctx_ids).count();
-
+        // And it counts the work it did.
         assert!(
-            overlap >= 3,
-            "Regular and context search should substantially overlap, got {}/{}",
-            overlap,
-            k
+            searcher.distance_calls() > 0,
+            "searcher performed {} distance computations across {} queries",
+            searcher.distance_calls(),
+            queries.len()
         );
+        searcher.reset_stats();
+        assert_eq!(searcher.distance_calls(), 0);
     }
 }
 

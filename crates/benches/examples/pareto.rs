@@ -91,12 +91,12 @@ fn main() {
     println!("{:>6} {:>11} {:>10}", "ef", "recall@10", "QPS");
     println!("{:-<30}", "");
 
-    let mut ctx = index.create_search_context();
     for &ef in &[10usize, 20, 50, 100, 200, 500] {
         index.set_ef_search(ef);
 
+        let mut searcher = index.searcher();
         for q in ds.queries.iter().take(50) {
-            std::hint::black_box(index.search_with_context(q, K, &mut ctx).unwrap());
+            std::hint::black_box(searcher.search(q, K).unwrap());
         }
 
         let recall = ds.recall_at(K, |q| {
@@ -109,8 +109,9 @@ fn main() {
         });
 
         let t = Instant::now();
+        let mut searcher = index.searcher();
         for q in &ds.queries {
-            std::hint::black_box(index.search_with_context(q, K, &mut ctx).unwrap());
+            std::hint::black_box(searcher.search(q, K).unwrap());
         }
         let qps = ds.queries.len() as f64 / t.elapsed().as_secs_f64();
 

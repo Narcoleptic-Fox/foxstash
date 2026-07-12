@@ -141,12 +141,12 @@ fn foxstash_recall(
     k: usize,
     n: usize,
 ) -> f32 {
-    let mut ctx = index.create_search_context();
+    let mut searcher = index.searcher();
     let mut total = 0.0;
     for q in queries.iter().take(n) {
         let gt = brute_force_topk(q, base, k);
-        let got: HashSet<usize> = index
-            .search_with_context(q, k, &mut ctx)
+        let got: HashSet<usize> = searcher
+            .search(q, k)
             .unwrap()
             .iter()
             .map(|r| r.id.parse().unwrap())
@@ -188,14 +188,14 @@ fn main() {
     let (clustered_index, c_build) = build_foxstash(&clustered_base, 100);
     println!("Foxstash build time: {:?}", c_build);
 
-    let mut ctx = clustered_index.create_search_context();
+    let mut searcher = clustered_index.searcher();
     let start = Instant::now();
     for q in &clustered_queries {
-        let _ = clustered_index.search_with_context(q, K, &mut ctx);
+        let _ = searcher.search(q, K);
     }
     let c_qps = NUM_QUERIES as f64 / start.elapsed().as_secs_f64();
     println!(
-        "Foxstash search: {:.0} QPS (single-threaded, ctx reuse)",
+        "Foxstash search: {:.0} QPS (single-threaded, searcher reuse)",
         c_qps
     );
 
@@ -249,10 +249,10 @@ fn main() {
     println!("{:-<36}", "");
     for &ef in &[50usize, 100, 200, 400] {
         let (idx, _) = build_foxstash(&clustered_base, ef);
-        let mut sctx = idx.create_search_context();
+        let mut searcher = idx.searcher();
         let start = Instant::now();
         for q in &clustered_queries {
-            let _ = idx.search_with_context(q, K, &mut sctx);
+            let _ = searcher.search(q, K);
         }
         let qps = NUM_QUERIES as f64 / start.elapsed().as_secs_f64();
         let recall = foxstash_recall(&idx, &clustered_base, &clustered_queries, K, RECALL_QUERIES);

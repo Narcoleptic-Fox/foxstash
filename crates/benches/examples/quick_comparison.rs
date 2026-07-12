@@ -95,11 +95,11 @@ fn main() {
     let fs_build_time = start.elapsed();
     println!("Build time: {:?}", fs_build_time);
 
-    // Single-threaded search with context reuse (fair comparison to instant-distance)
-    let mut ctx = index.create_search_context();
+    // Single-threaded search with searcher reuse (fair comparison to instant-distance)
+    let mut searcher = index.searcher();
     let start = Instant::now();
     for q in &query_vecs {
-        let _ = index.search_with_context(q, K, &mut ctx);
+        let _ = searcher.search(q, K);
     }
     let fs_st_search_time = start.elapsed();
     let fs_st_qps = NUM_QUERIES as f64 / fs_st_search_time.as_secs_f64();
@@ -111,7 +111,7 @@ fn main() {
     // === Foxstash batch (parallel search) ===
     println!("\n--- Foxstash (parallel build, batch search via rayon) ---");
     let start = Instant::now();
-    let _ = index.search_batch_fast(&query_vecs, K);
+    let _ = index.search_batch(&query_vecs, K);
     let fs_batch_search_time = start.elapsed();
     let fs_batch_qps = NUM_QUERIES as f64 / fs_batch_search_time.as_secs_f64();
     println!(
@@ -124,7 +124,7 @@ fn main() {
     let recall_queries = 100;
     let mut foxstash_total_recall = 0.0;
     let mut id_total_recall = 0.0;
-    let mut recall_ctx = index.create_search_context();
+    let mut recall_searcher = index.searcher();
 
     for q in query_vecs.iter().take(recall_queries) {
         // Brute-force ground truth using Euclidean distance (same as instant-distance)
@@ -145,8 +145,8 @@ fn main() {
         let ground_truth: std::collections::HashSet<usize> =
             distances.iter().take(K).map(|(_, j)| *j).collect();
 
-        // Foxstash results (with context reuse)
-        let results = index.search_with_context(q, K, &mut recall_ctx).unwrap();
+        // Foxstash results (with searcher reuse)
+        let results = recall_searcher.search(q, K).unwrap();
         let foxstash_ids: std::collections::HashSet<usize> =
             results.iter().map(|r| r.id.parse().unwrap()).collect();
 

@@ -73,11 +73,11 @@ fn main() {
         "{:>6} {:>11} {:>10} {:>12} {:>9}",
         "ef", "recall@10", "QPS", "dist/query", "ns/dist"
     );
-    let mut ctx = hnsw.create_search_context();
     for &ef in &[20usize, 50, 100, 200] {
         hnsw.set_ef_search(ef);
+        let mut searcher = hnsw.searcher();
         for q in ds.queries.iter().take(50) {
-            std::hint::black_box(hnsw.search_with_context(q, K, &mut ctx).unwrap());
+            std::hint::black_box(searcher.search(q, K).unwrap());
         }
         let recall = ds.recall_at(K, |q| {
             hnsw.search(q, K)
@@ -86,14 +86,15 @@ fn main() {
                 .filter_map(|r| r.id.parse::<usize>().ok())
                 .collect()
         });
-        ctx.reset_stats();
+        let mut searcher = hnsw.searcher();
+        searcher.reset_stats();
         let t = Instant::now();
         for q in &ds.queries {
-            std::hint::black_box(hnsw.search_with_context(q, K, &mut ctx).unwrap());
+            std::hint::black_box(searcher.search(q, K).unwrap());
         }
         let el = t.elapsed();
         let n = ds.queries.len() as f64;
-        let d = ctx.distance_calls() as f64;
+        let d = searcher.distance_calls() as f64;
         println!(
             "{:>6} {:>10.2}% {:>10.0} {:>12.0} {:>9.1}",
             ef,

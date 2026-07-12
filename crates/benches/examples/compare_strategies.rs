@@ -33,7 +33,7 @@ fn generate_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 fn measure_recall(index: &HNSWIndex, queries: &[Vec<f32>], base: &[Vec<f32>], k: usize) -> f32 {
-    let mut ctx = index.create_search_context();
+    let mut searcher = index.searcher();
     let mut total = 0.0;
     for q in queries.iter().take(100) {
         let mut distances: Vec<(f32, usize)> = base
@@ -52,7 +52,7 @@ fn measure_recall(index: &HNSWIndex, queries: &[Vec<f32>], base: &[Vec<f32>], k:
         distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let truth: HashSet<usize> = distances.iter().take(k).map(|(_, j)| *j).collect();
 
-        let results = index.search_with_context(q, k, &mut ctx).unwrap();
+        let results = searcher.search(q, k).unwrap();
         let found: HashSet<usize> = results.iter().map(|r| r.id.parse().unwrap()).collect();
         total += truth.intersection(&found).count() as f32 / k as f32;
     }
@@ -79,11 +79,11 @@ fn main() {
         let index = HNSWIndex::build(base.clone(), config);
         let build_time = start.elapsed();
 
-        // Single-threaded search with context reuse (fair comparison)
-        let mut ctx = index.create_search_context();
+        // Single-threaded search with searcher reuse (fair comparison)
+        let mut searcher = index.searcher();
         let start = Instant::now();
         for q in &queries {
-            let _ = index.search_with_context(q, K, &mut ctx);
+            let _ = searcher.search(q, K);
         }
         let search_time = start.elapsed();
         let qps = NUM_QUERIES as f64 / search_time.as_secs_f64();

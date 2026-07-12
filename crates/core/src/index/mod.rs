@@ -59,7 +59,9 @@ pub mod hnsw_quantized;
 pub mod streaming;
 
 pub use flat::FlatIndex;
-pub use hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown, Storage};
+pub use hnsw::{
+    BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown, Searcher, Storage,
+};
 pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
 pub use hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
 pub use streaming::{

@@ -108,11 +108,11 @@ impl BitsetVisited {
     }
 }
 
-/// Reusable search context to avoid allocations during search
+/// Per-query scratch space: the visited bitset and the two heaps.
 ///
-/// Provides ~2-3x speedup over allocating new structures each query.
-/// Uses packed bitset for cache-friendly visited tracking (~12.5 KB for 100K nodes).
-pub struct SearchContext {
+/// Private. Reusing it is [`Searcher`]'s job, and it is *not* a speed feature — see
+/// [`Searcher`] for the measurement.
+struct SearchContext {
     /// Packed bitset for visited tracking (fits L1 cache)
     visited: BitsetVisited,
     /// Number of nodes this context supports
@@ -135,8 +135,7 @@ pub struct SearchContext {
 }
 
 impl SearchContext {
-    /// Create a new search context for an index with `n` nodes
-    pub fn new(n: usize) -> Self {
+    fn new(n: usize) -> Self {
         Self {
             visited: BitsetVisited::new(n),
             capacity: n,
@@ -144,17 +143,6 @@ impl SearchContext {
             best: BinaryHeap::with_capacity(256),
             distance_calls: 0,
         }
-    }
-
-    /// Distance computations since the last [`Self::reset_stats`]. See [`Self::distance_calls`].
-    pub fn distance_calls(&self) -> u64 {
-        self.distance_calls
-    }
-
-    /// Zero the distance counter. Not done by `reset()` — the counter is meant to
-    /// accumulate across a whole query set.
-    pub fn reset_stats(&mut self) {
-        self.distance_calls = 0;
     }
 
     /// Reset for a new search — clears bitset (~12.5 KB memset for 100K nodes)
@@ -175,6 +163,73 @@ impl SearchContext {
     #[inline(always)]
     fn mark_visited(&mut self, node: usize) {
         self.visited.mark_visited(node);
+    }
+}
+
+/// A cursor over an [`HNSWIndex`] that keeps its scratch space between queries and counts
+/// the distance computations it performs.
+///
+/// # This is not a speed feature
+///
+/// It replaces a `search_with_context` / `create_search_context` pair whose docs claimed
+/// "~2-3x faster than `search()`". That claim was never true. Measured on SIFT1M — the size
+/// at which the O(n) visited bitset should hurt most:
+///
+/// | | QPS | speedup |
+/// |---|---|---|
+/// | `search()` | 4,118 | — |
+/// | reused context | 4,121 | **1.00x** |
+///
+/// `search()` allocates a fresh bitset per call: 125 KB at 1M nodes. But it is the *same*
+/// size every time, so it comes straight back off the allocator's free list, and zeroing it
+/// costs a couple of microseconds against a query that spends ~234 µs stalled on DRAM for
+/// its ~3,500 distance computations. The search is memory-latency bound, not allocation
+/// bound — the same fact that makes [`Storage::SQ8`] a win. Reuse the context all you like;
+/// there is nothing there to win. (`cargo run --release -p foxstash-benches --example
+/// search_api_cost`.)
+///
+/// # What it is for
+///
+/// [`Searcher::distance_calls`] — the unit of work an HNSW search is made of. Comparing it
+/// between implementations at matched recall separates *doing more work* (a worse graph, or
+/// a search that stops too late) from *doing the same work more slowly* (a worse inner loop,
+/// or worse latency hiding). Those have completely different fixes and QPS alone cannot tell
+/// them apart. faiss exposes the same counter as `hnsw_stats.ndis`.
+///
+/// ```
+/// # use foxstash_core::index::hnsw::{HNSWIndex, HNSWConfig};
+/// # let index = HNSWIndex::build(vec![vec![1.0, 0.0], vec![0.0, 1.0]], HNSWConfig::default());
+/// let mut searcher = index.searcher();
+/// for query in [[1.0, 0.0], [0.0, 1.0]] {
+///     searcher.search(&query, 1)?;
+/// }
+/// println!("{} distance computations", searcher.distance_calls());
+/// # Ok::<(), foxstash_core::RagError>(())
+/// ```
+pub struct Searcher<'a> {
+    index: &'a HNSWIndex,
+    ctx: SearchContext,
+}
+
+impl Searcher<'_> {
+    /// Search for the `k` nearest neighbours of `query`, reusing this searcher's scratch.
+    ///
+    /// # Errors
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not
+    /// the index's dimension.
+    pub fn search(&mut self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.index.search_inner(query, k, &mut self.ctx)
+    }
+
+    /// Distance computations performed since the last [`Self::reset_stats`].
+    pub fn distance_calls(&self) -> u64 {
+        self.ctx.distance_calls
+    }
+
+    /// Zero the distance counter. Searching does not reset it — the count is meant to
+    /// accumulate across a whole query set.
+    pub fn reset_stats(&mut self) {
+        self.ctx.distance_calls = 0;
     }
 }
 
@@ -1001,55 +1056,47 @@ impl HNSWIndex {
         Ok(())
     }
 
-    /// Searches for k nearest neighbors
-    ///
-    /// # Arguments
-    /// * `query` - Query embedding vector
-    /// * `k` - Number of results to return
+    /// Search for the `k` nearest neighbours of `query`.
     ///
     /// # Errors
-    /// Returns error if query dimension doesn't match index dimension
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not
+    /// this index's dimension.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         let mut ctx = SearchContext::new(self.len());
-        self.search_with_context(query, k, &mut ctx)
+        self.search_inner(query, k, &mut ctx)
     }
 
-    /// Searches for k nearest neighbors for multiple queries in parallel
-    ///
-    /// # Arguments
-    /// * `queries` - Slice of query embedding vectors
-    /// * `k` - Number of results to return per query
+    /// Search many queries in parallel, across all rayon worker threads.
     ///
     /// # Errors
-    /// Returns error if any query dimension doesn't match index dimension
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if any query is
+    /// not this index's dimension.
     pub fn search_batch(&self, queries: &[Vec<f32>], k: usize) -> Result<Vec<Vec<SearchResult>>> {
         use rayon::prelude::*;
 
-        // One SearchContext per worker thread, not per query. `search()` allocates a fresh
-        // context (a whole-index visited bitset plus two heaps) on every call, which at
-        // batch sizes is pure allocator churn — `map_init` hands each rayon worker a context
-        // it reuses across all the queries it happens to receive.
+        // One scratch context per worker thread, not per query — `map_init` hands each rayon
+        // worker a context it reuses across every query it receives.
         queries
             .par_iter()
             .map_init(
-                || self.create_search_context(),
-                |ctx, query| self.search_with_context(query, k, ctx),
+                || SearchContext::new(self.len()),
+                |ctx, query| self.search_inner(query, k, ctx),
             )
             .collect()
     }
 
-    /// Creates a reusable search context for faster repeated searches
+    /// A [`Searcher`]: a cursor that holds its scratch space across queries and counts the
+    /// distance computations it performs.
     ///
-    /// Use with `search_with_context` for ~2-3x speedup when doing many queries
-    pub fn create_search_context(&self) -> SearchContext {
-        SearchContext::new(self.len())
+    /// Reach for it to read [`Searcher::distance_calls`], not to go faster — see [`Searcher`].
+    pub fn searcher(&self) -> Searcher<'_> {
+        Searcher {
+            index: self,
+            ctx: SearchContext::new(self.len()),
+        }
     }
 
-    /// Fast search using a reusable context (avoids allocations)
-    ///
-    /// ~2-3x faster than `search()` when doing many queries.
-    /// Create context once with `create_search_context()`, reuse for all queries.
-    pub fn search_with_context(
+    fn search_inner(
         &self,
         query: &[f32],
         k: usize,
@@ -1117,34 +1164,6 @@ impl HNSWIndex {
                 metadata: self.metadata[node_id].clone(),
             })
             .collect())
-    }
-
-    /// Fast batch search using reusable contexts
-    pub fn search_batch_fast(
-        &self,
-        queries: &[Vec<f32>],
-        k: usize,
-    ) -> Result<Vec<Vec<SearchResult>>> {
-        use rayon::prelude::*;
-        use std::cell::RefCell;
-
-        // Thread-local search contexts
-        thread_local! {
-            static CTX: RefCell<Option<SearchContext>> = const { RefCell::new(None) };
-        }
-
-        queries
-            .par_iter()
-            .map(|query| {
-                CTX.with(|ctx| {
-                    let mut ctx_ref = ctx.borrow_mut();
-                    if ctx_ref.is_none() || ctx_ref.as_ref().unwrap().capacity < self.len() {
-                        *ctx_ref = Some(SearchContext::new(self.len()));
-                    }
-                    self.search_with_context(query, k, ctx_ref.as_mut().unwrap())
-                })
-            })
-            .collect()
     }
 
     /// Clears all documents from the index
@@ -2659,7 +2678,7 @@ mod tests {
         let neighbors: Vec<u32> = (1..=65).map(|n| n as u32).collect();
         index.l0_replace(0, &neighbors);
 
-        let mut ctx = index.create_search_context();
+        let mut ctx = SearchContext::new(index.len());
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, 1.0);
         assert!(
             candidates.iter().any(|&(_, id)| id == 65),
@@ -2706,34 +2725,39 @@ mod tests {
     }
 
     #[test]
-    fn search_context_resizes_after_add() {
+    fn an_undersized_scratch_context_is_regrown_before_use() {
+        // `BitsetVisited` indexes with `get_unchecked`. A context sized for a smaller index
+        // than the one it is used against is therefore not merely wrong, it is UB in release.
+        // `search_inner` guards that with `if ctx.capacity < self.len()`.
+        //
+        // A *public* caller can no longer reach this state: `search`/`search_batch` size the
+        // scratch at the moment of use, and `Searcher` borrows the index, so the index cannot
+        // grow while a searcher is alive — the borrow checker retired the runtime hazard.
+        // This test drives the guard directly, from inside the module, because the guard is
+        // load-bearing for an `unsafe` block and must not be deleted as "unreachable".
         let mut index = HNSWIndex::new(3, HNSWConfig::default());
-        index
-            .add(Document {
-                id: "a".into(),
-                content: "a".into(),
-                embedding: vec![1.0, 0.0, 0.0],
-                metadata: None,
-            })
-            .unwrap();
-
-        let mut ctx = index.create_search_context();
-
-        for i in 0..10 {
+        for i in 0..64 {
             index
                 .add(Document {
                     id: format!("doc-{i}"),
-                    content: format!("content-{i}"),
-                    embedding: vec![(i as f32) * 0.1, 1.0 - (i as f32) * 0.1, 0.0],
+                    content: String::new(),
+                    embedding: vec![(i as f32) * 0.01, 1.0 - (i as f32) * 0.01, 0.0],
                     metadata: None,
                 })
                 .unwrap();
         }
 
-        let results = index
-            .search_with_context(&[1.0, 0.0, 0.0], 5, &mut ctx)
-            .unwrap();
-        assert!(!results.is_empty());
+        // Deliberately far too small: one node's worth of bitset for a 64-node index.
+        let mut stale = SearchContext::new(1);
+        assert!(stale.capacity < index.len());
+
+        let results = index.search_inner(&[1.0, 0.0, 0.0], 5, &mut stale).unwrap();
+
+        assert_eq!(results.len(), 5);
+        assert!(
+            stale.capacity >= index.len(),
+            "search_inner must regrow an undersized context, not index past the end of its bitset"
+        );
     }
 
     #[test]

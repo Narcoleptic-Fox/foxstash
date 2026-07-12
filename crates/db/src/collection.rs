@@ -11,7 +11,6 @@ use crate::inverted_index::InvertedIndex;
 use crate::recovery;
 use crate::tokenizer::{SimpleTokenizer, Tokenizer};
 use crate::{DbConfig, DbError, Result};
-use foxstash_core::index::hnsw::SearchContext;
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::storage::incremental::{IncrementalStorage, IndexMetadata};
 use foxstash_core::{Document, SearchResult};
@@ -249,7 +248,7 @@ impl Collection {
                 let fetch = self.unfiltered_fetch_count(&inner, k);
                 let raw_batch = inner
                     .index
-                    .search_batch_fast(queries, fetch)
+                    .search_batch(queries, fetch)
                     .map_err(DbError::Core)?;
 
                 Ok(raw_batch
@@ -264,49 +263,6 @@ impl Collection {
             }
             Some(filter) => self.search_batch_filtered_impl(&inner, queries, k, filter),
         }
-    }
-
-    /// Create a reusable search context for repeated unfiltered searches.
-    pub fn create_search_context(&self) -> SearchContext {
-        self.inner.read().index.create_search_context()
-    }
-
-    /// Search with a reusable context (unfiltered).
-    ///
-    /// Use this in tight query loops to reduce allocation overhead.
-    pub fn search_with_context(
-        &self,
-        query: &[f32],
-        k: usize,
-        ctx: &mut SearchContext,
-    ) -> Result<Vec<SearchResult>> {
-        if query.len() != self.config.embedding_dim {
-            return Err(DbError::DimensionMismatch {
-                expected: self.config.embedding_dim,
-                actual: query.len(),
-            });
-        }
-
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-
-        let inner = self.inner.read();
-        if inner.index.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let fetch = self.unfiltered_fetch_count(&inner, k);
-        let raw = inner
-            .index
-            .search_with_context(query, fetch, ctx)
-            .map_err(DbError::Core)?;
-
-        Ok(raw
-            .into_iter()
-            .filter(|r| inner.id_map.is_live(&r.id))
-            .take(k)
-            .collect())
     }
 
     /// Get a document by ID.
@@ -605,7 +561,7 @@ impl Collection {
 
             let raw_batch = inner
                 .index
-                .search_batch_fast(&pending_queries, fetch)
+                .search_batch(&pending_queries, fetch)
                 .map_err(DbError::Core)?;
 
             let mut next_pending = Vec::new();
@@ -1697,35 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn search_with_context_matches_search() {
-        let dir = TempDir::new().unwrap();
-        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
-
-        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
-            .unwrap();
-        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
-            .unwrap();
-        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None)
-            .unwrap();
-        col.insert("d".into(), "delta".into(), vec![0.7, 0.3, 0.0], None)
-            .unwrap();
-
-        let mut ctx = col.create_search_context();
-        for query in [
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
-        ] {
-            let regular = col.search(&query, 3, None).unwrap();
-            let with_ctx = col.search_with_context(&query, 3, &mut ctx).unwrap();
-            let regular_ids: Vec<&str> = regular.iter().map(|r| r.id.as_str()).collect();
-            let ctx_ids: Vec<&str> = with_ctx.iter().map(|r| r.id.as_str()).collect();
-            assert_eq!(ctx_ids, regular_ids);
-        }
-    }
-
-    #[test]
-    fn parallel_paths_exclude_tombstones() {
+    fn search_batch_excludes_tombstones() {
         let dir = TempDir::new().unwrap();
         let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
 
@@ -1739,13 +1667,8 @@ mod tests {
 
         let queries = vec![vec![0.0, 1.0, 0.0], vec![1.0, 0.0, 0.0]];
         let batch = col.search_batch(&queries, 3, None).unwrap();
-        let mut ctx = col.create_search_context();
-        let with_ctx = col
-            .search_with_context(&[0.0, 1.0, 0.0], 3, &mut ctx)
-            .unwrap();
 
         assert!(batch.iter().flatten().all(|r| r.id != "b"));
-        assert!(with_ctx.iter().all(|r| r.id != "b"));
     }
 
     // ── P2.2: Create guard ──────────────────────────────────────────

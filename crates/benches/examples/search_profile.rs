@@ -54,11 +54,11 @@ fn main() {
     }
     row("search()", qps(n, t.elapsed().as_secs_f64()));
 
-    // 2. Same work, but the per-query SearchContext allocation is hoisted out.
-    let mut ctx = index.create_search_context();
+    // 2. Same work, but the per-query Searcher allocation is hoisted out.
+    let mut searcher = index.searcher();
     let t = Instant::now();
     for q in &ds.queries {
-        std::hint::black_box(index.search_with_context(q, K, &mut ctx).unwrap());
+        std::hint::black_box(searcher.search(q, K).unwrap());
     }
     row("search_with_context()", qps(n, t.elapsed().as_secs_f64()));
 

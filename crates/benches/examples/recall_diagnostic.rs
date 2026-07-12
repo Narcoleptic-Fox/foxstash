@@ -76,12 +76,12 @@ fn gt(q: &[f32], base: &[Vec<f32>]) -> HashSet<usize> {
     d.iter().take(K).map(|(_, j)| *j).collect()
 }
 fn recall(idx: &HNSWIndex, base: &[Vec<f32>], queries: &[Vec<f32>]) -> f32 {
-    let mut ctx = idx.create_search_context();
+    let mut searcher = idx.searcher();
     let mut t = 0.0;
     for q in queries.iter().take(NQ) {
         let truth = gt(q, base);
-        let got: HashSet<usize> = idx
-            .search_with_context(q, K, &mut ctx)
+        let got: HashSet<usize> = searcher
+            .search(q, K)
             .unwrap()
             .iter()
             .map(|r| r.id.parse().unwrap())
