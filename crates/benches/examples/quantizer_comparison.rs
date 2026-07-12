@@ -68,7 +68,11 @@ fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 fn exact_topk(q: &[f32], base: &[Vec<f32>]) -> HashSet<usize> {
-    let mut d: Vec<(f32, usize)> = base.iter().enumerate().map(|(i, v)| (l2_sq(q, v), i)).collect();
+    let mut d: Vec<(f32, usize)> = base
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (l2_sq(q, v), i))
+        .collect();
     d.sort_by(|a, b| a.0.total_cmp(&b.0));
     d.iter().take(K).map(|(_, i)| *i).collect()
 }
@@ -142,9 +146,24 @@ fn main() {
 
     println!("{:<22} {:>10} {:>14}", "Quantizer", "Compress", "Recall@10");
     println!("{:-<48}", "");
-    println!("{:<22} {:>10} {:>13.1}%", "RaBitQ (1-bit)", "32x", rb_recall * 100.0);
-    println!("{:<22} {:>10} {:>13.1}%", "Binary (Hamming)", "32x", bin_recall * 100.0);
-    println!("{:<22} {:>10} {:>13.1}%", "SQ8 (scalar int8)", "4x", sq_recall * 100.0);
+    println!(
+        "{:<22} {:>10} {:>13.1}%",
+        "RaBitQ (1-bit)",
+        "32x",
+        rb_recall * 100.0
+    );
+    println!(
+        "{:<22} {:>10} {:>13.1}%",
+        "Binary (Hamming)",
+        "32x",
+        bin_recall * 100.0
+    );
+    println!(
+        "{:<22} {:>10} {:>13.1}%",
+        "SQ8 (scalar int8)",
+        "4x",
+        sq_recall * 100.0
+    );
 
     println!(
         "\nAt equal 32x compression, RaBitQ's unbiased estimator recovers {:+.1} pts\n\

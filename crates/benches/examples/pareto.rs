@@ -1,28 +1,22 @@
 //! Recall/QPS Pareto curve — the only fair way to compare ANN implementations.
 //!
-//! Run: `cargo run --release -p foxstash-benches --example pareto`
+//! Run: `cargo run --release -p foxstash-benches --example pareto [dataset]`
+//!   e.g. `... --example pareto sift1m`   (default: sift10k)
 //!
 //! Comparing two ANN libraries at one fixed `ef` compares nothing: `ef` is a knob, and two
 //! implementations reach a given recall at different settings of it. The comparison that
 //! means something is **QPS at matched recall**.
 //!
-//! Two traps this exists to avoid, both of which caught this project:
+//! Three traps this exists to avoid, all of which caught this project:
 //!   - hnswlib's `knn_query` defaults to `num_threads=-1` (every core). Timing that against
 //!     a single-threaded Rust loop makes foxstash look ~11x slower than it is. Both sides
 //!     here are single-threaded; `search_batch` is reported separately.
 //!   - At `ef=500` on a 10k index the search touches ~85% of the graph — HNSW degenerating
 //!     into brute force. That is a terrible operating point to tune against.
-//!
-//! hnswlib reference (single-threaded, M=32, ef_construction=200, k=10, same machine):
-//!
-//! |  ef | recall@10 |   QPS |
-//! |-----|-----------|-------|
-//! |  10 |    40.20% | 68483 |
-//! |  20 |    57.29% | 41951 |
-//! |  50 |    81.95% | 20051 |
-//! | 100 |    94.34% | 10850 |
-//! | 200 |    99.20% |  6458 |
-//! | 500 |    99.98% |  3487 |
+//!   - The dataset may not be what its directory is named. `benchmarks/data/sift1m/` held a
+//!     10,000-vector base. `Dataset::load` now verifies shape against a manifest, and this
+//!     bench prints the exact-search control row: if that row is not ~100%, every other row
+//!     here is void.
 
 use foxstash_benches::sift::Dataset;
 use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex};
@@ -30,61 +24,77 @@ use std::time::Instant;
 
 const K: usize = 10;
 
-/// hnswlib, single-threaded, same machine/config. (ef, recall@10, qps)
-const HNSWLIB: &[(usize, f64, f64)] = &[
-    (10, 40.20, 68483.0),
-    (20, 57.29, 41951.0),
-    (50, 81.95, 20051.0),
-    (100, 94.34, 10850.0),
-    (200, 99.20, 6458.0),
-    (500, 99.98, 3487.0),
-];
-
-/// QPS hnswlib achieves at `recall`, linearly interpolated along its curve.
-/// Returns None if the recall is outside the measured range.
-fn hnswlib_qps_at(recall: f64) -> Option<f64> {
-    for w in HNSWLIB.windows(2) {
-        let (_, r0, q0) = w[0];
-        let (_, r1, q1) = w[1];
-        if recall >= r0 && recall <= r1 {
-            let t = if (r1 - r0).abs() < 1e-9 {
-                0.0
-            } else {
-                (recall - r0) / (r1 - r0)
-            };
-            return Some(q0 + t * (q1 - q0));
-        }
-    }
-    None
-}
-
 fn main() {
-    let ds = Dataset::load("benchmarks/data", "sift10k").expect("load sift10k");
+    let name = std::env::args().nth(1).unwrap_or_else(|| "sift10k".into());
+    let ds = Dataset::load("benchmarks/data", &name).unwrap_or_else(|e| panic!("load {name}: {e}"));
 
-    println!("SIFT10K — single-threaded, k={K}, M=32, ef_construction=200");
-    println!("foxstash vs hnswlib at MATCHED RECALL (both single-threaded)\n");
     println!(
-        "{:>5} {:>11} {:>9} {:>14} {:>10}",
-        "ef", "recall@10", "QPS", "hnswlib@same", "ratio"
+        "{} — {} base x {}d, {} queries — single-threaded, k={K}, M=32, ef_construction=200\n",
+        ds.name,
+        ds.base.len(),
+        ds.dim(),
+        ds.queries.len()
     );
-    println!("{:-<56}", "");
 
+    // The control row, first and unconditionally. If exact brute-force search does not
+    // score ~100% against the shipped ground truth, the loader or the metric is wrong and
+    // every number below is void — so we refuse to print them.
+    const CTRL_N: usize = 200;
+    let control = ds.exact_control_sampled(K, CTRL_N);
+    let sep = ds.separation(K, CTRL_N);
+    println!(
+        "exact control (brute force, {CTRL_N} queries): {:.2}%  {}",
+        control * 100.0,
+        if control > 0.99 {
+            "PASS"
+        } else {
+            "*** FAIL ***"
+        }
+    );
+    assert!(
+        control > 0.99,
+        "exact control failed at {:.2}% — the harness is broken, not the index. \
+         Refusing to emit a recall table.",
+        control * 100.0
+    );
+    println!(
+        "difficulty: d(100th)/d(10th) = {sep:.3}  \
+         (near 1.0 = true neighbours buried in a near-tie shell; recall@10 is NOT \
+         comparable across datasets with different separation)\n"
+    );
+
+    let t = Instant::now();
+    // Build ONCE. `ef_search` is a search-time dial and does not touch graph structure,
+    // so the whole curve below comes off this one graph.
+    let mut index = HNSWIndex::build_parallel(
+        ds.base.clone(),
+        HNSWConfig {
+            metric: DistanceMetric::L2,
+            m: 32,
+            m0: 64,
+            ef_construction: 200,
+            ef_search: 100,
+            build_strategy: BuildStrategy::Parallel,
+            ..Default::default()
+        },
+    );
+    println!("build: {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let mem = index.memory_breakdown();
+    println!(
+        "memory: {:.1} MB total ({:.1} MB vectors + {:.1} MB links)\n",
+        mem.total() as f64 / 1e6,
+        mem.embeddings as f64 / 1e6,
+        (mem.layer0_links + mem.upper_layer_links) as f64 / 1e6,
+    );
+
+    println!("{:>6} {:>11} {:>10}", "ef", "recall@10", "QPS");
+    println!("{:-<30}", "");
+
+    let mut ctx = index.create_search_context();
     for &ef in &[10usize, 20, 50, 100, 200, 500] {
-        let index = HNSWIndex::build_parallel(
-            ds.base.clone(),
-            HNSWConfig {
-                metric: DistanceMetric::L2,
-                m: 32,
-                m0: 64,
-                ef_construction: 200,
-                ef_search: ef,
-                build_strategy: BuildStrategy::Parallel,
-                ..Default::default()
-            },
-        );
+        index.set_ef_search(ef);
 
-        let mut ctx = index.create_search_context();
-        // warm
         for q in ds.queries.iter().take(50) {
             std::hint::black_box(index.search_with_context(q, K, &mut ctx).unwrap());
         }
@@ -104,42 +114,17 @@ fn main() {
         }
         let qps = ds.queries.len() as f64 / t.elapsed().as_secs_f64();
 
-        let r = recall as f64 * 100.0;
-        match hnswlib_qps_at(r) {
-            Some(h) => println!(
-                "{:>5} {:>10.2}% {:>9.0} {:>14.0} {:>9.2}x",
-                ef,
-                r,
-                qps,
-                h,
-                qps / h
-            ),
-            None => println!(
-                "{:>5} {:>10.2}% {:>9.0} {:>14} {:>10}",
-                ef, r, qps, "off-curve", "-"
-            ),
-        }
+        println!("{:>6} {:>10.2}% {:>10.0}", ef, recall * 100.0, qps);
     }
 
-    // Multi-threaded, at the ef=100 operating point, for comparison with hnswlib's
-    // default knn_query (which fans out across every core).
-    let index = HNSWIndex::build_parallel(
-        ds.base.clone(),
-        HNSWConfig {
-            metric: DistanceMetric::L2,
-            m: 32,
-            m0: 64,
-            ef_construction: 200,
-            ef_search: 100,
-            build_strategy: BuildStrategy::Parallel,
-            ..Default::default()
-        },
-    );
+    // Multi-threaded, at ef=100, for comparison with hnswlib's default knn_query
+    // (which fans out across every core).
+    index.set_ef_search(100);
     std::hint::black_box(index.search_batch(&ds.queries[..64].to_vec(), K).unwrap());
     let t = Instant::now();
     std::hint::black_box(index.search_batch(&ds.queries, K).unwrap());
-    let batch_qps = ds.queries.len() as f64 / t.elapsed().as_secs_f64();
-    println!("\nsearch_batch() [all cores, ef=100]: {:.0} QPS", batch_qps);
-
-    println!("\nratio > 1.00x means foxstash serves more QPS than hnswlib at the same recall.");
+    println!(
+        "\nsearch_batch() [all cores, ef=100]: {:.0} QPS",
+        ds.queries.len() as f64 / t.elapsed().as_secs_f64()
+    );
 }

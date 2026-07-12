@@ -65,7 +65,12 @@ fn gt(q: &[f32], base: &[Vec<f32>]) -> HashSet<usize> {
     let mut d: Vec<(f32, usize)> = base
         .iter()
         .enumerate()
-        .map(|(j, v)| (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j))
+        .map(|(j, v)| {
+            (
+                q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(),
+                j,
+            )
+        })
         .collect();
     d.sort_by(|a, b| a.0.total_cmp(&b.0));
     d.iter().take(K).map(|(_, j)| *j).collect()
@@ -88,15 +93,26 @@ fn recall(idx: &HNSWIndex, base: &[Vec<f32>], queries: &[Vec<f32>]) -> f32 {
 
 fn main() {
     println!("=== Recall Root-Cause Diagnostic (clustered data) ===");
-    println!("{} vectors, {}d, top-{}, {} clusters\n", N, DIM, K, CLUSTERS);
+    println!(
+        "{} vectors, {}d, top-{}, {} clusters\n",
+        N, DIM, K, CLUSTERS
+    );
     let base = clustered(N, 42);
     let queries = clustered(NQ, 123);
 
-    println!("{:<12} {:<10} {:>12} {:>12}", "build", "select", "Recall@10", "build ms");
+    println!(
+        "{:<12} {:<10} {:>12} {:>12}",
+        "build", "select", "Recall@10", "build ms"
+    );
     println!("{:-<48}", "");
-    for (sname, strat) in [("Sequential", BuildStrategy::Sequential), ("Parallel", BuildStrategy::Parallel)] {
+    for (sname, strat) in [
+        ("Sequential", BuildStrategy::Sequential),
+        ("Parallel", BuildStrategy::Parallel),
+    ] {
         for (hname, simple) in [("heuristic", false), ("simple", true)] {
-            let mut cfg = HNSWConfig::default().with_build_strategy(strat).with_ef_search(100);
+            let mut cfg = HNSWConfig::default()
+                .with_build_strategy(strat)
+                .with_ef_search(100);
             if simple {
                 cfg = cfg.with_simple_selection();
             }
@@ -104,7 +120,13 @@ fn main() {
             let idx = HNSWIndex::build(base.clone(), cfg);
             let ms = start.elapsed().as_millis();
             let r = recall(&idx, &base, &queries);
-            println!("{:<12} {:<10} {:>11.2}% {:>12}", sname, hname, r * 100.0, ms);
+            println!(
+                "{:<12} {:<10} {:>11.2}% {:>12}",
+                sname,
+                hname,
+                r * 100.0,
+                ms
+            );
         }
     }
 }

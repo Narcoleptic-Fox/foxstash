@@ -407,6 +407,32 @@ impl HNSWIndex {
         Self::new(embedding_dim, HNSWConfig::default())
     }
 
+    /// Set the search-time `ef` on a built index.
+    ///
+    /// `ef_search` is the recall/speed dial: it bounds the candidate pool during the
+    /// layer-0 scan and has no effect whatsoever on graph structure. Sweeping it does
+    /// **not** require rebuilding — walking the recall/QPS curve is a search-time
+    /// operation. (hnswlib exposes the same thing as `set_ef`.)
+    ///
+    /// # Example
+    /// ```
+    /// use foxstash_core::index::{HNSWIndex, HNSWConfig};
+    ///
+    /// let embeddings = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, 0.7]];
+    /// let mut index = HNSWIndex::build(embeddings, HNSWConfig::default());
+    ///
+    /// index.set_ef_search(200);          // more thorough
+    /// assert_eq!(index.ef_search(), 200);
+    /// ```
+    pub fn set_ef_search(&mut self, ef: usize) {
+        self.config.ef_search = ef;
+    }
+
+    /// The search-time `ef` currently in effect. See [`Self::set_ef_search`].
+    pub fn ef_search(&self) -> usize {
+        self.config.ef_search
+    }
+
     /// Build an HNSW index from embeddings using the configured strategy
     ///
     /// This is the recommended way to create an index from bulk embeddings.
@@ -531,6 +557,10 @@ impl HNSWIndex {
             index.ids.push(i.to_string());
             index.contents.push(String::new());
             index.metadata.push(None);
+            // `insert_node` writes layer-0 links straight into the flat array, so the slot
+            // must exist before it runs. (The parallel builder does not need this: it fills
+            // the nested structure first and migrates via `build_l0_cache`.)
+            index.extend_l0_cache_for_new_node();
 
             if index.entry_point.is_none() {
                 index.entry_point = Some(node_id);
@@ -546,7 +576,10 @@ impl HNSWIndex {
             }
         }
 
-        index.build_l0_cache();
+        // NO `build_l0_cache()` here. That migrates nested layer-0 links into the flat
+        // array, but this builder never put any there — `insert_node` wrote them directly
+        // to the flat array. Running the migration would copy the empty nested layer 0 over
+        // the real graph and silently erase every layer-0 link.
         index.shrink_to_fit();
         index
     }
@@ -2842,5 +2875,69 @@ mod tests {
     fn cosine_is_still_the_default() {
         assert_eq!(HNSWConfig::default().metric, DistanceMetric::Cosine);
         assert_eq!(DistanceMetric::default(), DistanceMetric::Cosine);
+    }
+
+    /// Every build strategy must produce a working graph.
+    ///
+    /// `BuildStrategy::Sequential` panicked outright for an entire release: the layer-0
+    /// refactor made the flat array the sole owner of layer-0 links, and the sequential
+    /// builder was never taught to grow it. Nothing caught it — every other test and every
+    /// doctest either forces `Parallel` or takes the default, so `Sequential` had no
+    /// coverage at all despite being a documented public option.
+    ///
+    /// This asserts *recall*, not merely absence of a panic: the same refactor left a
+    /// `build_l0_cache()` call that would have copied an empty nested layer 0 over the real
+    /// graph, erasing every layer-0 link and failing silently with a still-"working" index.
+    #[test]
+    fn every_build_strategy_produces_a_searchable_graph() {
+        // Clustered, not uniform-random: random vectors have no structure to recover, and
+        // every ANN scores ~60% on them whether or not its graph is intact.
+        let mut rng = StdRng::seed_from_u64(7);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..16).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..400)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.3).collect()
+            })
+            .collect();
+
+        for strategy in [
+            BuildStrategy::Sequential,
+            BuildStrategy::Parallel,
+            BuildStrategy::Auto,
+        ] {
+            let config = HNSWConfig::default()
+                .with_build_strategy(strategy)
+                .with_seed(42)
+                .with_ef_search(100);
+            let index = HNSWIndex::build(embeddings.clone(), config);
+            assert_eq!(
+                index.len(),
+                embeddings.len(),
+                "{strategy:?}: wrong node count"
+            );
+
+            // Self-retrieval: querying with an indexed vector must return that vector.
+            // A graph with its layer-0 links erased fails this immediately.
+            let hits = embeddings
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| {
+                    index
+                        .search(e, 1)
+                        .expect("search")
+                        .first()
+                        .is_some_and(|r| r.id == i.to_string())
+                })
+                .count();
+            let recall = hits as f32 / embeddings.len() as f32;
+            assert!(
+                recall > 0.95,
+                "{strategy:?}: self-retrieval recall {:.1}%, graph is broken",
+                recall * 100.0,
+            );
+        }
     }
 }

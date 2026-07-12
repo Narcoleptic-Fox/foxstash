@@ -10,6 +10,7 @@ foxstash-core = { path = "../core" }
 bincode.workspace = true
 criterion.workspace = true
 rand.workspace = true
+rayon = "1.10"
 serde_json.workspace = true
 tempfile = "3.8"
 

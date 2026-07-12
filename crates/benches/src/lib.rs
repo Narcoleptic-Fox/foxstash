@@ -14,6 +14,45 @@ pub mod sift {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
+    /// The shape every known dataset is required to have.
+    struct Spec {
+        name: &'static str,
+        base: usize,
+        queries: usize,
+        dim: usize,
+    }
+
+    /// Known datasets and the shape each one must have on disk.
+    ///
+    /// [`Dataset::load`] refuses to return a dataset that does not match its entry
+    /// here. That check is not paranoia: `benchmarks/data/sift1m/` really did contain
+    /// a **10,000**-vector base. Benchmarking "SIFT1M" against it would have produced
+    /// an entirely plausible — and entirely meaningless — number, with nothing in the
+    /// output to suggest the index was 100x smaller than its label claimed.
+    ///
+    /// A dataset that fails to load is a good day. A dataset that loads as the wrong
+    /// thing is how you ship a false benchmark.
+    const MANIFEST: &[Spec] = &[
+        Spec {
+            name: "sift10k",
+            base: 10_000,
+            queries: 1_000,
+            dim: 128,
+        },
+        Spec {
+            name: "sift100k",
+            base: 100_000,
+            queries: 10_000,
+            dim: 128,
+        },
+        Spec {
+            name: "sift1m",
+            base: 1_000_000,
+            queries: 10_000,
+            dim: 128,
+        },
+    ];
+
     /// A loaded ANN benchmark dataset with its shipped ground truth.
     pub struct Dataset {
         pub name: String,
@@ -31,10 +70,23 @@ pub mod sift {
             self.base[0].len()
         }
 
-        /// Load `<root>/<name>/{base,query,groundtruth}.npy`.
+        /// Load `<root>/<name>/{base,query,groundtruth}.npy`, then verify it is
+        /// actually the dataset it claims to be (see [`MANIFEST`]).
         pub fn load(root: impl AsRef<Path>, name: &str) -> std::io::Result<Self> {
+            use std::io::{Error, ErrorKind};
+            let bad = |m: String| Error::new(ErrorKind::InvalidData, m);
+
+            let spec = MANIFEST.iter().find(|s| s.name == name).ok_or_else(|| {
+                let known: Vec<_> = MANIFEST.iter().map(|s| s.name).collect();
+                bad(format!(
+                    "unknown dataset {name:?}; known: {known:?}. \
+                     Add it to MANIFEST with its expected shape — datasets are not \
+                     loaded on trust."
+                ))
+            })?;
+
             let dir: PathBuf = root.as_ref().join(name);
-            Ok(Self {
+            let ds = Self {
                 name: name.to_string(),
                 base: load_f32(&dir.join("base.npy"))?,
                 queries: load_f32(&dir.join("query.npy"))?,
@@ -42,7 +94,45 @@ pub mod sift {
                     .into_iter()
                     .map(|row| row.into_iter().map(|i| i as usize).collect())
                     .collect(),
-            })
+            };
+
+            // Does it match the label on the tin?
+            let got = (ds.base.len(), ds.queries.len(), ds.base[0].len());
+            let want = (spec.base, spec.queries, spec.dim);
+            if got != want {
+                return Err(bad(format!(
+                    "{name} is not {name}: expected {} base x {}d with {} queries, \
+                     found {} base x {}d with {} queries. The directory is mislabelled \
+                     or the download is truncated — fix the data, do not adjust MANIFEST \
+                     to match it.",
+                    want.0, want.2, want.1, got.0, got.2, got.1
+                )));
+            }
+
+            // Internal consistency: ground truth must index into the base we loaded,
+            // and cover every query.
+            if ds.truth.len() != ds.queries.len() {
+                return Err(bad(format!(
+                    "{name}: {} queries but {} ground-truth rows",
+                    ds.queries.len(),
+                    ds.truth.len()
+                )));
+            }
+            if let Some(&i) = ds.truth.iter().flatten().max() {
+                if i >= ds.base.len() {
+                    return Err(bad(format!(
+                        "{name}: ground truth references base index {i}, but the base has \
+                         only {} vectors. The ground truth belongs to a different (larger) \
+                         base than the one on disk.",
+                        ds.base.len()
+                    )));
+                }
+            }
+            if ds.queries.iter().any(|q| q.len() != spec.dim) {
+                return Err(bad(format!("{name}: queries are not all {}d", spec.dim)));
+            }
+
+            Ok(ds)
         }
 
         /// Recall@k of `search`, which must return the retrieved base-indices for a query.
@@ -60,16 +150,62 @@ pub mod sift {
         /// not ~1.0, the loader or the distance metric is wrong and no other row in the
         /// table means anything.
         pub fn exact_control(&self, k: usize) -> f32 {
-            self.recall_at(k, |q| {
-                let mut d: Vec<(f32, usize)> = self
-                    .base
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (l2_sq(q, v), i))
-                    .collect();
-                d.sort_by(|a, b| a.0.total_cmp(&b.0));
-                d.into_iter().take(k).map(|(_, i)| i).collect()
-            })
+            self.exact_control_sampled(k, self.queries.len())
+        }
+
+        /// [`Self::exact_control`] over the first `n` queries.
+        ///
+        /// The full control is O(queries x base) and takes minutes on SIFT1M, which is
+        /// exactly the excuse one uses to skip it. Sampling a few hundred queries costs
+        /// a second and catches every failure the full run would: a bad loader, a metric
+        /// mismatch, ground truth belonging to a different corpus.
+        pub fn exact_control_sampled(&self, k: usize, n: usize) -> f32 {
+            use rayon::prelude::*;
+            let n = n.min(self.queries.len());
+            let total: f32 = self.queries[..n]
+                .par_iter()
+                .enumerate()
+                .map(|(qi, q)| {
+                    let mut d: Vec<(f32, usize)> = self
+                        .base
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (l2_sq(q, v), i))
+                        .collect();
+                    d.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
+                    d.truncate(k);
+                    let got: HashSet<usize> = d.into_iter().map(|(_, i)| i).collect();
+                    let gt: HashSet<usize> = self.truth[qi].iter().take(k).copied().collect();
+                    gt.intersection(&got).count() as f32 / gt.len().max(1) as f32
+                })
+                .sum();
+            total / n as f32
+        }
+
+        /// How hard is this dataset, really? Mean ratio `d(100th NN) / d(kth NN)`.
+        ///
+        /// Recall@k is **not comparable across datasets**, and this number is why. On
+        /// SIFT10K the 100th neighbour sits only 4.7% further from the query than the
+        /// 10th — the true top-10 is buried in a shell of ~90 near-equidistant vectors,
+        /// and separating 10th from 11th is nearly impossible for an approximate method.
+        /// On SIFT100K the same ratio is 13.5%, and *every* index scores far better.
+        ///
+        /// A ratio near 1.0 means a punishing dataset. Quoting a recall number without
+        /// it invites the reader to compare figures that measure different problems.
+        pub fn separation(&self, k: usize, n: usize) -> f32 {
+            use rayon::prelude::*;
+            let n = n.min(self.queries.len());
+            let total: f32 = self.queries[..n]
+                .par_iter()
+                .map(|q| {
+                    let mut d: Vec<f32> = self.base.iter().map(|v| l2_sq(q, v)).collect();
+                    let hundredth = 99.min(d.len() - 1);
+                    d.sort_unstable_by(|a, b| a.total_cmp(b));
+                    let dk = d[(k - 1).min(d.len() - 1)].sqrt().max(f32::EPSILON);
+                    d[hundredth].sqrt() / dk
+                })
+                .sum();
+            total / n as f32
         }
 
         /// Brute-force **cosine** ground truth, computed here rather than shipped.

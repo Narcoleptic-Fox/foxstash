@@ -1,0 +1,150 @@
+foxstash scoreboard — 2026-07-12T19:13:03Z
+host: Linux 6.8.0-134-generic, 16 threads
+NOTE: recall@10 is NOT comparable across datasets
+      (see the per-dataset difficulty line)
+
+################ sift10k ################
+
+=== foxstash ===
+sift10k — 10000 base x 128d, 1000 queries — single-threaded, k=10, M=32, ef_construction=200
+
+exact control (brute force, 200 queries): 100.00%  PASS
+difficulty: d(100th)/d(10th) = 1.047  (near 1.0 = true neighbours buried in a near-tie shell; recall@10 is NOT comparable across datasets with different separation)
+
+build: 1.1s
+
+memory: 9.4 MB total (5.1 MB vectors + 3.7 MB links)
+
+    ef   recall@10        QPS
+------------------------------
+    10      49.47%      57137
+    20      67.50%      34947
+    50      88.25%      16881
+   100      96.88%       9366
+   200      99.51%       5608
+   500      99.99%       3089
+
+search_batch() [all cores, ef=100]: 79334 QPS
+
+sift10k — 10000 base x 128d, 1000 queries
+single-threaded search, k=10, M=32, ef_construction=200
+
+exact control (brute force, 200 queries): 100.00%  PASS
+
+=== hnswlib ===  build: 1.6s
+    ef   recall@10        QPS
+------------------------------
+    10      40.05%      73430
+    20      57.96%      41249
+    50      81.82%      20269
+   100      94.28%      11343
+   200      99.17%       6456
+   500      99.98%       3542
+
+=== faiss-HNSW ===  build: 0.2s
+    ef   recall@10        QPS
+------------------------------
+    10      43.37%      84181
+    20      61.61%      50395
+    50      84.77%      22797
+   100      95.87%      12553
+   200      99.51%       7018
+   500      99.99%       3596
+
+################ sift100k ################
+
+=== foxstash ===
+sift100k — 100000 base x 128d, 10000 queries — single-threaded, k=10, M=32, ef_construction=200
+
+exact control (brute force, 200 queries): 100.00%  PASS
+difficulty: d(100th)/d(10th) = 1.145  (near 1.0 = true neighbours buried in a near-tie shell; recall@10 is NOT comparable across datasets with different separation)
+
+build: 7.0s
+
+memory: 93.9 MB total (51.2 MB vectors + 37.1 MB links)
+
+    ef   recall@10        QPS
+------------------------------
+    10      91.10%      23729
+    20      96.61%      15609
+    50      99.41%       8238
+   100      99.88%       4953
+   200      99.98%       2942
+   500      99.99%       1466
+
+search_batch() [all cores, ef=100]: 35324 QPS
+
+sift100k — 100000 base x 128d, 10000 queries
+single-threaded search, k=10, M=32, ef_construction=200
+
+exact control (brute force, 200 queries): 100.00%  PASS
+
+=== hnswlib ===  build: 17.4s
+    ef   recall@10        QPS
+------------------------------
+    10      83.91%      41800
+    20      93.48%      26731
+    50      98.96%      13573
+   100      99.81%       7917
+   200      99.97%       4542
+   500      99.99%       2179
+
+=== faiss-HNSW ===  build: 3.0s
+    ef   recall@10        QPS
+------------------------------
+    10      83.97%      41334
+    20      93.50%      26024
+    50      98.90%      12878
+   100      99.80%       7262
+   200      99.96%       4075
+   500      99.99%       1863
+
+################ sift1m ################
+
+=== foxstash ===
+sift1m — 1000000 base x 128d, 10000 queries — single-threaded, k=10, M=32, ef_construction=200
+
+exact control (brute force, 200 queries): 99.90%  PASS
+difficulty: d(100th)/d(10th) = 1.123  (near 1.0 = true neighbours buried in a near-tie shell; recall@10 is NOT comparable across datasets with different separation)
+
+build: 164.2s
+
+memory: 940.5 MB total (512.0 MB vectors + 370.6 MB links)
+
+    ef   recall@10        QPS
+------------------------------
+    10      85.14%      13590
+    20      93.03%       9351
+    50      98.18%       5043
+   100      99.48%       2978
+   200      99.85%       1718
+   500      99.91%        815
+
+search_batch() [all cores, ef=100]: 14943 QPS
+
+sift1m — 1000000 base x 128d, 10000 queries
+single-threaded search, k=10, M=32, ef_construction=200
+
+exact control (brute force, 200 queries): 99.95%  PASS
+
+=== hnswlib ===  build: 341.9s
+    ef   recall@10        QPS
+------------------------------
+    10      77.66%      23760
+    20      88.98%      15408
+    50      97.18%       8076
+   100      99.18%       4629
+   200      99.79%       2610
+   500      99.91%       1212
+
+=== faiss-HNSW ===  build: 77.9s
+    ef   recall@10        QPS
+------------------------------
+    10      78.03%      22335
+    20      89.17%      14405
+    50      97.24%       7204
+   100      99.29%       4030
+   200      99.82%       2228
+   500      99.93%       1008
+
+written to benchmarks/scoreboard-20260712-151303.txt

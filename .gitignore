@@ -8,3 +8,8 @@ Cargo.lock
 /models/
 benchmarks/python/venv/
 .bench-venv/
+
+# ANN benchmark corpora — large, and reproducible from benchmarks/fetch-data.sh.
+# Do not commit these. A dataset in git is a dataset nobody re-verifies; the
+# previously-committed `sift1m/` held a 10,000-vector base for months.
+benchmarks/data/

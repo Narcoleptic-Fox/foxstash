@@ -1,146 +1,141 @@
 # Foxstash Benchmark Results
 
-Measured against hnswlib and faiss on **real SIFT10K**, at **matched recall**.
+Measured against **hnswlib** and **faiss** on real SIFT, at **matched recall**, at three scales.
 
-**Headline: foxstash is 1.03–1.10x faster than hnswlib at equal recall, single-threaded,
-across the useful operating range.**
+**Headline: at realistic scale, foxstash is currently ~20% slower than hnswlib and ~13%
+slower than faiss.** It wins only on SIFT10K — the one dataset small enough to fit in L3
+cache. It does build 2.1x faster than hnswlib, and it reaches a given recall at a lower `ef`
+than either competitor.
 
-## Test Configuration
+Reproduce the whole table: `benchmarks/run-scoreboard.sh`
 
-- **Dataset:** SIFT10K — 10,000 base vectors, 128d, 1,000 queries, **real data with ground
-  truth shipped by the dataset authors** (exact L2, 0-indexed)
-- **Hardware:** Cortex (Ryzen 7 7840HS, 8 cores / 16 threads), Ubuntu 24.04
-- **Config:** M=32, ef_construction=200, k=10, `DistanceMetric::L2` — identical on both sides
-- **Reproduce:**
-  - `cargo run --release -p foxstash-benches --example pareto` (recall/QPS curve)
-  - `cargo run --release -p foxstash-benches --example memory` (footprint)
-  - `cargo run --release -p foxstash-benches --example sift_bench` (full index sweep)
+## Test configuration
 
-## Methodology: two traps, both of which caught this project
+- **Data:** real SIFT, exact-L2 ground truth. Fetch with `benchmarks/fetch-data.sh`.
+  | dataset | base | queries | difficulty `d(100th)/d(10th)` |
+  |---|---|---|---|
+  | sift10k | 10,000 | 1,000 | 1.047 |
+  | sift100k | 100,000 | 10,000 | 1.145 |
+  | sift1m | 1,000,000 | 10,000 | 1.123 |
+- **Hardware:** Ryzen 7 7840HS, 8 cores / 16 threads, 16 MB L3, Ubuntu 24.04
+- **Config:** M=32, ef_construction=200, k=10, L2 — identical on all three libraries
+- **Search is single-threaded on every library.** Build uses all cores on every library.
 
-**1. Compare at matched recall, not matched `ef`.** `ef_search` is a knob, and two
+## Four traps, every one of which has caught this project
+
+**1. Compare at matched recall, not at matched `ef`.** `ef` is a knob and different
 implementations reach a given recall at different settings of it. Foxstash gets *more recall
-per ef* than hnswlib (96.9% vs 94.3% at ef=100), so comparing at fixed `ef` understates it.
-The only meaningful question is **QPS at the same recall**.
+per ef* than hnswlib, so a fixed-`ef` table flatters it.
 
-**2. Count the threads.** hnswlib's `knn_query` defaults to `num_threads=-1` — *every core*.
-An earlier version of this file timed that against a single-threaded Rust loop and concluded
-foxstash was "~11x slower". It is not; that was a 16-core number racing a 1-core number.
-Both sides below are single-threaded, and multi-threaded is reported separately.
+**2. Count the threads.** hnswlib's `knn_query` defaults to `num_threads=-1` — every core. An
+earlier version of this file timed that against a single-threaded Rust loop and reported
+foxstash as "~11x slower". That was a 16-core number racing a 1-core number.
 
-Every recall table must also carry an **exact/flat control row**. If brute-force search does
-not score 100% against the ground truth, the loader or the metric is wrong and every other
-row in the table is void.
+**3. Never run two benchmarks at once.** Running the Python harness while a Rust 1M build held
+all 16 cores *halved* hnswlib's apparent QPS (5,478 vs 10,850 at ef=100). `run-scoreboard.sh`
+serializes every run behind an idle gate.
 
-## Recall vs QPS — single-threaded, matched recall
+**4. Verify the corpus is the corpus.** `benchmarks/data/sift1m/` contained a **10,000**-vector
+base. Benchmarking "SIFT1M" against it would have yielded an entirely plausible number off an
+index 100x smaller than its label. `Dataset::load` now validates shape against a manifest and
+the bench asserts an exact brute-force control row before printing anything.
 
-| ef | foxstash recall@10 | foxstash QPS | hnswlib QPS @ same recall | ratio |
-|----|--------------------|--------------|---------------------------|-------|
-| 10 | 49.77% | 56,125 | 53,626 | **1.05x** |
-| 20 | 67.36% | 35,421 | 33,008 | **1.07x** |
-| 50 | 88.42% | 15,078 | 15,246 | 0.99x |
-| 100 | **96.86%** | **9,442** | 8,572 | **1.10x** |
-| 200 | 99.47% | 5,585 | 5,429 | **1.03x** |
-| 500 | 99.96% | 3,022 | 3,563 | 0.85x |
+**And do not compare recall across datasets.** On SIFT10K the 100th neighbour is only 4.7%
+further from the query than the 10th, so the true top-10 hides inside a shell of ~90
+near-equidistant vectors; on SIFT100K it is 13.5% further. Every index scores far better on
+SIFT100K because the task is easier, not because the index improved. The `difficulty` column
+above exists to stop that comparison being made by accident.
 
-hnswlib's own single-threaded curve, same machine and config, for reference:
+## QPS at matched recall
 
-| ef | recall@10 | QPS |
-|----|-----------|-----|
-| 10 | 40.20% | 68,483 |
-| 50 | 81.95% | 20,051 |
-| 100 | 94.34% | 10,850 |
-| 200 | 99.20% | 6,458 |
-| 500 | 99.98% | 3,487 |
+Competitor QPS is linearly interpolated along its own recall/QPS curve to foxstash's recall.
+Ratio > 1.00x means foxstash serves more queries per second at the same recall.
 
-**Foxstash wins across the useful range** (50–99.5% recall) and needs less search to get
-there — the Algorithm-4 diversity heuristic builds a better graph, so a given `ef` buys more
-recall. It loses only at ef=500, where the search touches ~85% of a 10k index: HNSW
-degenerating toward brute force, which is a pathological operating point, not a useful one.
+### SIFT10K — 9.4 MB index, fits in 16 MB L3
 
-## Multi-threaded
+| recall@10 | foxstash | hnswlib | vs hnswlib | faiss | vs faiss |
+|---|---|---|---|---|---|
+| 88.25% | 16,881 | 15,663 | **1.08x** | 19,585 | 0.86x |
+| 96.88% | 9,366 | 8,745 | **1.07x** | 11,017 | 0.85x |
+| 99.51% | 5,608 | 5,233 | **1.07x** | 7,018 | 0.80x |
 
-| | QPS | recall@10 |
-|---|-----|-----------|
-| foxstash `search_batch()` (ef=100) | 79,796 | **96.86%** |
-| hnswlib `knn_query()` default (ef=100) | 94,517 | 94.25% |
+### SIFT100K — 94 MB index, exceeds L3
 
-Not matched on recall — foxstash is 2.6 points ahead there, so this is not a like-for-like
-row. Both achieve ~54% parallel efficiency across 16 SMT threads on 8 physical cores; the
-workload is memory-bandwidth bound on both sides.
+| recall@10 | foxstash | hnswlib | vs hnswlib | faiss | vs faiss |
+|---|---|---|---|---|---|
+| 91.10% | 23,729 | 30,479 | 0.78x | 29,880 | 0.79x |
+| 96.61% | 15,609 | 19,216 | 0.81x | 18,453 | 0.85x |
+| 99.41% | 8,238 | 10,579 | 0.78x | 9,696 | 0.85x |
+| 99.88% | 4,953 | 6,440 | 0.77x | 5,668 | 0.87x |
 
-## Memory
+### SIFT1M — 940 MB index
 
-`cargo run --release -p foxstash-benches --example memory` — retained bytes, counting
-allocated *capacity* and per-`Vec` headers, not RSS (RSS around a build also captures the
-builder's transients and whatever the allocator declines to return).
+| recall@10 | foxstash | hnswlib | vs hnswlib | faiss | vs faiss |
+|---|---|---|---|---|---|
+| 85.14% | 13,590 | 18,241 | 0.75x | 17,274 | 0.79x |
+| 93.03% | 9,351 | 11,787 | 0.79x | 10,961 | 0.85x |
+| 98.18% | 5,043 | 6,352 | 0.79x | 5,749 | 0.88x |
+| 99.48% | 2,978 | 3,636 | 0.82x | 3,384 | 0.88x |
 
-| Component | MB |
-|-----------|-----|
-| embeddings (f32) | 5.12 |
-| layer-0 links (flat) | 2.61 |
-| upper-layer links (nested) | 1.09 |
-| norms (cosine only) | 0.04 |
-| payload (ids + contents) | 0.52 |
-| **total** | **9.38** |
-| *theoretical floor (vectors + links)* | *7.68* |
-| *hnswlib (its own accounting)* | *7.80* |
+## Why foxstash wins at 10K and loses past it
 
-Down from **12.65 MB**. Two fixes got there: layer-0 adjacency was being stored **twice**
-(once nested, once in the flat cache) — the flat array is now its sole owner; and the
-embedding array was holding 8.39 MB of `Vec` growth capacity for 5.12 MB of vectors, so the
-build paths now `shrink_to_fit()`.
+The crossover sits exactly at the L3 boundary, and the cause is the memory layout.
 
-The remaining gap to hnswlib is mostly the 0.52 MB `payload` — foxstash stores document ids
-and contents, where hnswlib stores only an integer label. Excluding payload, foxstash is
-8.86 MB against hnswlib's 7.80 MB.
+`HNSWIndex` is Struct-of-Arrays: a node's vector lives in `embeddings`, its neighbours live in
+`connections_l0`, and the two are separate allocations. Visiting a node therefore issues **two
+independent random DRAM reads**. hnswlib and faiss interleave per node — `[link_count | links |
+vector | label]` in one contiguous block — so a node visit is **one read**, and pulling a
+neighbour's vector also warms the links you need if you expand it.
 
-## Quantized indexes (vs SIFT's L2 ground truth)
+Below L3 that costs nothing: everything is already in cache and foxstash's better graph wins on
+recall-per-ef. Above L3 the extra random read is the whole ballgame, and it is worth about the
+20% we measure. The in-code comment claiming SoA gives "better cache locality" is true of linear
+scans and false of graph traversal, which never scans linearly.
 
-| Index | Compression | Recall@10 | QPS |
-|-------|-------------|-----------|-----|
-| sq8-hnsw | 4x | 71.4% | 11,166 |
-| rabitq-hnsw | 32x | 62.5% | 894 |
-| ~~binary-hnsw~~ | 32x | **1.1%** | — |
+## Build time and memory
 
-**These are the weak spot.** Both are correctness-first and untuned (`QuantizedHNSWConfig`
-still defaults to `ef_search: 50` where `HNSWConfig` uses 100).
+| | foxstash | hnswlib | faiss |
+|---|---|---|---|
+| build, SIFT1M (all cores) | **164 s** | 342 s | 78 s |
+| index, SIFT1M | 940 MB | ~776 MB | ~776 MB |
 
-`BinaryHNSWIndex` is **deprecated**: its zero threshold sets every bit on non-negative data
-(SIFT, any ReLU embedding), collapsing all codes to all-ones. Superseded by
-`RaBitQHNSWIndex` — same 32x, but centered.
+Foxstash builds **2.1x faster than hnswlib**. Its index is ~21% larger: 512 MB vectors +
+371 MB links, where the link array carries an `m0 + 1` stride and the nested upper-layer
+`Vec`s cost a 24-byte header per node.
 
-## What changed to get here
+## What foxstash is genuinely better at
 
-- **Squared L2 in the hot loop.** `sqrt` is monotonic, so it cannot change the ordering — it
-  was pure overhead on ~8,500 distance computations per query. Rooted only for the k results
-  returned.
-- **Stopped throwing away work.** `search_layer` computed `ef` distances and returned bare
-  ids; the caller then *recomputed* all of them, built a `SearchResult` (cloning an id, a
-  content string and a metadata blob) for all 500, sorted, and discarded 490 to return 10.
-  It now returns `(distance, id)` and materialises only `k`.
-- **`search_batch` reuses a context per worker** instead of allocating a whole-index visited
-  bitset and two heaps per query.
+- **Recall per `ef`.** At every scale it needs a lower `ef` than hnswlib or faiss to reach a
+  given recall — the Algorithm-4 diversity heuristic builds a measurably better graph. This is
+  a real asset and the reason the matched-recall gap (0.78x) is *smaller* than the raw
+  fixed-`ef` gap.
+- **Build throughput**, 2.1x hnswlib.
 
 ## Known issues
 
-1. **ef=500 regime is 0.85x** — the only point where hnswlib wins. Low priority; it is the
-   brute-force-degenerate corner.
-2. **Quantized recall is low** (SQ8 71.4%, RaBitQ 62.5%) and untuned.
-3. **Metric inconsistency** — `HNSWIndex` defaults to Cosine, but `SQ8HNSWIndex` and
+1. **Slower than both competitors above L3** (0.78x hnswlib, 0.85x faiss). Root cause is the
+   SoA layout above; the fix is node-interleaved storage plus prefetch.
+2. **Quantized indexes are unfinished.** `SQ8HNSWIndex` has **no rerank path at all**, which is
+   why it sits at 71.4% recall; `RaBitQHNSWIndex` has one but defaults to `ef_search: 50` where
+   `HNSWConfig` uses 100. Compressed traversal with exact rerank is the standard way to beat a
+   memory-bandwidth wall and it is half-built here.
+3. **Metric inconsistency.** `HNSWIndex` defaults to cosine; `SQ8HNSWIndex` and
    `RaBitQHNSWIndex` are L2-only. Swapping index type to save memory silently changes the
-   metric. They should take the same `DistanceMetric` config.
-4. **RaBitQ build is slow** (17.2s) — `prepare_query` runs per insert.
-5. **Nested `connections` still holds an empty `Vec` per node for layer 0** (~0.24 MB) —
-   removing it means re-indexing layers, which was judged not worth the risk.
-6. **100K/1M not yet run** — `benchmarks/data/` has `sift100k` and `sift1m`.
+   metric.
+4. **Index memory is ~21% above hnswlib.**
+5. **False claims in rustdoc.** `index/mod.rs` advertises SQ8 at "100.0%" recall (measured:
+   71.4%) and full-precision HNSW at "100%" (measured: ~97%).
 
 > ### Historical note
 >
-> Before 2026-07-12 this file benchmarked on **synthetic** "SIFT-like" vectors and claimed
-> foxstash "beats gold standards" with *1.5x hnswlib's recall*. That was an artifact:
-> synthetic vectors have no cluster structure, so every ANN collapses to ~60% recall on them
-> regardless of quality. hnswlib scored 40.3% there and scores **99.98%** on real SIFT. The
-> synthetic run flattered foxstash and hid a real bug (`BinaryQuantizer` at 1.2% recall) for
-> an entire release. Foxstash does beat hnswlib — but only measurement on real data at
-> matched recall can support that claim.
+> Before 2026-07-12 this file reported foxstash as "1.03–1.10x faster than hnswlib" without
+> qualification. That was measured only on SIFT10K, and it does not hold at 100K or 1M, where
+> foxstash loses to both hnswlib and faiss. faiss was not benchmarked against at all.
+>
+> Before that, the file benchmarked on **synthetic** vectors and claimed foxstash "beats gold
+> standards" with 1.5x hnswlib's recall — an artifact of synthetic data having no cluster
+> structure, which collapses every ANN to ~60% and hid a real bug (`BinaryQuantizer` at 1.2%
+> recall) for a full release.
+>
+> The pattern is consistent: every previous headline was produced by measuring one convenient
+> configuration and not asking what would falsify it.

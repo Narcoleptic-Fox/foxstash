@@ -194,9 +194,18 @@ fn main() {
         let _ = clustered_index.search_with_context(q, K, &mut ctx);
     }
     let c_qps = NUM_QUERIES as f64 / start.elapsed().as_secs_f64();
-    println!("Foxstash search: {:.0} QPS (single-threaded, ctx reuse)", c_qps);
+    println!(
+        "Foxstash search: {:.0} QPS (single-threaded, ctx reuse)",
+        c_qps
+    );
 
-    let c_recall = foxstash_recall(&clustered_index, &clustered_base, &clustered_queries, K, RECALL_QUERIES);
+    let c_recall = foxstash_recall(
+        &clustered_index,
+        &clustered_base,
+        &clustered_queries,
+        K,
+        RECALL_QUERIES,
+    );
     println!("Foxstash Recall@{}: {:.2}%", K, c_recall * 100.0);
 
     // instant-distance cross-check on the SAME clustered data
@@ -225,7 +234,13 @@ fn main() {
     println!("\n--- UNIFORM-RANDOM data (the old quick_comparison distribution) ---");
     let (uniform_index, u_build) = build_foxstash(&uniform_base, 100);
     println!("Foxstash build time: {:?}", u_build);
-    let u_recall = foxstash_recall(&uniform_index, &uniform_base, &uniform_queries, K, RECALL_QUERIES);
+    let u_recall = foxstash_recall(
+        &uniform_index,
+        &uniform_base,
+        &uniform_queries,
+        K,
+        RECALL_QUERIES,
+    );
     println!("Foxstash Recall@{}: {:.2}%", K, u_recall * 100.0);
 
     // === ef_search sweep on clustered data (the real recall knob) ===
