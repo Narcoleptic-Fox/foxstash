@@ -51,6 +51,15 @@ pub mod sift {
             queries: 10_000,
             dim: 128,
         },
+        // 960-d. SIFT's 128 dimensions cannot answer whether a quantized storage mode pays
+        // off, because a node block is `header(m0) + vector` and which half dominates is a
+        // pure function of `dim`. Real embeddings are 384-1536d, not 128.
+        Spec {
+            name: "gist1m",
+            base: 1_000_000,
+            queries: 1_000,
+            dim: 960,
+        },
     ];
 
     /// A loaded ANN benchmark dataset with its shipped ground truth.

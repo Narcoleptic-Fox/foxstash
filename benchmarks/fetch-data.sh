@@ -14,8 +14,18 @@
 #   sift10k    10,000 base x 128d,     1,000 queries   (TEXMEX siftsmall, authors' GT)
 #   sift100k   100,000 base x 128d,   10,000 queries   (prefix of sift1m, GT recomputed)
 #   sift1m     1,000,000 base x 128d, 10,000 queries   (TEXMEX ANN_SIFT1M, authors' GT)
+#   gist1m     1,000,000 base x 960d,  1,000 queries   (TEXMEX ANN_GIST1M, authors' GT)
 #
-# Usage: benchmarks/fetch-data.sh
+# gist1m exists to settle a question SIFT cannot answer. A node block is
+# `header(m0) + vector`, so which half dominates is a pure function of `dim`. At
+# SIFT's 128d the adjacency dominates and 1-bit codes (Storage::RaBitQ) save
+# almost nothing while wrecking the metric -- they lose ~12x. At 960d the vector
+# dominates and the arithmetic inverts. Nobody runs RAG on 128-d vectors; MiniLM
+# is 384d and OpenAI's embeddings are 1536d. Concluding anything about
+# quantization from SIFT alone would be a dataset-generalization error.
+#
+# Usage: benchmarks/fetch-data.sh            (sift only -- gist is a 3.6 GB download)
+#        benchmarks/fetch-data.sh --with-gist
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -24,6 +34,10 @@ cd data
 
 SIFT1M_URL="ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
 SIFTSMALL_URL="ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz"
+GIST1M_URL="ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz"
+
+WITH_GIST=0
+[ "${1:-}" = "--with-gist" ] && WITH_GIST=1
 
 need() { [ ! -f "$1/base.npy" ]; }
 
@@ -33,6 +47,15 @@ if need sift1m || need sift100k; then
     curl -# -o sift.tar.gz "$SIFT1M_URL"
     tar xzf sift.tar.gz
     rm -f sift.tar.gz
+  fi
+fi
+
+if [ "$WITH_GIST" = 1 ] && need gist1m; then
+  if [ ! -d gist ]; then
+    echo "==> downloading ANN_GIST1M (~3.6 GB — this takes a while)"
+    curl -# -o gist.tar.gz "$GIST1M_URL"
+    tar xzf gist.tar.gz
+    rm -f gist.tar.gz
   fi
 fi
 
@@ -94,15 +117,24 @@ if not os.path.exists("sift1m/base.npy") or not os.path.exists("sift100k/base.np
         print("    computing exact ground truth for the 100k subset...")
         sub = base[:100_000]
         write("sift100k", sub, query, exact_gt(sub, query))
+
+if os.path.isdir("gist") and not os.path.exists("gist1m/base.npy"):
+    write("gist1m",
+          read_vecs("gist/gist_base.fvecs"),
+          read_vecs("gist/gist_query.fvecs"),
+          read_vecs("gist/gist_groundtruth.ivecs", np.int32))
 PY
 
 echo "==> verifying (exact-L2 control — a corpus that fails this is unusable)"
 python3 - <<'PY'
-import numpy as np, sys
+import numpy as np, os, sys
 
-EXPECT = {"sift10k": (10_000, 1_000), "sift100k": (100_000, 10_000), "sift1m": (1_000_000, 10_000)}
+EXPECT = {"sift10k": (10_000, 1_000), "sift100k": (100_000, 10_000), "sift1m": (1_000_000, 10_000),
+          "gist1m": (1_000_000, 1_000)}
 ok = True
 for name, (nb, nq) in EXPECT.items():
+    if not os.path.exists(f"{name}/base.npy"):
+        continue   # gist is opt-in; absence is not failure
     b = np.load(f"{name}/base.npy", mmap_mode="r")
     q = np.load(f"{name}/query.npy", mmap_mode="r")
     g = np.load(f"{name}/groundtruth.npy", mmap_mode="r")
