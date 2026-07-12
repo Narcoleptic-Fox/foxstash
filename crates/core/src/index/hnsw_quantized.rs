@@ -342,7 +342,12 @@ impl SQ8HNSWIndex {
         Ok(results)
     }
 
-    /// Search using symmetric quantized distance (faster, slightly lower quality)
+    /// Search scoring candidates by quantized-vs-quantized distance instead of
+    /// [`SQ8HNSWIndex::search`]'s quantized-vs-full-precision distance.
+    ///
+    /// Skips dequantizing the query, at the cost of quantization error on both sides of
+    /// every comparison instead of one. Prefer [`SQ8HNSWIndex::search`] unless the query
+    /// itself is only available already quantized.
     pub fn search_symmetric(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
         if query.len() != self.embedding_dim {
             return Err(RagError::DimensionMismatch {
@@ -1956,19 +1961,29 @@ mod tests {
 
     #[test]
     fn sq8_search_symmetric_recall_on_heterogeneous_per_dimension_scale() {
-        // `distance_quantized` (ScalarQuantizer, quantize.rs) computes L2 on raw u8 codes
-        // with no per-dimension scale correction, despite `ScalarQuantizer::fit` giving
-        // each dimension an independent min/max/scale. `search_symmetric` uses it directly
-        // for the final score; `search_layer` (shared by every search method, plus
-        // `insert_node`/`select_neighbors` during construction) uses it as the traversal
-        // metric. When one dimension carries the real signal and others are
-        // near-constant, a near-constant dimension's full-range code swing can
-        // numerically dominate the signal dimension's modest code difference.
+        // Regression test for a real bug: `distance_quantized` (ScalarQuantizer,
+        // quantize.rs) used to compute L2 on raw u8 codes with no per-dimension scale
+        // correction, even though `ScalarQuantizer::fit` gives each dimension its own
+        // independent min/max/scale. `search_symmetric` used it directly for the final
+        // score; `search_layer` (shared by every search method, plus
+        // `insert_node`/`select_neighbors` during construction) used it as the traversal
+        // metric too. With one dimension carrying the real signal and others
+        // near-constant, a near-constant dimension's full-range code swing could
+        // numerically dominate the signal dimension's modest code difference — measured
+        // at the time as chance-level recall against `search`'s much higher recall on
+        // this exact fixture, from the *same* traversal and candidate pool, isolating the
+        // fault to the metric rather than the graph. `distance_quantized` now weights
+        // each dimension's code difference by that dimension's fitted scale
+        // (`sq8_scaled_l2_distance_simd`), so this asserts recall stays high for both.
         //
-        // Recall@k against held-out queries (not self-retrieval — querying with an
-        // indexed vector re-quantizes to that vector's own code, which trivially wins
-        // under ANY quantize-vs-quantize metric regardless of whether it's scale-correct,
-        // so self-retrieval can't isolate this bug).
+        // Recall@k against held-out queries, deliberately NOT self-retrieval: querying
+        // with an already-indexed vector re-quantizes to that exact vector's own code, so
+        // a quantize-vs-quantize metric trivially gets distance 0 against itself and wins
+        // regardless of whether the metric is scale-correct. An earlier version of this
+        // test used self-retrieval and got 100% for the *broken* metric — self-retrieval
+        // cannot distinguish a correct symmetric metric from a broken one, so don't
+        // "simplify" this back to self-retrieval; only held-out-query recall against real
+        // ground truth exercises the actual ranking quality.
         let noise_dims = 8;
         let all_vectors = heterogeneous_scale_fixture(160, noise_dims);
         let (queries, corpus) = all_vectors.split_at(20);
@@ -2030,17 +2045,16 @@ mod tests {
              {asymmetric_hits}/{total_possible} — fixture may not isolate the bug as intended"
         );
 
-        // Pin the bug: search_symmetric's final score has no scale correction, so it
-        // should measurably underperform search's real recall on this fixture. If this
-        // assertion ever starts failing because symmetric_hits caught up, distance_quantized
-        // has gained a scale correction and search_symmetric's doc comment should be
-        // revisited.
+        // With the scale correction, search_symmetric's final score is in the same units
+        // as the real distance and should be comparably reliable — no longer the
+        // chance-level recall the unscaled metric produced on this fixture. If this
+        // regresses, check whether distance_quantized lost its per-dimension scale
+        // weighting.
         assert!(
-            symmetric_hits < asymmetric_hits,
-            "search_symmetric ({symmetric_hits}/{total_possible}) should underperform search \
-             ({asymmetric_hits}/{total_possible}) when per-dimension quantization scale is \
-             heterogeneous — if it doesn't, distance_quantized's missing scale correction may \
-             have been fixed"
+            symmetric_hits * 2 >= total_possible,
+            "search_symmetric recall collapsed on heterogeneous-scale data: \
+             {symmetric_hits}/{total_possible} — distance_quantized may have lost its \
+             per-dimension scale correction"
         );
     }
 

@@ -124,6 +124,67 @@ Foxstash builds **2.1x faster than hnswlib**. Its index is ~21% larger: 512 MB v
 378 MB of links and block headers, where the nested upper-layer `Vec`s cost a 24-byte header
 per node and the arena block carries padding to keep the vector 16-byte aligned.
 
+## Quantized indexes — the metric was broken
+
+`ScalarQuantizer::distance_quantized` computed L2 directly on the raw 0-255 codes. But
+`fit()` gives **every dimension its own scale** — that is the entire point of fitting — so a
+near-constant dimension's full code swing carried the same weight as a high-variance
+dimension's. The comment said "(scaled)". Nothing was scaled.
+
+This was not confined to `search_symmetric`'s output. `search_layer` calls
+`distance_quantized` during **insertion**, so the SQ8 graph was *built* under a distorted
+metric. On a fixture with heterogeneous per-dimension variance, `search_symmetric` scored
+**7% recall — indistinguishable from chance** — against `search()`'s 73% on the identical
+graph and candidate pool. After the fix, SQ8 on real SIFT100K reaches **99.33% recall@10**
+(rerank pool 50), against the **71.4%** this file previously reported.
+
+That 71.4% was never a quantization ceiling, and never a missing rerank. It was a bug, and it
+cost 28 points of recall while the rustdoc advertised "100.0%".
+
+**Any SQ8 index previously built via `fit()` is invalid, not stale** — its edges were selected
+under the wrong metric. It must be rebuilt from source vectors; re-scoring cannot repair it.
+
+Nothing caught this because `search_symmetric` had **zero tests** — and, the subtle part,
+**self-retrieval cannot detect it.** Querying with an indexed vector re-quantizes to that
+vector's own code, so a quantized-vs-quantized metric returns distance 0 against itself
+whether or not it is scale-correct. A "symmetric" quantized index that passes a self-retrieval
+test has proven nothing. Only held-out queries scored against real brute-force ground truth
+expose it.
+
+## Compressed traversal: thesis unproven, not disproven
+
+The reason to quantize is bandwidth. Search is memory-latency bound — 77–98 ns per distance
+computation, about one DRAM round-trip — so moving a quarter of the bytes per node visit
+ought to buy throughput. It does not. SIFT100K, matched ~99.4% recall:
+
+| | QPS | build | memory |
+|---|---|---|---|
+| full-precision HNSW | **8,867** | 7 s | 95 MB |
+| SQ8 + exact rerank | 1,541 | 135 s | 74 MB |
+
+SQ8 is **5.8x slower while touching a quarter of the vector bytes.** That is not a bandwidth
+result; it is a data-structure result. `SQ8HNSWIndex` is a wholly separate implementation that
+never touches the interleaved node arena:
+
+```rust
+struct SQ8Node {
+    id: String,                       // heap allocation, per node
+    content: String,                  // heap allocation, per node
+    quantized: ScalarQuantizedVector, // heap allocation, per node
+    full_precision: Option<Vec<f32>>, // heap allocation, per node
+    connections: Vec<HashSet<usize>>, // a HashSet. Per layer. Per node.
+}
+```
+
+Every node visit pointer-chases through a fat struct into a heap-allocated code vector and
+iterates neighbours through a **hash set** of 8-byte ids. The compression win is real and
+entirely swamped by the container carrying it. It also builds sequentially (135 s vs 7 s).
+
+So compressed traversal is **untested**: the vehicle cannot hold the experiment. Testing it
+means making SQ8 a *storage mode of the main index* — sharing the arena, the u32 adjacency
+and the parallel builder — instead of a parallel codebase. The API unification is therefore on
+the critical path for performance, not merely for tidiness.
+
 ## What foxstash is genuinely better at
 
 - **Recall per `ef`.** At every scale it needs a lower `ef` than hnswlib or faiss to reach a

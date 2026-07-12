@@ -218,8 +218,14 @@ impl Quantizer for ScalarQuantizer {
     }
 
     fn distance_quantized(&self, a: &Self::Quantized, b: &Self::Quantized) -> f32 {
-        // L2 distance in quantized space (scaled)
-        sq8_l2_distance_simd(&a.data, &b.data)
+        // Weighted by each dimension's fitted scale (see `sq8_scaled_l2_distance_simd`):
+        // `ScalarQuantizer::fit` gives each dimension an independent scale, so summing
+        // raw code differences unweighted would let a dimension with a small real range
+        // dominate one with a large real range purely because both share the same 0-255
+        // code budget. When every dimension shares one scale (`for_normalized`,
+        // `with_bounds`), the weight is a single global constant, so this is a monotonic
+        // rescaling of the unweighted distance — same ranking as before.
+        sq8_scaled_l2_distance_simd(&a.data, &b.data, &self.params)
     }
 
     fn distance_asymmetric(&self, query: &[f32], quantized: &Self::Quantized) -> f32 {
@@ -470,6 +476,71 @@ fn sq8_asymmetric_l2_impl(
     })
 }
 
+/// SIMD-accelerated scale-corrected L2 distance between two SQ8 codes
+///
+/// `sq8_l2_distance_simd` diffs raw codes directly, which only tracks real L2 distance
+/// when every dimension shares one quantization scale. `ScalarQuantizer::fit` assigns
+/// each dimension its own independent scale, so this instead weights each dimension's
+/// code difference by that dimension's scale before squaring — putting every term back
+/// into the units of the original vector space regardless of how the corpus's
+/// per-dimension ranges compare to each other.
+#[inline]
+pub fn sq8_scaled_l2_distance_simd(a: &[u8], b: &[u8], params: &[ScalarQuantizationParams]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), params.len());
+
+    let simd = pulp::Arch::new();
+    simd.dispatch(|| sq8_scaled_l2_impl(simd, a, b, params))
+}
+
+/// Internal scale-corrected SQ8-to-SQ8 L2 implementation
+#[inline(always)]
+fn sq8_scaled_l2_impl(
+    simd: pulp::Arch,
+    a: &[u8],
+    b: &[u8],
+    params: &[ScalarQuantizationParams],
+) -> f32 {
+    struct ScaledSq8L2<'a> {
+        a: &'a [u8],
+        b: &'a [u8],
+        params: &'a [ScalarQuantizationParams],
+    }
+
+    impl pulp::WithSimd for ScaledSq8L2<'_> {
+        type Output = f32;
+
+        #[inline(always)]
+        fn with_simd<S: Simd>(self, _simd: S) -> Self::Output {
+            // pulp has no u8/i16 SIMD ops, so we use scalar unrolling, matching the
+            // shape of sq8_asymmetric_l2_impl above.
+            let mut sum_sq: f32 = 0.0;
+            let n = self.a.len();
+
+            let mut i = 0;
+            while i + 4 <= n {
+                let d0 = (self.a[i] as f32 - self.b[i] as f32) * self.params[i].scale;
+                let d1 = (self.a[i + 1] as f32 - self.b[i + 1] as f32) * self.params[i + 1].scale;
+                let d2 = (self.a[i + 2] as f32 - self.b[i + 2] as f32) * self.params[i + 2].scale;
+                let d3 = (self.a[i + 3] as f32 - self.b[i + 3] as f32) * self.params[i + 3].scale;
+                sum_sq += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+                i += 4;
+            }
+
+            // Handle remainder (0..3 elements)
+            while i < n {
+                let d = (self.a[i] as f32 - self.b[i] as f32) * self.params[i].scale;
+                sum_sq += d * d;
+                i += 1;
+            }
+
+            sum_sq.sqrt()
+        }
+    }
+
+    simd.dispatch(ScaledSq8L2 { a, b, params })
+}
+
 /// SIMD-accelerated Hamming distance for binary vectors
 #[inline]
 pub fn hamming_distance_simd(a: &[u8], b: &[u8]) -> u32 {
@@ -694,7 +765,13 @@ mod tests {
         let qb = sq.quantize(&b);
 
         let dist = sq.distance_quantized(&qa, &qb);
-        assert!(dist > 100.0, "Opposite vectors should have large distance");
+        // distance_quantized is scale-corrected (see sq8_scaled_l2_distance_simd), so it
+        // reports real vector-space units, not raw 0-255 code differences. The true L2
+        // distance between the extremes of a 4-dim [-1,1] box is sqrt(4 * 2^2) = 4.0.
+        assert!(
+            dist > 3.9,
+            "Opposite vectors should have large distance, got {dist}"
+        );
     }
 
     // ========================================================================
