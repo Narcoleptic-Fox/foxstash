@@ -5,17 +5,21 @@
 //! - [`FlatIndex`]: Brute-force search (100% accurate, O(n) search)
 //! - [`HNSWIndex`]: Approximate nearest neighbors (fast, full precision)
 //! - [`SQ8HNSWIndex`]: HNSW with scalar quantization (4x memory reduction)
-//! - [`BinaryHNSWIndex`]: HNSW with binary quantization (32x memory reduction)
+//! - [`RaBitQHNSWIndex`]: HNSW with RaBitQ 1-bit quantization (32x memory reduction)
+//! - [`BinaryHNSWIndex`]: **deprecated** — degenerate on non-negative embeddings
 //!
 //! # Memory Comparison (1M vectors × 384 dims)
 //!
-//! | Index | Memory | Recall | Use Case |
-//! |-------|--------|--------|----------|
-//! | HNSW (f32) | 1.5 GB | ~95% | Default choice |
-//! | SQ8 HNSW | 384 MB | ~90% | Memory constrained |
-//! | Binary HNSW | 48 MB | ~80%* | Massive datasets |
+//! | Index | Memory | Recall@10* | Use Case |
+//! |-------|--------|------------|----------|
+//! | HNSW (f32) | 1.5 GB | 100% | Default choice |
+//! | SQ8 HNSW | 384 MB | 100.0% | Memory constrained |
+//! | RaBitQ HNSW | 48 MB | 73.2% | Massive datasets |
+//! | Binary HNSW | 48 MB | 1.2% | Deprecated — use RaBitQ |
 //!
-//! *Binary recall improves significantly with two-phase search (filter + rerank).
+//! *Measured on SIFT10K with a two-phase search (1-bit filter, pool=100, exact rerank):
+//! `cargo run --release -p foxstash-benches --example quantizer_sift`. Binary's zero
+//! threshold collapses on non-negative data; RaBitQ centers and does not.
 //!
 //! # Streaming Operations
 //!
@@ -55,7 +59,8 @@ pub mod streaming;
 pub use flat::FlatIndex;
 pub use hnsw::{BuildStrategy, HNSWConfig, HNSWIndex};
 pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
-pub use hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex};
+#[allow(deprecated)]
+pub use hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
 pub use streaming::{
     BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult, FilteredSearchBuilder,
     PaginationConfig, SearchPage, SearchResultIterator,
