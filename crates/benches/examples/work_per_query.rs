@@ -22,7 +22,7 @@
 //! Run on an IDLE machine. A concurrent build halves the QPS and makes ns/dist a fiction.
 
 use foxstash_benches::sift::Dataset;
-use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex};
+use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, Storage};
 use std::time::Instant;
 
 const K: usize = 10;
@@ -38,6 +38,11 @@ fn main() {
         control * 100.0
     );
 
+    let (storage, rerank) = match std::env::args().nth(2).as_deref() {
+        Some("sq8") => (Storage::SQ8, 100),
+        Some("sq8-norerank") => (Storage::SQ8, 0),
+        _ => (Storage::F32, 0),
+    };
     let mut index = HNSWIndex::build_parallel(
         ds.base.clone(),
         HNSWConfig {
@@ -46,9 +51,16 @@ fn main() {
             m0: 64,
             ef_construction: 200,
             ef_search: 100,
+            storage,
+            rerank_candidates: rerank,
             build_strategy: BuildStrategy::Parallel,
             ..Default::default()
         },
+    );
+    let mem = index.memory_breakdown();
+    println!(
+        "storage={storage:?} rerank={rerank}  index {:.0} MB\n",
+        mem.total() as f64 / 1e6
     );
 
     println!(

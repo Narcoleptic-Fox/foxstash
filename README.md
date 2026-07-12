@@ -432,24 +432,39 @@ Measured on **real SIFT**, against **hnswlib** and **faiss**, at **matched recal
 single-threaded. Full methodology and the 10K/100K tables:
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
-**Where Foxstash actually stands: it does not beat hnswlib.** At 1M vectors it serves
-~0.85–0.91x hnswlib's QPS at equal recall, and sits at parity with faiss. It does build 2.1x
-faster than hnswlib, and it reaches any given recall at a lower `ef` than either of them.
+**With `Storage::SQ8`, Foxstash serves 1.20x hnswlib's QPS and 1.30x faiss's at 99.5% recall**
+on SIFT1M — rising to 1.33x at 99.85%. It also builds 2.1x faster than hnswlib.
+
+**The cost is memory.** The rerank stage needs the full-precision vectors, so the fast
+configuration uses 1,076 MB against their ~776 MB. Drop them (`rerank_candidates = 0`) and the
+index falls to **564 MB — 0.73x hnswlib** — but recall ceilings out around 98.9%. Pick one.
+
+In full precision Foxstash is still ~0.88x hnswlib. The win comes entirely from moving fewer
+bytes per node visit.
 
 ### SIFT1M — 1,000,000 x 128d, k=10, M=32, single-threaded
 
 QPS at **matched recall** (competitor QPS interpolated along its own curve to Foxstash's recall):
 
-| recall@10 | Foxstash | hnswlib | vs hnswlib | faiss | vs faiss |
-|-----------|----------|---------|------------|-------|----------|
-| 93.0% | 10,044 | 11,787 | 0.85x | 10,961 | 0.91x |
-| 98.2% | 5,455 | 6,352 | 0.88x | 5,749 | 0.97x |
-| 99.5% | 3,267 | 3,636 | 0.91x | 3,384 | 0.98x |
+| recall@10 | Foxstash SQ8 | hnswlib | vs hnswlib | faiss | vs faiss |
+|-----------|--------------|---------|------------|-------|----------|
+| 93.0% | **13,107** | 11,823 | **1.11x** | 10,961 | **1.19x** |
+| 98.2% | **7,183** | 6,249 | **1.15x** | 5,673 | **1.27x** |
+| 99.5% | **4,254** | 3,537 | **1.20x** | 3,282 | **1.30x** |
+| 99.9% | **2,549** | 1,911 | **1.33x** | 1,895 | **1.34x** |
 
-| | Foxstash | hnswlib | faiss |
-|---|---|---|---|
-| build, all cores | **167 s** | 342 s | 78 s |
-| index size | 947 MB | ~776 MB | ~776 MB |
+| | Foxstash SQ8 | Foxstash F32 | hnswlib | faiss |
+|---|---|---|---|---|
+| build, all cores | 167 s | **167 s** | 342 s | 78 s |
+| index size | 1,076 MB | 948 MB | ~776 MB | ~776 MB |
+| index size, codes only | **564 MB** | — | — | — |
+
+Why it works: HNSW search is **memory-latency bound** — one distance computation costs ~85 ns,
+about a DRAM round-trip. Foxstash already computed distances *faster* than faiss and still lost,
+because each one waited on memory. `Storage::SQ8` puts 8-bit codes in the hot node block (400
+bytes instead of 784) and keeps the f32 vectors in a cold array touched only when rescoring the
+final candidates. The graph is still built with exact distances, so recall and the distance
+count are unchanged — only `ns/dist` moves, 87 -> 67.
 
 ### Reproduce
 

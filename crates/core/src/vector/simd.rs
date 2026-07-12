@@ -779,3 +779,116 @@ mod tests {
         );
     }
 }
+
+/// Asymmetric squared-L2 between an `f32` query and a node's 8-bit SQ8 codes.
+///
+/// "Asymmetric" means the query is **not** quantized: each database value is dequantized on
+/// the fly (`min[d] + code * scale[d]`) and compared against the exact query component, so
+/// quantization error enters on one side only. Quantizing both sides is cheaper per call and
+/// strictly less accurate.
+///
+/// `min` and `scale` are **per dimension**, and must be. A single shared scale would let a
+/// near-constant dimension's full 0-255 code swing weigh as much as a high-variance
+/// dimension's — the bug that cost `SQ8HNSWIndex` 28 points of recall (commit 1df91b6).
+///
+/// The `u8 -> f32` widening is the entire cost of this kernel, and it is why the portable
+/// `pulp` path is not used here: `pulp` operates on `f32` slices and cannot express the
+/// widening, so a scalar version of this loop runs at ~124 ns per call against the f32 SIMD
+/// path's ~87 ns — turning a bandwidth *saving* into a compute *regression*. AVX2 does the
+/// widening in one instruction (`cvtepu8_epi32`), which is the only reason SQ8 traversal can
+/// pay for itself at all.
+#[inline]
+pub fn sq8_asymmetric_l2_simd(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    debug_assert_eq!(query.len(), codes.len());
+    debug_assert_eq!(query.len(), min.len());
+    debug_assert_eq!(query.len(), scale.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection; all four slices are the same
+            // length (checked above) and the loop never reads past `n - n % 8`.
+            return unsafe { sq8_asymmetric_l2_avx2(query, codes, min, scale) };
+        }
+    }
+    sq8_asymmetric_l2_scalar(query, codes, min, scale)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sq8_asymmetric_l2_avx2(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = codes.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+
+    while i + 8 <= n {
+        // Widen 8 u8 codes to 8 f32 lanes — one instruction, and the reason this kernel
+        // exists rather than a portable one.
+        let c8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+        let c32 = _mm256_cvtepu8_epi32(c8);
+        let cf = _mm256_cvtepi32_ps(c32);
+
+        let s = _mm256_loadu_ps(scale.as_ptr().add(i));
+        let m = _mm256_loadu_ps(min.as_ptr().add(i));
+        let q = _mm256_loadu_ps(query.as_ptr().add(i));
+
+        // deq = min + code * scale;  d = q - deq;  acc += d * d
+        let deq = _mm256_fmadd_ps(cf, s, m);
+        let d = _mm256_sub_ps(q, deq);
+        acc = _mm256_fmadd_ps(d, d, acc);
+
+        i += 8;
+    }
+
+    // Horizontal sum of the 8 lanes.
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let deq = min[j] + codes[j] as f32 * scale[j];
+        let d = query[j] - deq;
+        total += d * d;
+    }
+    total
+}
+
+fn sq8_asymmetric_l2_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..codes.len() {
+        let deq = min[i] + codes[i] as f32 * scale[i];
+        let d = query[i] - deq;
+        acc += d * d;
+    }
+    acc
+}
+
+#[cfg(test)]
+mod sq8_asymmetric_tests {
+    use super::*;
+
+    /// The AVX2 path and the scalar path must agree. A SIMD kernel that silently disagrees
+    /// with its fallback produces results that depend on which machine you ran on.
+    #[test]
+    fn avx2_matches_scalar() {
+        let dim = 131; // deliberately not a multiple of 8, to exercise the tail
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 12.0).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let min: Vec<f32> = (0..dim).map(|i| -(i as f32) * 0.11).collect();
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i % 5) as f32 * 0.03).collect();
+
+        let dispatched = sq8_asymmetric_l2_simd(&query, &codes, &min, &scale);
+        let scalar = sq8_asymmetric_l2_scalar(&query, &codes, &min, &scale);
+
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "AVX2 kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
+        );
+    }
+}

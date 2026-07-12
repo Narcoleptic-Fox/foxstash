@@ -6,9 +6,7 @@
 //! # Quantization Modes
 //!
 //! - **SQ8 (Scalar Quantization)**: 4x compression, near-exact recall
-//! - **RaBitQ**: 32x compression, 1 bit/dim with an unbiased estimator — the
-//!   recommended 32x mode
-//! - **Binary**: 32x compression — **deprecated**, degenerate on non-negative data
+//! - **RaBitQ**: 32x compression, 1 bit/dim with an unbiased estimator
 //!
 //! # Two-Phase Search (Recommended)
 //!
@@ -48,7 +46,6 @@
 //! | Full f32   | 1.5 GB | full vector per node visit | n/a (already exact) |
 //! | SQ8        | 384 MB | 1-byte/dim code per visit | `search_and_rerank` against retained f32 |
 //! | RaBitQ     | 48 MB  | 1-bit/dim code per visit  | `search_and_rerank` against retained f32 |
-//! | Binary     | 48 MB  | 1-bit/dim code per visit  | deprecated, see below |
 //!
 //! SQ8 and RaBitQ both traverse the graph on their compressed code only — the retained
 //! full-precision vector, if any, is never touched during traversal, only during the
@@ -56,14 +53,8 @@
 //! pool size and is not asserted here; measure it with `cargo run --release -p
 //! foxstash-benches --example quantizer_sift` before relying on a number, per this
 //! repo's history of stale benchmark claims (see `benchmarks/RESULTS.md`).
-//!
-//! Binary is deprecated regardless of pool size: its zero threshold sets every bit on
-//! non-negative data (SIFT, and any ReLU-activated embedding), collapsing every code to
-//! all-ones, so the coarse stage it feeds into carries no signal.
 
-use crate::vector::quantize::{
-    BinaryQuantizedVector, BinaryQuantizer, Quantizer, ScalarQuantizedVector, ScalarQuantizer,
-};
+use crate::vector::quantize::{Quantizer, ScalarQuantizedVector, ScalarQuantizer};
 use crate::vector::rabitq::{PreparedQuery, RaBitCode, RaBitQuantizer};
 use crate::{Document, RagError, Result, SearchResult};
 use rand::RngExt;
@@ -687,494 +678,6 @@ impl crate::index::VectorIndex for SQ8HNSWIndex {
 }
 
 // ============================================================================
-// Binary HNSW Index
-// ============================================================================
-
-/// Node in Binary HNSW graph
-#[derive(Debug, Clone)]
-struct BinaryNode {
-    id: String,
-    content: String,
-    quantized: BinaryQuantizedVector,
-    /// Optional full precision vector for reranking
-    full_precision: Option<Vec<f32>>,
-    metadata: Option<serde_json::Value>,
-    connections: Vec<HashSet<usize>>,
-}
-
-/// HNSW index with binary quantization
-///
-/// Stores vectors as packed bits (32x compression). Best used for initial
-/// candidate retrieval followed by reranking with higher precision.
-///
-/// # ⚠️ Degenerate on non-negative embeddings
-///
-/// [`BinaryQuantizer`] thresholds each dimension at zero, so on data that is
-/// wholly non-negative — SIFT descriptors, and the output of any ReLU-activated
-/// model — *every* bit is set, all codes collapse to all-ones, every Hamming
-/// distance is zero, and graph traversal degenerates to arbitrary order.
-///
-/// Measured on SIFT10K (10k vectors, 128d, top-10, pool=100): **1.2%** recall@10,
-/// i.e. chance. Mean-centering the threshold lifts it to 50.1%, and RaBitQ at the
-/// same 32x compression reaches 73.2%.
-///
-/// Use [`RaBitQHNSWIndex`] instead: identical footprint, centers the data, and a
-/// strictly better estimator.
-///
-/// # Example
-///
-/// ```
-/// use foxstash_core::index::hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig};
-/// use foxstash_core::Document;
-///
-/// # #[allow(deprecated)] {
-/// // Create binary index
-/// let mut index = BinaryHNSWIndex::new(384, QuantizedHNSWConfig::default());
-///
-/// // Add with full precision storage for reranking
-/// let doc = Document {
-///     id: "doc1".to_string(),
-///     content: "Hello world".to_string(),
-///     embedding: vec![0.1; 384],
-///     metadata: None,
-/// };
-/// index.add_with_full_precision(doc).unwrap();
-///
-/// // Two-phase search: binary filter → full precision rerank
-/// let results = index.search_and_rerank(&vec![0.1; 384], 100, 10).unwrap();
-/// # }
-/// ```
-#[deprecated(
-    since = "0.6.0",
-    note = "zero-threshold binary codes degenerate on non-negative embeddings (1.2% recall@10 on SIFT10K). \
-            Use RaBitQHNSWIndex: same 32x compression, centered, 73.2% on the same benchmark."
-)]
-pub struct BinaryHNSWIndex {
-    embedding_dim: usize,
-    config: QuantizedHNSWConfig,
-    quantizer: BinaryQuantizer,
-    nodes: Vec<BinaryNode>,
-    entry_point: Option<usize>,
-    max_layer: usize,
-    /// Whether full precision vectors are stored
-    store_full_precision: bool,
-}
-
-#[allow(deprecated)]
-impl BinaryHNSWIndex {
-    /// Create index (binary only, no full precision storage)
-    pub fn new(dim: usize, config: QuantizedHNSWConfig) -> Self {
-        Self {
-            embedding_dim: dim,
-            config,
-            quantizer: BinaryQuantizer::new(dim),
-            nodes: Vec::new(),
-            entry_point: None,
-            max_layer: 0,
-            store_full_precision: false,
-        }
-    }
-
-    /// Create index with full precision storage for reranking
-    pub fn with_full_precision(dim: usize, config: QuantizedHNSWConfig) -> Self {
-        let mut index = Self::new(dim, config);
-        index.store_full_precision = true;
-        index
-    }
-
-    /// Add document (binary only)
-    pub fn add(&mut self, document: Document) -> Result<()> {
-        self.add_internal(document, false)
-    }
-
-    /// Add document with full precision storage for reranking
-    pub fn add_with_full_precision(&mut self, document: Document) -> Result<()> {
-        self.add_internal(document, true)
-    }
-
-    fn add_internal(&mut self, document: Document, store_full: bool) -> Result<()> {
-        if document.embedding.len() != self.embedding_dim {
-            return Err(RagError::DimensionMismatch {
-                expected: self.embedding_dim,
-                actual: document.embedding.len(),
-            });
-        }
-
-        if document.embedding.iter().any(|v| !v.is_finite()) {
-            return Err(RagError::InvalidInput(
-                "embedding contains non-finite values (NaN or Inf)".to_string(),
-            ));
-        }
-
-        let node_id = self.nodes.len();
-        let node_level = self.random_level();
-
-        let mut connections = Vec::with_capacity(node_level + 1);
-        for _ in 0..=node_level {
-            connections.push(HashSet::new());
-        }
-
-        let quantized = self.quantizer.quantize(&document.embedding);
-        let full_precision = if store_full || self.store_full_precision {
-            Some(document.embedding)
-        } else {
-            None
-        };
-
-        let node = BinaryNode {
-            id: document.id,
-            content: document.content,
-            quantized,
-            full_precision,
-            metadata: document.metadata,
-            connections,
-        };
-
-        self.nodes.push(node);
-
-        if self.entry_point.is_none() {
-            self.entry_point = Some(node_id);
-            self.max_layer = node_level;
-            return Ok(());
-        }
-
-        self.insert_node(node_id, node_level);
-
-        if node_level > self.max_layer {
-            self.max_layer = node_level;
-            self.entry_point = Some(node_id);
-        }
-
-        Ok(())
-    }
-
-    /// Search using Hamming distance (fast, lower quality)
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        if query.len() != self.embedding_dim {
-            return Err(RagError::DimensionMismatch {
-                expected: self.embedding_dim,
-                actual: query.len(),
-            });
-        }
-
-        if self.nodes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let query_quantized = self.quantizer.quantize(query);
-
-        let entry_point = self.entry_point.unwrap();
-        let mut current_nearest = vec![entry_point];
-
-        for layer in (1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(&query_quantized, &current_nearest, 1, layer);
-        }
-
-        let ef = self.config.ef_search.max(k);
-        current_nearest = self.search_layer(&query_quantized, &current_nearest, ef, 0);
-
-        let mut results: Vec<SearchResult> = current_nearest
-            .iter()
-            .map(|&node_id| {
-                let node = &self.nodes[node_id];
-                let dist = self
-                    .quantizer
-                    .distance_quantized(&query_quantized, &node.quantized);
-                // Convert Hamming distance to similarity (max distance = dim)
-                let score = 1.0 - (dist / self.embedding_dim as f32);
-                SearchResult {
-                    id: node.id.clone(),
-                    content: node.content.clone(),
-                    score,
-                    metadata: node.metadata.clone(),
-                }
-            })
-            .collect();
-
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        results.truncate(k);
-
-        Ok(results)
-    }
-
-    /// Two-phase search: binary filter → full precision rerank
-    ///
-    /// First retrieves `candidates` using binary search, then reranks using
-    /// full precision cosine similarity if available.
-    ///
-    /// # Arguments
-    /// * `query` - Query vector
-    /// * `candidates` - Number of candidates to retrieve in binary phase
-    /// * `k` - Number of final results
-    pub fn search_and_rerank(
-        &self,
-        query: &[f32],
-        candidates: usize,
-        k: usize,
-    ) -> Result<Vec<SearchResult>> {
-        if query.len() != self.embedding_dim {
-            return Err(RagError::DimensionMismatch {
-                expected: self.embedding_dim,
-                actual: query.len(),
-            });
-        }
-
-        if self.nodes.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Phase 1: Binary search
-        let query_quantized = self.quantizer.quantize(query);
-        let entry_point = self.entry_point.unwrap();
-        let mut current_nearest = vec![entry_point];
-
-        for layer in (1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(&query_quantized, &current_nearest, 1, layer);
-        }
-
-        let ef = self.config.ef_search.max(candidates);
-        current_nearest = self.search_layer(&query_quantized, &current_nearest, ef, 0);
-        current_nearest.truncate(candidates);
-
-        // Phase 2: Rerank with full precision (if available)
-        let mut results: Vec<SearchResult> = current_nearest
-            .iter()
-            .map(|&node_id| {
-                let node = &self.nodes[node_id];
-
-                let score = if let Some(ref full_vec) = node.full_precision {
-                    // Full precision cosine similarity
-                    crate::vector::cosine_similarity(query, full_vec).unwrap_or(0.0)
-                } else {
-                    // Fall back to binary similarity
-                    let dist = self
-                        .quantizer
-                        .distance_quantized(&query_quantized, &node.quantized);
-                    1.0 - (dist / self.embedding_dim as f32)
-                };
-
-                SearchResult {
-                    id: node.id.clone(),
-                    content: node.content.clone(),
-                    score,
-                    metadata: node.metadata.clone(),
-                }
-            })
-            .collect();
-
-        results.sort_by(|a, b| b.score.total_cmp(&a.score));
-        results.truncate(k);
-
-        Ok(results)
-    }
-
-    /// Returns number of documents
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    /// Returns true if empty
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    /// Clear all documents
-    pub fn clear(&mut self) {
-        self.nodes.clear();
-        self.entry_point = None;
-        self.max_layer = 0;
-    }
-
-    /// Memory usage estimate in bytes
-    pub fn memory_usage(&self) -> usize {
-        if self.nodes.is_empty() {
-            return 0;
-        }
-
-        let binary_size = self.quantizer.byte_len();
-        let full_size = if self.store_full_precision {
-            self.embedding_dim * 4 // f32
-        } else {
-            0
-        };
-        let overhead_per_node = 100;
-        self.nodes.len() * (binary_size + full_size + overhead_per_node)
-    }
-
-    /// Get the embedding dimension
-    pub fn embedding_dim(&self) -> usize {
-        self.embedding_dim
-    }
-
-    fn random_level(&self) -> usize {
-        let mut rng = rand::rng();
-        let uniform: f32 = rng.random::<f32>().max(f32::EPSILON);
-        (-uniform.ln() * self.config.ml).floor() as usize
-    }
-
-    fn insert_node(&mut self, node_id: usize, node_level: usize) {
-        let entry_point = self.entry_point.unwrap();
-        let mut current_nearest = vec![entry_point];
-        let node_quantized = self.nodes[node_id].quantized.clone();
-
-        for layer in (node_level + 1..=self.max_layer).rev() {
-            current_nearest = self.search_layer(&node_quantized, &current_nearest, 1, layer);
-        }
-
-        for layer in (0..=node_level).rev() {
-            current_nearest = self.search_layer(
-                &node_quantized,
-                &current_nearest,
-                self.config.ef_construction,
-                layer,
-            );
-
-            let m = if layer == 0 {
-                self.config.m0
-            } else {
-                self.config.m
-            };
-            let neighbors = self.select_neighbors(&current_nearest, &node_quantized, m);
-
-            for &neighbor_id in &neighbors {
-                self.nodes[node_id].connections[layer].insert(neighbor_id);
-
-                if layer < self.nodes[neighbor_id].connections.len() {
-                    self.nodes[neighbor_id].connections[layer].insert(node_id);
-
-                    let neighbor_m = if layer == 0 {
-                        self.config.m0
-                    } else {
-                        self.config.m
-                    };
-                    if self.nodes[neighbor_id].connections[layer].len() > neighbor_m {
-                        let neighbor_quantized = self.nodes[neighbor_id].quantized.clone();
-                        let neighbor_connections: Vec<usize> = self.nodes[neighbor_id].connections
-                            [layer]
-                            .iter()
-                            .copied()
-                            .collect();
-                        let pruned = self.select_neighbors(
-                            &neighbor_connections,
-                            &neighbor_quantized,
-                            neighbor_m,
-                        );
-                        self.nodes[neighbor_id].connections[layer] = pruned.into_iter().collect();
-                    }
-                }
-            }
-        }
-    }
-
-    fn search_layer(
-        &self,
-        query: &BinaryQuantizedVector,
-        entry_points: &[usize],
-        ef: usize,
-        layer: usize,
-    ) -> Vec<usize> {
-        let mut visited = HashSet::new();
-        let mut candidates = BinaryHeap::new();
-        let mut best = BinaryHeap::new();
-
-        for &ep in entry_points {
-            let dist = self
-                .quantizer
-                .distance_quantized(query, &self.nodes[ep].quantized);
-            candidates.push(Reverse((OrderedFloat(dist), ep)));
-            best.push((OrderedFloat(dist), ep));
-            visited.insert(ep);
-        }
-
-        while let Some(Reverse((current_dist, current_id))) = candidates.pop() {
-            if best.len() >= ef {
-                if let Some(&(furthest_dist, _)) = best.peek() {
-                    if current_dist > furthest_dist {
-                        break;
-                    }
-                }
-            }
-
-            if layer < self.nodes[current_id].connections.len() {
-                for &neighbor_id in &self.nodes[current_id].connections[layer] {
-                    if !visited.contains(&neighbor_id) {
-                        visited.insert(neighbor_id);
-                        let dist = self
-                            .quantizer
-                            .distance_quantized(query, &self.nodes[neighbor_id].quantized);
-                        let dist_ord = OrderedFloat(dist);
-
-                        if best.len() < ef {
-                            candidates.push(Reverse((dist_ord, neighbor_id)));
-                            best.push((dist_ord, neighbor_id));
-                        } else if let Some(&(furthest_dist, _)) = best.peek() {
-                            if dist_ord < furthest_dist {
-                                candidates.push(Reverse((dist_ord, neighbor_id)));
-                                best.push((dist_ord, neighbor_id));
-                                if best.len() > ef {
-                                    best.pop();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut results: Vec<(f32, usize)> = best
-            .into_iter()
-            .map(|(OrderedFloat(dist), id)| (dist, id))
-            .collect();
-        results.sort_by(|a, b| a.0.total_cmp(&b.0));
-        results.into_iter().map(|(_, id)| id).collect()
-    }
-
-    fn select_neighbors(
-        &self,
-        candidates: &[usize],
-        query: &BinaryQuantizedVector,
-        m: usize,
-    ) -> Vec<usize> {
-        let mut scored: Vec<(f32, usize)> = candidates
-            .iter()
-            .map(|&id| {
-                let dist = self
-                    .quantizer
-                    .distance_quantized(query, &self.nodes[id].quantized);
-                (dist, id)
-            })
-            .collect();
-
-        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-        scored.truncate(m);
-        scored.into_iter().map(|(_, id)| id).collect()
-    }
-}
-
-#[allow(deprecated)]
-impl crate::index::VectorIndex for BinaryHNSWIndex {
-    fn add(&mut self, document: Document) -> Result<()> {
-        self.add(document)
-    }
-
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.search(query, k)
-    }
-
-    fn len(&self) -> usize {
-        self.len()
-    }
-
-    fn clear(&mut self) {
-        self.clear()
-    }
-
-    fn embedding_dim(&self) -> usize {
-        self.embedding_dim()
-    }
-}
-
-// ============================================================================
 // OrderedFloat Helper
 // ============================================================================
 
@@ -1213,17 +716,13 @@ struct RaBitQNode {
 
 /// HNSW index with RaBitQ 1-bit quantization (32x compression).
 ///
-/// Supersedes [`BinaryHNSWIndex`]: same 1 bit/dim footprint, but RaBitQ's
-/// unbiased estimator is a far better first-stage ranker than a Hamming proxy,
-/// and — critically — it centers the data, so it does not degenerate on
-/// non-negative embeddings the way a zero-threshold binary code does.
+/// RaBitQ's unbiased estimator centers the data before thresholding, so unlike a
+/// zero-threshold binary code it does not degenerate on wholly non-negative
+/// embeddings (SIFT descriptors, and the output of any ReLU-activated model), where
+/// a zero threshold sets every bit and collapses every code to the same value.
 ///
 /// The quantizer must be fitted on training data (it needs a centroid), so
 /// there is no `new(dim)` constructor — use [`RaBitQHNSWIndex::fit`].
-///
-/// Measured on SIFT10K (10k vectors, 128d, top-10, pool=100, exact-L2 rerank):
-/// RaBitQ **73.2%** recall@10 vs binary's **1.2%** (binary's zero threshold
-/// collapses on this non-negative data; even mean-centered it reaches only 50.1%).
 ///
 /// # Example
 ///
@@ -2059,82 +1558,6 @@ mod tests {
     }
 
     // ========================================================================
-    // Binary HNSW Tests
-    // ========================================================================
-
-    #[test]
-    fn test_binary_hnsw_basic() {
-        let index = BinaryHNSWIndex::new(128, QuantizedHNSWConfig::default());
-        assert_eq!(index.len(), 0);
-        assert!(index.is_empty());
-    }
-
-    #[test]
-    fn test_binary_hnsw_search() {
-        let mut index = BinaryHNSWIndex::new(128, QuantizedHNSWConfig::default());
-
-        for i in 0..100 {
-            let embedding = generate_random_vector(128, i);
-            let doc = create_test_document(&format!("doc{}", i), embedding);
-            index.add(doc).unwrap();
-        }
-
-        let query = generate_random_vector(128, 999);
-        let results = index.search(&query, 10).unwrap();
-
-        assert_eq!(results.len(), 10);
-        for i in 0..results.len() - 1 {
-            assert!(results[i].score >= results[i + 1].score);
-        }
-    }
-
-    #[test]
-    fn test_binary_hnsw_search_and_rerank() {
-        let mut index = BinaryHNSWIndex::with_full_precision(128, QuantizedHNSWConfig::default());
-
-        for i in 0..100 {
-            let embedding = generate_random_vector(128, i);
-            let doc = create_test_document(&format!("doc{}", i), embedding);
-            index.add_with_full_precision(doc).unwrap();
-        }
-
-        let query = generate_random_vector(128, 999);
-
-        // Two-phase search should give better results than binary-only
-        let results = index.search_and_rerank(&query, 50, 10).unwrap();
-
-        assert_eq!(results.len(), 10);
-        for i in 0..results.len() - 1 {
-            assert!(results[i].score >= results[i + 1].score);
-        }
-    }
-
-    #[test]
-    fn test_binary_memory_savings() {
-        let dim = 384usize;
-        let num_docs = 1000usize;
-
-        let mut index = BinaryHNSWIndex::new(dim, QuantizedHNSWConfig::default());
-
-        for i in 0..num_docs {
-            let embedding = generate_random_vector(dim, i as u64);
-            let doc = create_test_document(&format!("doc{}", i), embedding);
-            index.add(doc).unwrap();
-        }
-
-        let memory = index.memory_usage();
-        let full_precision = num_docs * dim * 4; // f32 size
-
-        // Binary should use ~1/32 the memory for vectors
-        assert!(
-            memory < full_precision / 10,
-            "Binary memory: {}, full: {}",
-            memory,
-            full_precision
-        );
-    }
-
-    // ========================================================================
     // Recall Comparison Tests
     // ========================================================================
 
@@ -2156,15 +1579,12 @@ mod tests {
             })
             .collect();
 
-        // Build indices
+        // Build index
         let mut sq8_index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
-        let mut binary_index =
-            BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
 
         for (i, vec) in vectors.iter().enumerate() {
             let doc = create_test_document(&format!("doc{}", i), vec.clone());
-            sq8_index.add(doc.clone()).unwrap();
-            binary_index.add_with_full_precision(doc).unwrap();
+            sq8_index.add(doc).unwrap();
         }
 
         // Test with random queries
@@ -2191,29 +1611,13 @@ mod tests {
             .collect();
         let sq8_recall = ground_truth_top_k.intersection(&sq8_ids).count();
 
-        // Test Binary recall (with reranking)
-        let binary_results = binary_index.search_and_rerank(&query, 50, k).unwrap();
-        let binary_ids: std::collections::HashSet<_> = binary_results
-            .iter()
-            .map(|r| r.id.strip_prefix("doc").unwrap().parse::<usize>().unwrap())
-            .collect();
-        let binary_recall = ground_truth_top_k.intersection(&binary_ids).count();
-
         println!("SQ8 recall@{}: {}/{}", k, sq8_recall, k);
-        println!("Binary+rerank recall@{}: {}/{}", k, binary_recall, k);
 
         // Note: Recall can vary significantly based on data distribution.
         // With random vectors in high dimensions, recall tends to be lower.
-        // We're testing that the indices work, not exact recall guarantees.
+        // We're testing that the index works, not exact recall guarantees.
         // SQ8 should have at least 40% recall (conservative for random data)
         assert!(sq8_recall >= 4, "SQ8 recall too low: {}/{}", sq8_recall, k);
-        // Binary with reranking should have at least 30% recall
-        assert!(
-            binary_recall >= 3,
-            "Binary recall too low: {}/{}",
-            binary_recall,
-            k
-        );
     }
 
     #[test]
@@ -2227,35 +1631,11 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_add_nan_embedding_rejected() {
-        let mut index = BinaryHNSWIndex::new(8, QuantizedHNSWConfig::default());
-        let doc =
-            create_test_document("nan_doc", vec![0.1, 0.2, 0.3, f32::NAN, 0.5, 0.6, 0.7, 0.8]);
-        let result = index.add(doc);
-        assert!(result.is_err());
-        assert_eq!(index.len(), 0);
-    }
-
-    #[test]
-    fn test_binary_add_with_full_precision_nan_embedding_rejected() {
-        let mut index = BinaryHNSWIndex::with_full_precision(8, QuantizedHNSWConfig::default());
-        let doc = create_test_document("nan_doc", vec![f32::NAN; 8]);
-        let result = index.add_with_full_precision(doc);
-        assert!(result.is_err());
-        assert_eq!(index.len(), 0);
-    }
-
-    #[test]
     fn test_quantized_search_with_nan_query_does_not_panic() {
         let dim = 8;
 
         let mut sq8 = SQ8HNSWIndex::for_normalized(dim, QuantizedHNSWConfig::default());
         sq8.add(create_test_document("sq8_doc", vec![0.1; dim]))
-            .unwrap();
-
-        let mut binary = BinaryHNSWIndex::new(dim, QuantizedHNSWConfig::default());
-        binary
-            .add(create_test_document("bin_doc", vec![0.2; dim]))
             .unwrap();
 
         let query = vec![f32::NAN; dim];
@@ -2264,12 +1644,6 @@ mod tests {
         assert!(
             sq8_outcome.is_ok(),
             "SQ8 search panicked when query contains NaN"
-        );
-
-        let binary_outcome = std::panic::catch_unwind(|| binary.search(&query, 1));
-        assert!(
-            binary_outcome.is_ok(),
-            "Binary search panicked when query contains NaN"
         );
     }
 
@@ -2312,12 +1686,11 @@ mod tests {
             .collect()
     }
 
-    /// Regression test for the bug this index exists to fix.
-    ///
-    /// `BinaryQuantizer` thresholds at zero, so on wholly non-negative data every bit
-    /// sets, all codes collapse to all-ones, and retrieval degenerates to arbitrary
-    /// order. RaBitQ centers on a fitted centroid, so it must still find the exact
-    /// vector it was given as a query.
+    /// Regression test for the class of bug RaBitQ's centering avoids: a zero-threshold
+    /// binary code would set every bit on wholly non-negative data, collapsing all
+    /// codes to the same value and degenerating retrieval to arbitrary order. RaBitQ
+    /// centers on a fitted centroid, so it must still find the exact vector it was
+    /// given as a query.
     #[test]
     fn rabitq_retrieves_exactly_on_nonnegative_data() {
         let dim = 32;
@@ -2345,83 +1718,11 @@ mod tests {
         }
 
         // Exact-match self-retrieval through a 1-bit first stage + exact rerank should
-        // be essentially perfect. Binary scores near zero here.
+        // be essentially perfect.
         assert!(
             hits >= 122, // >= 95% of 128
             "RaBitQ self-retrieval on non-negative data: {hits}/128 (expected >= 122). \
              A collapse toward 0 means the codes are degenerate."
-        );
-    }
-
-    /// Pins the bug that RaBitQHNSWIndex exists to fix, on the same fixture.
-    ///
-    /// If this ever starts passing at RaBitQ-like rates, someone has fixed
-    /// BinaryQuantizer's threshold and the deprecation can be revisited.
-    #[test]
-    #[allow(deprecated)]
-    fn binary_degenerates_on_nonnegative_data() {
-        let dim = 32;
-        let vectors = sift_like(128, dim);
-
-        let mut binary = BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
-        let mut rabitq = RaBitQHNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
-        for (i, v) in vectors.iter().enumerate() {
-            let id = format!("doc{i}");
-            binary
-                .add_with_full_precision(create_test_document(&id, v.clone()))
-                .unwrap();
-            rabitq
-                .add_with_full_precision(create_test_document(&id, v.clone()))
-                .unwrap();
-        }
-
-        // Every code is all-ones, so the binary quantizer cannot distinguish any two
-        // vectors: quantize the whole corpus and it collapses to a single distinct code.
-        let bq = BinaryQuantizer::new(dim);
-        let distinct: HashSet<Vec<u8>> = vectors
-            .iter()
-            .map(|v| bq.quantize(v).data.clone())
-            .collect();
-        assert_eq!(
-            distinct.len(),
-            1,
-            "expected all binary codes to collapse to one; got {} distinct",
-            distinct.len()
-        );
-
-        // And that collapse shows up as retrieval quality, through the real index.
-        let score = |hits: usize| hits as f32 / vectors.len() as f32;
-        let count_self_hits = |f: &dyn Fn(&[f32], usize) -> Vec<String>| {
-            vectors
-                .iter()
-                .enumerate()
-                .filter(|(i, v)| f(v, 1).first() == Some(&format!("doc{i}")))
-                .count()
-        };
-
-        let bin_hits = count_self_hits(&|v, k| {
-            binary
-                .search(v, k)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.id)
-                .collect()
-        });
-        let rb_hits = count_self_hits(&|v, k| {
-            rabitq
-                .search_and_rerank(v, 64, k)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.id)
-                .collect()
-        });
-
-        assert!(
-            score(rb_hits) > score(bin_hits) + 0.5,
-            "RaBitQ should dominate degenerate binary by a wide margin on non-negative data; \
-             got RaBitQ {:.0}% vs Binary {:.0}%",
-            score(rb_hits) * 100.0,
-            score(bin_hits) * 100.0
         );
     }
 

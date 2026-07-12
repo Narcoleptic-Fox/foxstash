@@ -979,6 +979,12 @@ pub struct HNSWConfigWrapper {
     /// cosine, which is what `DistanceMetric::default()` yields — so they load correctly.
     #[serde(default)]
     pub metric: crate::index::hnsw::DistanceMetric,
+    /// Absent from indexes persisted before this field existed; `serde(default)` gives them
+    /// `Storage::F32`, which is what they were.
+    #[serde(default)]
+    pub storage: crate::index::hnsw::Storage,
+    #[serde(default = "default_rerank_candidates")]
+    pub rerank_candidates: usize,
     pub m: usize,
     pub m0: usize,
     pub ef_construction: usize,
@@ -1011,8 +1017,14 @@ impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
             extend_candidates: config.extend_candidates,
             keep_pruned_connections: config.keep_pruned_connections,
             metric: config.metric,
+            storage: config.storage,
+            rerank_candidates: config.rerank_candidates,
         }
     }
+}
+
+fn default_rerank_candidates() -> usize {
+    100
 }
 
 impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
@@ -1027,6 +1039,8 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             use_heuristic: wrapper.use_heuristic,
             extend_candidates: wrapper.extend_candidates,
             keep_pruned_connections: wrapper.keep_pruned_connections,
+            storage: wrapper.storage,
+            rerank_candidates: wrapper.rerank_candidates,
             build_strategy: crate::index::BuildStrategy::default(),
             seed: None,
         }

@@ -2,11 +2,65 @@
 
 Measured against **hnswlib** and **faiss** on real SIFT, at **matched recall**, at three scales.
 
-**Headline: foxstash is at parity with faiss and ~10% behind hnswlib at 1M.** It builds 2.1x
-faster than hnswlib and reaches any given recall at a lower `ef` than either competitor.
+**Headline: with `Storage::SQ8`, foxstash serves 1.20x hnswlib's QPS and 1.30x faiss's at
+99.5% recall on SIFT1M** — and 1.33x / 1.34x at 99.85%. It also builds 2.1x faster than hnswlib.
 
-Before the node-arena interleave (commit 0617c6c) it was ~20% behind hnswlib and only won on
-SIFT10K, the one dataset small enough to live in L3 cache. See *Why the layout mattered* below.
+**The cost is memory: 1,076 MB against their ~776 MB.** The rerank stage needs the
+full-precision vectors, so you can have the speed crown at 1.39x memory, or the *memory* crown
+(564 MB, 0.73x hnswlib) by dropping them — at a recall ceiling of ~98.9%. Not both, yet.
+
+In full precision (`Storage::F32`) foxstash is still ~0.88x hnswlib. The win comes entirely
+from moving fewer bytes per node visit, not from a better graph or a faster kernel.
+
+## SIFT1M — QPS at matched recall, single-threaded
+
+| recall@10 | foxstash SQ8 | vs hnswlib | vs faiss | foxstash F32 | vs hnswlib |
+|---|---|---|---|---|---|
+| 92.99% | 13,107 | **1.11x** | **1.19x** | 10,045 | 0.84x |
+| 98.24% | 7,183 | **1.15x** | **1.27x** | 5,478 | 0.87x |
+| 99.51% | 4,254 | **1.20x** | **1.30x** | 3,290 | 0.88x |
+| 99.85% | 2,549 | **1.33x** | **1.34x** | 1,925 | 0.90x |
+
+| index size @ 1M | |
+|---|---|
+| foxstash SQ8 + rerank | 1,076 MB |
+| foxstash F32 | 948 MB |
+| hnswlib / faiss | ~776 MB |
+| **foxstash SQ8, codes only** (no rerank; recall ceiling ~98.9%) | **564 MB** |
+
+### Why it works, and why it nearly didn't
+
+Search is **memory-latency bound**: a distance computation costs 77–98 ns, about one DRAM
+round-trip. Foxstash already computed distances *faster* than faiss (84 ns vs 98 ns) and still
+lost, because it issued more of them and each one waited on memory. Making the kernel faster
+was never going to help. Moving fewer bytes was.
+
+`Storage::SQ8` puts 8-bit codes in the hot node block — 400 bytes instead of 784 — and keeps
+the f32 vectors in a **cold** array read only when rescoring the final candidate pool
+(`O(rerank_candidates)` per query, against `O(nodes visited)` for the walk). The graph itself
+is still built with **exact f32 distances**, so it is bit-identical to the F32 index:
+
+| | F32 | SQ8 |
+|---|---|---|
+| recall@10 (ef=100) | 99.45% | 99.51% |
+| distance computations / query | 3,492 | 3,491 |
+| **ns per distance** | **87.1** | **67.3** |
+
+Same graph, same work, fewer bytes. That is the whole result.
+
+**The near-miss:** the first version of the SQ8 kernel was a scalar loop, and it made SQ8
+*slower* — 132 ns per distance against F32's 87 — because the `u8 -> f32` widening cost more
+than the bandwidth saved. Measured naively, that reads as "compressed traversal does not work".
+It does; the widening just has to be one instruction. AVX2's `cvtepu8_epi32` is the difference
+between 132 ns and 67 ns. A portable `pulp` kernel cannot express it, which is why this is the
+one hand-written `std::arch` path in the library — and why it carries a test asserting the AVX2
+and scalar paths agree.
+
+## History: before the SQ8 storage mode
+
+Before the node-arena interleave (commit 0617c6c) foxstash was ~20% behind hnswlib and only won
+on SIFT10K, the one dataset small enough to live in L3 cache. See *Why the layout mattered*
+below — that fix is what made the SQ8 win reachable.
 
 Reproduce the whole table: `benchmarks/run-scoreboard.sh`
 

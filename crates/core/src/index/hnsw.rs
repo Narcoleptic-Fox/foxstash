@@ -244,6 +244,23 @@ pub struct HNSWConfig {
 
     /// Random seed for reproducible builds (None = random)
     pub seed: Option<u64>,
+
+    /// What the traversal reads for each node's vector. See [`Storage`].
+    pub storage: Storage,
+
+    /// Candidates rescored against full-precision vectors before returning `k`.
+    ///
+    /// Only meaningful under [`Storage::SQ8`]: the coarse walk ranks by an approximate
+    /// distance, so its top-`k` is not necessarily the true top-`k`. Rescoring a pool of this
+    /// size with exact distances recovers it. The pool reads come from a cold array and are
+    /// `O(pool)` per query, against `O(nodes visited)` for the walk — which is why the walk
+    /// gets to keep its small blocks.
+    ///
+    /// **Set to 0 to drop the full-precision vectors entirely.** That is the memory-optimal
+    /// configuration: the index then stores only 8-bit codes and pays no `f32` array at all.
+    /// It costs whatever recall the approximate ranking loses, which is a real trade and
+    /// should be measured on your data, not assumed.
+    pub rerank_candidates: usize,
 }
 
 /// Distance metric for [`HNSWIndex`].
@@ -261,6 +278,36 @@ pub enum DistanceMetric {
     L2,
 }
 
+/// What the graph traversal reads for each node's vector.
+///
+/// HNSW search is **memory-latency bound**: a distance computation costs 77-98 ns on SIFT1M,
+/// which is essentially one DRAM round-trip. Foxstash already computes distances *faster* than
+/// faiss (84 ns vs 98 ns) and still loses, because it issues more of them and each one waits on
+/// memory. The only remaining lever is to move fewer bytes per node visit.
+///
+/// With `m0 = 64` and 128 dimensions, one node block is:
+///
+/// | storage | header + links | vector | block |
+/// |---|---|---|---|
+/// | `F32` | 272 B | 512 B | **784 B** |
+/// | `SQ8` | 272 B | 128 B | **400 B** |
+///
+/// Note the adjacency does not shrink, so this is ~2x less traffic, not 4x — quantization
+/// cannot buy more than the vector's share of the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Storage {
+    /// Full-precision `f32` vectors in the arena. Exact distances, largest blocks.
+    #[default]
+    F32,
+    /// 8-bit codes in the arena, with per-dimension `min`/`scale` fitted over the corpus.
+    ///
+    /// Traversal computes an *asymmetric* distance: the query stays `f32` and each database
+    /// value is dequantized on the fly, so error enters on one side only. The full-precision
+    /// vectors are retained in a cold side array and used to rescore the final candidates —
+    /// they are never touched during the walk.
+    SQ8,
+}
+
 impl Default for HNSWConfig {
     fn default() -> Self {
         let m = 32; // Match instant-distance for good recall
@@ -276,6 +323,8 @@ impl Default for HNSWConfig {
             keep_pruned_connections: true,
             build_strategy: BuildStrategy::default(),
             seed: None,
+            storage: Storage::default(),
+            rerank_candidates: 100,
         }
     }
 }
@@ -363,10 +412,23 @@ const fn node_hdr_len(m0: usize) -> usize {
     (2 + m0 + 1).div_ceil(4) * 4
 }
 
+/// Size, in 4-byte units, of the vector region of a node block.
+///
+/// `F32` needs one word per dimension. `SQ8` packs one byte per dimension, rounded up to a
+/// whole word — the codes sit in the same arena as the links, so a node visit still touches
+/// exactly one contiguous block.
+#[inline(always)]
+const fn vec_words(storage: Storage, dim: usize) -> usize {
+    match storage {
+        Storage::F32 => dim,
+        Storage::SQ8 => dim.div_ceil(4),
+    }
+}
+
 /// Size, in 4-byte units, of one node block.
 #[inline(always)]
-const fn node_stride(m0: usize, dim: usize) -> usize {
-    node_hdr_len(m0) + dim
+const fn node_stride(m0: usize, dim: usize, storage: Storage) -> usize {
+    node_hdr_len(m0) + vec_words(storage, dim)
 }
 
 /// HNSW index for efficient similarity search.
@@ -416,6 +478,22 @@ pub struct HNSWIndex {
     /// `node_hdr_len(m0)`, cached. Same reason.
     hdr: usize,
 
+    // === SQ8 storage (empty under Storage::F32) ===
+    /// Per-dimension quantization offset: `value ~= min[d] + code * scale[d]`.
+    q_min: Vec<f32>,
+    /// Per-dimension quantization step.
+    ///
+    /// Per-dimension, not global. A single shared scale would let a near-constant dimension's
+    /// full 0-255 code swing carry the same weight as a high-variance dimension's — the exact
+    /// bug that cost `SQ8HNSWIndex` 28 points of recall (see commit 1df91b6).
+    q_scale: Vec<f32>,
+    /// Full-precision vectors, kept out of the hot arena.
+    ///
+    /// Read only when rescoring the final candidate pool (`O(rerank_candidates)` per query),
+    /// never during the walk (`O(nodes visited)`). Keeping them here rather than in the node
+    /// block is the entire point: the walk must not pay for bytes it does not use.
+    full: Vec<f32>,
+
     // === GRAPH STRUCTURE (layers >= 1 only) ===
     /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
     ///
@@ -447,17 +525,42 @@ impl HNSWIndex {
     pub fn new(embedding_dim: usize, config: HNSWConfig) -> Self {
         Self {
             embedding_dim,
-            stride: node_stride(config.m0, embedding_dim),
+            stride: node_stride(config.m0, embedding_dim, config.storage),
             hdr: node_hdr_len(config.m0),
             config,
             nodes: Vec::new(),
             connections: Vec::new(),
+            q_min: Vec::new(),
+            q_scale: Vec::new(),
+            full: Vec::new(),
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
             entry_point: None,
             max_layer: 0,
         }
+    }
+
+    /// Fit the per-dimension SQ8 codebook over the corpus. No-op under `Storage::F32`.
+    ///
+    /// Each dimension gets its own `min`/`scale` from its own observed range. A dimension with
+    /// no spread gets `scale = 0`, which dequantizes to a constant — correct, and it contributes
+    /// nothing to any distance, which is exactly right for a dimension carrying no information.
+    fn fit_codebook(&mut self, embeddings: &[Vec<f32>]) {
+        if self.config.storage != Storage::SQ8 || embeddings.is_empty() {
+            return;
+        }
+        let dim = self.embedding_dim;
+        let mut lo = vec![f32::INFINITY; dim];
+        let mut hi = vec![f32::NEG_INFINITY; dim];
+        for v in embeddings {
+            for d in 0..dim {
+                lo[d] = lo[d].min(v[d]);
+                hi[d] = hi[d].max(v[d]);
+            }
+        }
+        self.q_scale = (0..dim).map(|d| (hi[d] - lo[d]) / 255.0).collect();
+        self.q_min = lo;
     }
 
     /// Creates a new HNSW index with default configuration
@@ -594,7 +697,8 @@ impl HNSWIndex {
         // Pre-allocate
         index
             .nodes
-            .reserve(n * node_stride(index.config.m0, embedding_dim));
+            .reserve(n * node_stride(index.config.m0, embedding_dim, index.config.storage));
+        index.fit_codebook(&embeddings);
         index.connections.reserve(n);
         index.ids.reserve(n);
         index.contents.reserve(n);
@@ -653,15 +757,40 @@ impl HNSWIndex {
         self.ids.is_empty()
     }
 
-    /// Get embedding slice for a node (hot path).
+    /// Full-precision vector for a node.
+    ///
+    /// Under `Storage::F32` this reads the arena (hot). Under `Storage::SQ8` it reads the cold
+    /// `full` array — correct, but NOT what the traversal uses; see `distance_to_node`.
     ///
     /// Bounds-checked, deliberately. Replacing these with `get_unchecked` was measured at
     /// +1.3% on SIFT1M — inside run-to-run noise, and not worth `unsafe` in the hottest
     /// accessor in the library. The bounds check is not what separates us from hnswlib.
     #[inline(always)]
     fn get_embedding(&self, node_id: usize) -> &[f32] {
+        match self.config.storage {
+            Storage::F32 => {
+                let start = node_id * self.stride + self.hdr;
+                bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
+            }
+            Storage::SQ8 => {
+                debug_assert!(
+                    !self.full.is_empty(),
+                    "full-precision vectors were dropped (rerank_candidates = 0); \
+                     no exact embedding exists to return"
+                );
+                let start = node_id * self.embedding_dim;
+                &self.full[start..start + self.embedding_dim]
+            }
+        }
+    }
+
+    /// The 8-bit codes for a node, from the hot arena. `Storage::SQ8` only.
+    #[inline(always)]
+    fn get_codes(&self, node_id: usize) -> &[u8] {
         let start = node_id * self.stride + self.hdr;
-        bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
+        let words = vec_words(Storage::SQ8, self.embedding_dim);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.nodes[start..start + words]);
+        &bytes[..self.embedding_dim]
     }
 
     /// Precomputed L2 norm of a node's vector. Lives in the node's own block, so cosine
@@ -718,7 +847,30 @@ impl HNSWIndex {
         self.nodes.resize(base + self.stride, 0);
         self.nodes[base + 1] = crate::vector::simd::norm_simd(embedding).to_bits();
         let v = base + self.hdr;
-        self.nodes[v..v + self.embedding_dim].copy_from_slice(bytemuck::cast_slice(embedding));
+
+        match self.config.storage {
+            Storage::F32 => {
+                self.nodes[v..v + self.embedding_dim]
+                    .copy_from_slice(bytemuck::cast_slice(embedding));
+            }
+            Storage::SQ8 => {
+                // Codes go in the hot block. The f32 vector goes to the cold side array only
+                // if a rerank stage will actually read it — otherwise it is pure memory cost.
+                let words = vec_words(Storage::SQ8, self.embedding_dim);
+                let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut self.nodes[v..v + words]);
+                for (d, &x) in embedding.iter().enumerate() {
+                    let s = self.q_scale[d];
+                    bytes[d] = if s <= 0.0 {
+                        0
+                    } else {
+                        (((x - self.q_min[d]) / s).round().clamp(0.0, 255.0)) as u8
+                    };
+                }
+                if self.config.rerank_candidates > 0 {
+                    self.full.extend_from_slice(embedding);
+                }
+            }
+        }
     }
 
     /// Move layer-0 links out of the nested `connections` and into the arena.
@@ -936,7 +1088,20 @@ impl HNSWIndex {
 
         // Search layer 0 with ef_search candidates
         let ef = self.config.ef_search.max(k);
-        let found = self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
+        let mut found = self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
+
+        // Under SQ8 the walk ranked by an approximate distance, so its top-k is not the true
+        // top-k. Rescore a pool with exact distances and re-sort. The pool is read from the
+        // cold `full` array — O(pool) reads, against O(nodes visited) during the walk, which
+        // is why the walk gets to keep its small blocks.
+        if self.config.storage == Storage::SQ8 && self.config.rerank_candidates > 0 {
+            let pool = self.config.rerank_candidates.max(k).min(found.len());
+            found.truncate(pool);
+            for entry in found.iter_mut() {
+                entry.0 = self.exact_distance(query, entry.1);
+            }
+            found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        }
 
         // `found` is already sorted nearest-first and carries its distances, so cut to k
         // *before* materialising anything. Building a SearchResult per candidate would clone
@@ -985,6 +1150,7 @@ impl HNSWIndex {
     /// Clears all documents from the index
     pub fn clear(&mut self) {
         self.nodes.clear();
+        self.full.clear();
         self.connections.clear();
         self.ids.clear();
         self.contents.clear();
@@ -1050,6 +1216,7 @@ impl HNSWIndex {
     /// the index is now static.
     pub fn shrink_to_fit(&mut self) {
         self.nodes.shrink_to_fit();
+        self.full.shrink_to_fit();
         self.ids.shrink_to_fit();
         self.contents.shrink_to_fit();
         self.metadata.shrink_to_fit();
@@ -1110,13 +1277,16 @@ impl HNSWIndex {
         // neighbour slots + padding) plus any surplus arena capacity.
         let n = self.len();
         let arena = self.nodes.capacity() * std::mem::size_of::<u32>();
-        let vectors = n * self.embedding_dim * std::mem::size_of::<f32>();
+        // Bytes the *traversal* reads for vectors: 4/dim under F32, 1/dim under SQ8.
+        let hot_vectors = n * vec_words(self.config.storage, self.embedding_dim) * 4;
+        // Under SQ8 the f32 vectors still exist, in the cold rerank array.
+        let cold_vectors = self.full.capacity() * std::mem::size_of::<f32>();
 
         MemoryBreakdown {
-            embeddings: vectors,
+            embeddings: hot_vectors + cold_vectors,
             norms: n * std::mem::size_of::<f32>(),
             layer0_links: arena
-                .saturating_sub(vectors)
+                .saturating_sub(hot_vectors)
                 .saturating_sub(n * std::mem::size_of::<f32>()),
             upper_layer_links: nested,
             payload: self
@@ -1549,6 +1719,18 @@ impl HNSWIndex {
     /// L2 needs no norms, so `query_norm` is ignored there.
     #[inline]
     fn distance_to_node(&self, query: &[f32], node_id: usize, query_norm: f32) -> f32 {
+        // Under SQ8 the walk reads 8-bit codes straight out of the node's own block and
+        // never touches `full`. This is the whole point of the storage mode: the block
+        // shrinks from 784 bytes to 400, and the search is bound by exactly these reads.
+        if self.config.storage == Storage::SQ8 {
+            return crate::vector::simd::sq8_asymmetric_l2_simd(
+                query,
+                self.get_codes(node_id),
+                &self.q_min,
+                &self.q_scale,
+            );
+        }
+
         let embedding = self.get_embedding(node_id);
         match self.config.metric {
             DistanceMetric::Cosine => {
@@ -1561,6 +1743,12 @@ impl HNSWIndex {
             }
             DistanceMetric::L2 => crate::vector::simd::l2_squared_distance_simd(query, embedding),
         }
+    }
+
+    /// Exact squared-L2 against the full-precision vector, for the rerank stage.
+    #[inline]
+    fn exact_distance(&self, query: &[f32], node_id: usize) -> f32 {
+        crate::vector::simd::l2_squared_distance_simd(query, self.get_embedding(node_id))
     }
 
     /// Map a distance to a similarity score (higher is better), per metric.
@@ -1935,33 +2123,37 @@ impl HNSWIndex {
             connections.push(node_connections);
         }
 
-        // Lay the vectors and norms into the interleaved arena. Layer-0 links are still in
-        // `connections` at this point; `migrate_l0_into_arena` moves them to their owner.
-        let stride = node_stride(config.m0, embedding_dim);
-        let hdr = node_hdr_len(config.m0);
-        let mut arena = vec![0u32; n * stride];
-        for (i, p) in points.iter().enumerate() {
-            let base = i * stride;
-            arena[base + 1] = crate::vector::simd::norm_simd(p).to_bits();
-            arena[base + hdr..base + hdr + embedding_dim].copy_from_slice(bytemuck::cast_slice(p));
-        }
-
         // Create ID mapping (shuffled index → original index)
         let ids: Vec<String> = shuffled.iter().map(|&(_, orig)| orig.to_string()).collect();
 
+        // The GRAPH was built with exact f32 distances — `points` is right there, and an exact
+        // graph is strictly better than one built on lossy codes. Only the *traversal* storage
+        // is quantized, below. Layer-0 links still live in `connections`;
+        // `migrate_l0_into_arena` hands them to their owner.
         let mut index = Self {
             embedding_dim,
-            stride,
-            hdr,
+            stride: node_stride(config.m0, embedding_dim, config.storage),
+            hdr: node_hdr_len(config.m0),
             config,
-            nodes: arena,
+            nodes: Vec::new(),
             connections,
+            q_min: Vec::new(),
+            q_scale: Vec::new(),
+            full: Vec::new(),
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
             entry_point: Some(0),
             max_layer: top.0,
         };
+        index.fit_codebook(&points);
+        index.nodes.reserve(n * index.stride);
+        if index.config.storage == Storage::SQ8 && index.config.rerank_candidates > 0 {
+            index.full.reserve(n * embedding_dim);
+        }
+        for p in &points {
+            index.push_node(p);
+        }
         index.migrate_l0_into_arena();
         index.shrink_to_fit();
         index

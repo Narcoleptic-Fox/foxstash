@@ -139,8 +139,15 @@ struct PQNode {
 
 /// HNSW index with Product Quantization
 ///
-/// Achieves extreme compression (up to 192x) while maintaining good search quality.
-/// Uses Asymmetric Distance Computation (ADC) for accurate search with full-precision queries.
+/// Compresses each vector to one byte per subvector (a centroid index), so the
+/// compression ratio is fixed by configuration — see [`PQConfig::compression_ratio`].
+/// `search` uses Asymmetric Distance Computation (ADC): a full-precision query against
+/// PQ-compressed database vectors, via a per-subspace centroid distance table.
+///
+/// Unlike [`SQ8HNSWIndex`](super::hnsw_quantized::SQ8HNSWIndex) and
+/// [`RaBitQHNSWIndex`](super::hnsw_quantized::RaBitQHNSWIndex), this index has not been
+/// measured against real-data recall or throughput; see `benchmarks/RESULTS.md` for
+/// what has and has not been verified in this module before relying on a number.
 pub struct PQHNSWIndex {
     config: PQHNSWConfig,
     pq: ProductQuantizer,
@@ -978,6 +985,146 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "PQ search panicked when query contains NaN"
+        );
+    }
+
+    /// Clustered fixture (deterministic xorshift, not `rand`) for recall tests.
+    ///
+    /// Uniform-random vectors have no cluster structure and every ANN scores ~60% on
+    /// them regardless of correctness (see `benchmarks/RESULTS.md`), which is exactly
+    /// the kind of fixture that let a real bug hide behind a passing test elsewhere in
+    /// this project. This fixture has real cluster structure so a broken distance
+    /// metric or a broken traversal shows up as depressed recall, not noise.
+    fn clustered_vectors(count: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let clusters = 8;
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| (0..dim).map(|_| (next() % 1000) as f32 / 10.0).collect())
+            .collect();
+        (0..count)
+            .map(|i| {
+                let c = &centers[i % clusters];
+                c.iter()
+                    .map(|&x| {
+                        let noise = (next() % 41) as f32 - 20.0; // +/- 20
+                        x + noise
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn l2_dist_sq(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+    }
+
+    /// Coverage for `PQHNSWConfig::use_distance_cache = false`, which had zero test
+    /// coverage before this: every existing test (and the default config) leaves it
+    /// `true`, so the uncached branch of `distance_symmetric` — and by extension every
+    /// symmetric-distance call made during construction and `search_symmetric` — had
+    /// never been exercised. This asserts a retrieval outcome against real brute-force
+    /// ground truth, not just "doesn't panic", per this repo's history of options that
+    /// were only ever run at their default and shipped broken
+    /// (`BuildStrategy::Sequential`, `keep_pruned_connections`, `SQ8::search_symmetric`).
+    ///
+    /// Both indices share one trained `ProductQuantizer` (same codebooks), so
+    /// `use_distance_cache` is the only variable between them: `PQDistanceCache` merely
+    /// precomputes the same per-subspace centroid-to-centroid L2 distances that
+    /// `ProductQuantizer::symmetric_distance` computes directly, so a correct
+    /// implementation should place both indices at comparable recall on the same
+    /// fixture and queries.
+    #[test]
+    fn pq_use_distance_cache_false_retrieves_correctly_on_clustered_data() {
+        let dim = 32;
+        let pq_config = PQConfig::new(dim, 8, 6)
+            .with_seed(42)
+            .with_kmeans_iterations(15);
+
+        let all_vectors = clustered_vectors(180, dim, 0x51ED_2701);
+        let (queries, corpus) = all_vectors.split_at(20);
+
+        let pq = ProductQuantizer::train(corpus, pq_config).unwrap();
+
+        let cached_config = PQHNSWConfig::default();
+        assert!(
+            cached_config.use_distance_cache,
+            "test assumes the default is true; cached vs. uncached comparison depends on it"
+        );
+        let uncached_config = PQHNSWConfig {
+            use_distance_cache: false,
+            ..PQHNSWConfig::default()
+        };
+
+        let mut cached_index = PQHNSWIndex::from_quantizer(pq.clone(), cached_config);
+        let mut uncached_index = PQHNSWIndex::from_quantizer(pq, uncached_config);
+        assert!(uncached_index.distance_cache.is_none());
+        assert!(cached_index.distance_cache.is_some());
+
+        for (i, v) in corpus.iter().enumerate() {
+            let doc = create_test_document(&format!("doc{i}"), v.clone());
+            cached_index.add(doc.clone()).unwrap();
+            uncached_index.add(doc).unwrap();
+        }
+
+        let k = 5;
+        let mut cached_hits = 0usize;
+        let mut uncached_hits = 0usize;
+
+        for query in queries {
+            let mut brute_force: Vec<(usize, f32)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, l2_dist_sq(query, v)))
+                .collect();
+            brute_force.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let ground_truth: HashSet<String> = brute_force[..k]
+                .iter()
+                .map(|(i, _)| format!("doc{i}"))
+                .collect();
+
+            let cached: HashSet<String> = cached_index
+                .search_symmetric(query, k)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            let uncached: HashSet<String> = uncached_index
+                .search_symmetric(query, k)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+
+            cached_hits += ground_truth.intersection(&cached).count();
+            uncached_hits += ground_truth.intersection(&uncached).count();
+        }
+
+        let total_possible = queries.len() * k;
+        eprintln!(
+            "pq search_symmetric recall@{k} over {} held-out queries: \
+             cached={cached_hits}/{total_possible} uncached={uncached_hits}/{total_possible}",
+            queries.len()
+        );
+
+        // Both distance paths are the same math (see doc comment above), so neither
+        // should be at floor. A collapse in the uncached path specifically would mean
+        // `distance_symmetric`'s `false` branch (`self.pq.symmetric_distance`) is wrong
+        // relative to the cache it's supposed to be a cheaper equivalent of.
+        assert!(
+            uncached_hits * 2 >= total_possible,
+            "use_distance_cache=false recall collapsed: {uncached_hits}/{total_possible} \
+             (cached path scored {cached_hits}/{total_possible} on the same fixture/queries)"
+        );
+        assert!(
+            cached_hits * 2 >= total_possible,
+            "cached recall unexpectedly low on this fixture: {cached_hits}/{total_possible} \
+             — fixture may not isolate the use_distance_cache path as intended"
         );
     }
 }

@@ -6,7 +6,6 @@
 //! - [`HNSWIndex`]: Approximate nearest neighbors (fast, full precision)
 //! - [`SQ8HNSWIndex`]: HNSW with scalar quantization (4x memory reduction)
 //! - [`RaBitQHNSWIndex`]: HNSW with RaBitQ 1-bit quantization (32x memory reduction)
-//! - [`BinaryHNSWIndex`]: **deprecated** — degenerate on non-negative embeddings
 //!
 //! # Memory Comparison (1M vectors × 384 dims)
 //!
@@ -57,10 +56,9 @@ pub mod hnsw_quantized;
 pub mod streaming;
 
 pub use flat::FlatIndex;
-pub use hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown};
+pub use hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown, Storage};
 pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
-#[allow(deprecated)]
-pub use hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
+pub use hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
 pub use streaming::{
     BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult, FilteredSearchBuilder,
     PaginationConfig, SearchPage, SearchResultIterator,
@@ -176,16 +174,6 @@ mod tests {
 
         let results = index.search(&[0.5, -0.3, 0.8, 0.1], 1).unwrap();
         assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn vector_index_binary() {
-        let mut index: Box<dyn VectorIndex> =
-            Box::new(BinaryHNSWIndex::new(4, QuantizedHNSWConfig::default()));
-
-        index.add(make_doc("r", vec![0.1, 0.2, 0.3, 0.4])).unwrap();
-        assert_eq!(index.len(), 1);
-        assert_eq!(index.embedding_dim(), 4);
     }
 
     #[test]

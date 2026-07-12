@@ -3,7 +3,7 @@
 //! These tests exercise full end-to-end pipelines across foxstash-core subsystems:
 //! - Document lifecycle (create, add, search, verify metadata)
 //! - Index persistence and recovery via FileStorage
-//! - Quantized index accuracy comparison (HNSW, SQ8, Binary, PQ)
+//! - Quantized index accuracy comparison (HNSW, SQ8, PQ)
 //! - Incremental persistence (WAL logging, checkpoint, recovery)
 //! - Compression round-trip for all available codecs
 //! - Batch operations and streaming search
@@ -11,8 +11,8 @@
 //! - Concurrent parallel search
 
 use foxstash_core::index::{
-    BatchBuilder, BatchConfig, BinaryHNSWIndex, FilteredSearchBuilder, FlatIndex, HNSWIndex,
-    PQHNSWConfig, PQHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex, SearchPage, SearchResultIterator,
+    BatchBuilder, BatchConfig, FilteredSearchBuilder, FlatIndex, HNSWIndex, PQHNSWConfig,
+    PQHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex, SearchPage, SearchResultIterator,
 };
 use foxstash_core::storage::compression::{self, Codec};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
@@ -415,34 +415,17 @@ mod quantized_accuracy {
             sq8.add(doc.clone()).unwrap();
         }
 
-        // Binary
-        let mut binary = BinaryHNSWIndex::new(dim, QuantizedHNSWConfig::default());
-        for doc in &documents {
-            binary.add(doc.clone()).unwrap();
-        }
-
         let query = deterministic_embedding(dim, 9999);
 
         let hnsw_results = hnsw.search(&query, k).unwrap();
         let sq8_results = sq8.search(&query, k).unwrap();
-        let binary_results = binary.search(&query, k).unwrap();
 
         // All should return k results
         assert_eq!(hnsw_results.len(), k, "HNSW should return {} results", k);
         assert_eq!(sq8_results.len(), k, "SQ8 should return {} results", k);
-        assert_eq!(
-            binary_results.len(),
-            k,
-            "Binary should return {} results",
-            k
-        );
 
         // All results should be sorted by score descending
-        for (name, results) in [
-            ("HNSW", &hnsw_results),
-            ("SQ8", &sq8_results),
-            ("Binary", &binary_results),
-        ] {
+        for (name, results) in [("HNSW", &hnsw_results), ("SQ8", &sq8_results)] {
             for window in results.windows(2) {
                 assert!(
                     window[0].score >= window[1].score,
@@ -484,38 +467,6 @@ mod quantized_accuracy {
         // Results should be sorted by score descending
         for window in results.windows(2) {
             assert!(window[0].score >= window[1].score, "PQ results not sorted");
-        }
-    }
-
-    #[test]
-    fn binary_rerank_improves_over_binary_only() {
-        let dim = 64;
-        let n = 80;
-        let k = 10;
-
-        let documents: Vec<Document> = (0..n)
-            .map(|i| make_doc(&format!("doc_{}", i), dim, i))
-            .collect();
-
-        let mut binary = BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
-        for doc in &documents {
-            binary.add_with_full_precision(doc.clone()).unwrap();
-        }
-
-        let query = deterministic_embedding(dim, 9999);
-
-        // Binary-only search
-        let binary_results = binary.search(&query, k).unwrap();
-
-        // Binary + full-precision rerank
-        let rerank_results = binary.search_and_rerank(&query, 50, k).unwrap();
-
-        assert_eq!(binary_results.len(), k);
-        assert_eq!(rerank_results.len(), k);
-
-        // Both should return sorted results
-        for window in rerank_results.windows(2) {
-            assert!(window[0].score >= window[1].score);
         }
     }
 }
@@ -1202,14 +1153,6 @@ mod edge_cases {
     #[test]
     fn sq8_empty_search() {
         let index = SQ8HNSWIndex::for_normalized(16, QuantizedHNSWConfig::default());
-        let query = vec![0.5; 16];
-        let results = index.search(&query, 10).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn binary_empty_search() {
-        let index = BinaryHNSWIndex::new(16, QuantizedHNSWConfig::default());
         let query = vec![0.5; 16];
         let results = index.search(&query, 10).unwrap();
         assert!(results.is_empty());
