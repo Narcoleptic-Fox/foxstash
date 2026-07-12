@@ -868,6 +868,172 @@ fn sq8_asymmetric_l2_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[f
     acc
 }
 
+/// Asymmetric RaBitQ estimate of squared L2 between a prepared query and a node's 1-bit code.
+///
+/// "Asymmetric" in the same sense as [`sq8_asymmetric_l2_simd`]: the query stays `f32`
+/// (already rotated into RaBitQ space by the caller — see
+/// [`crate::vector::rabitq::RaBitQuantizer::prepare_query`]) and only the *database* side is
+/// compressed, to 1 bit/dim.
+///
+/// This is the folded estimator from `crate::vector::rabitq` (Gao & Long, RaBitQ, SIGMOD
+/// 2024), not Hamming distance: `S = Σ (2·bit − 1) · rq[i]`, then
+/// `‖o − q‖² ≈ dtc_sq + qn_sq − 2 · est_factor · S`. `dtc_sq` (the vector's squared distance
+/// to the corpus centroid) and `est_factor` (`dtc_sq / L1` of its rotated residual) are
+/// per-vector scalars computed once at index-build time by
+/// [`RaBitQuantizer::encode`](crate::vector::rabitq::RaBitQuantizer::encode); `rq` and
+/// `qn_sq` are computed once per *query*, not per candidate — recomputing the rotation
+/// (an O(dim²) matvec) on every node visit would turn an O(dim) distance into the very
+/// cost this storage mode exists to avoid.
+///
+/// `bits` is packed 1 bit/dim, `bits[i/8]` bit `i%8`, matching
+/// [`RaBitCode::bits`](crate::vector::rabitq::RaBitCode::bits)'s convention exactly — this
+/// kernel does not call into `rabitq.rs` itself, so any packing mismatch here would silently
+/// disagree with the derivation it claims to implement.
+#[inline]
+pub fn rabitq_asymmetric_l2_simd(
+    rq: &[f32],
+    bits: &[u8],
+    dtc_sq: f32,
+    est_factor: f32,
+    qn_sq: f32,
+) -> f32 {
+    debug_assert_eq!(bits.len(), rq.len().div_ceil(8));
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection; the loop never reads past
+            // `rq.len() - rq.len() % 8`, and `bits` has at least `rq.len().div_ceil(8)`
+            // bytes (checked above), which covers every byte index the loop computes.
+            let s = unsafe { rabitq_signed_sum_avx2(rq, bits) };
+            return (dtc_sq + qn_sq - 2.0 * est_factor * s).max(0.0);
+        }
+    }
+    let s = rabitq_signed_sum_scalar(rq, bits);
+    (dtc_sq + qn_sq - 2.0 * est_factor * s).max(0.0)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn rabitq_signed_sum_avx2(rq: &[f32], bits: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = rq.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+
+    // Bit weights in lane order: lane 0 <-> bit 0 (value 1) .. lane 7 <-> bit 7 (value 128),
+    // matching `bits[i/8] & (1 << (i % 8))`.
+    let bit_masks = _mm256_set_epi32(128, 64, 32, 16, 8, 4, 2, 1);
+    let zero = _mm256_setzero_si256();
+    let ones = _mm256_set1_ps(1.0);
+    let neg_ones = _mm256_set1_ps(-1.0);
+
+    while i + 8 <= n {
+        // One input byte covers exactly 8 dims — the same width as an AVX2 f32 lane.
+        let byte = bits[i / 8] as i32;
+        let byte_bcast = _mm256_set1_epi32(byte);
+        let anded = _mm256_and_si256(byte_bcast, bit_masks);
+        let is_set = _mm256_cmpgt_epi32(anded, zero);
+        let signs = _mm256_blendv_ps(neg_ones, ones, _mm256_castsi256_ps(is_set));
+
+        let rq_vec = _mm256_loadu_ps(rq.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(rq_vec, signs, acc);
+
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let bit = (bits[j / 8] >> (j % 8)) & 1;
+        total += if bit == 1 { rq[j] } else { -rq[j] };
+    }
+    total
+}
+
+fn rabitq_signed_sum_scalar(rq: &[f32], bits: &[u8]) -> f32 {
+    let mut s = 0.0f32;
+    for (i, &rqi) in rq.iter().enumerate() {
+        let bit = (bits[i / 8] >> (i % 8)) & 1;
+        s += if bit == 1 { rqi } else { -rqi };
+    }
+    s
+}
+
+#[cfg(test)]
+mod rabitq_asymmetric_tests {
+    use super::*;
+
+    /// The AVX2 path and the scalar path must agree. A dim that is NOT a multiple of the
+    /// 8-lane width exercises the tail loop, and NOT a multiple of 8 bits also forces a
+    /// partial final byte in `bits`.
+    #[test]
+    fn avx2_matches_scalar() {
+        let dim: usize = 131; // not a multiple of 8: exercises both the SIMD tail and a partial byte
+        let rq: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.29).cos() * 7.0).collect();
+        let n_bytes = dim.div_ceil(8);
+        let bits: Vec<u8> = (0..n_bytes).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let dtc_sq = 4.5f32;
+        let est_factor = 0.83f32;
+        let qn_sq = 6.1f32;
+
+        let dispatched = rabitq_asymmetric_l2_simd(&rq, &bits, dtc_sq, est_factor, qn_sq);
+
+        let s = rabitq_signed_sum_scalar(&rq, &bits);
+        let scalar = (dtc_sq + qn_sq - 2.0 * est_factor * s).max(0.0);
+
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "AVX2 kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
+        );
+    }
+
+    /// Cross-check against `crate::vector::rabitq`'s own (allocating, reference)
+    /// `estimate_dist_sq` — the kernel above reimplements that math without going through
+    /// `RaBitCode`/`PreparedQuery`, so this is the check that the reimplementation didn't
+    /// silently drift from the derivation it claims to match.
+    #[test]
+    fn matches_rabitq_module_reference_estimator() {
+        use crate::vector::rabitq::RaBitQuantizer;
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(21);
+        let dim = 97; // also not a multiple of 8
+        let train: Vec<Vec<f32>> = (0..300)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let q = RaBitQuantizer::fit(&train);
+
+        let o: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+        let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        let code = q.encode(&o);
+        let prepared = q.prepare_query(&query);
+        let reference = q.estimate_dist_sq(&prepared, &code);
+
+        let kernel = rabitq_asymmetric_l2_simd(
+            prepared.rq(),
+            &code.bits,
+            code.dtc_sq,
+            code.est_factor,
+            prepared.qn_sq(),
+        );
+
+        let rel = (kernel - reference).abs() / reference.abs().max(1e-6);
+        assert!(
+            rel < 1e-4,
+            "kernel disagrees with rabitq.rs reference estimator: {kernel} vs {reference} (rel {rel:.2e})"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sq8_asymmetric_tests {
     use super::*;

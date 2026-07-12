@@ -72,6 +72,23 @@ pub struct PreparedQuery {
     qn_sq: f32,
 }
 
+impl PreparedQuery {
+    /// `R·(q − c)` — the rotated query residual, borrowed.
+    ///
+    /// Exposed for callers that fold the estimator into their own SIMD kernel rather than
+    /// going through [`RaBitQuantizer::estimate_dist_sq`] — that method takes `&RaBitCode`,
+    /// which owns a `Vec<u8>`, so building one per candidate to call it would allocate on
+    /// every distance computation in a hot graph-traversal loop.
+    pub fn rq(&self) -> &[f32] {
+        &self.rq
+    }
+
+    /// `‖q − c‖²`.
+    pub fn qn_sq(&self) -> f32 {
+        self.qn_sq
+    }
+}
+
 impl RaBitQuantizer {
     /// Fit a quantizer from training vectors using the default rotation seed.
     ///

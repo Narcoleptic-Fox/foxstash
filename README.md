@@ -310,8 +310,6 @@ store.flush_all()?;
 | `search_batch(queries, k, filter)` | Parallel vector search for multiple queries via rayon |
 | `search_text(query, k, filter)` | BM25 keyword search with optional metadata filter |
 | `search_hybrid(query, text, k, filter, config)` | Hybrid vector + BM25 search |
-| `create_search_context()` | Allocate a reusable `SearchContext` for tight query loops |
-| `search_with_context(query, k, ctx)` | Vector search reusing a caller-managed context |
 | `flush()` | Flush WAL to disk |
 | `compact()` | Remove tombstoned entries and rebuild index |
 

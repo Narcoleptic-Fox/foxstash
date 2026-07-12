@@ -1,27 +1,39 @@
 //! Vector index implementations
 //!
-//! This module provides multiple index types for vector similarity search:
+//! - [`HNSWIndex`]: approximate nearest neighbours. **The one you want.** Quantization is a
+//!   [`Storage`] mode on this index, not a separate type — see below.
+//! - [`FlatIndex`]: brute force. Exact, O(n) per query. Use it as a control, and for tiny
+//!   corpora where an approximate index cannot pay for itself.
+//! - [`RaBitQHNSWIndex`]: 1-bit quantization, 32x compression. Still a separate type; being
+//!   folded into [`Storage`].
 //!
-//! - [`FlatIndex`]: Brute-force search (100% accurate, O(n) search)
-//! - [`HNSWIndex`]: Approximate nearest neighbors (fast, full precision)
-//! - [`SQ8HNSWIndex`]: HNSW with scalar quantization (4x memory reduction)
-//! - [`RaBitQHNSWIndex`]: HNSW with RaBitQ 1-bit quantization (32x memory reduction)
+//! # Quantization is a storage mode, not an index type
 //!
-//! # Memory Comparison (1M vectors × 384 dims)
+//! ```
+//! # use foxstash_core::index::{HNSWConfig, HNSWIndex, Storage, DistanceMetric};
+//! let config = HNSWConfig {
+//!     storage: Storage::SQ8,      // 8-bit codes inline in the node arena
+//!     rerank_candidates: 100,     // rescore the top pool with exact f32 distances
+//!     metric: DistanceMetric::L2,
+//!     ..Default::default()
+//! };
+//! ```
 //!
-//! | Index | Memory | Recall@10* | Use Case |
-//! |-------|--------|------------|----------|
-//! | HNSW (f32) | 1.5 GB | 100% | Default choice |
-//! | SQ8 HNSW | 384 MB | 100.0% | Memory constrained |
-//! | RaBitQ HNSW | 48 MB | 73.2% | Massive datasets |
+//! The graph is still *built* with exact f32 distances; only the traversal reads compressed
+//! codes. That combination is what makes it fast **and** accurate: on SIFT1M it is 1.20x
+//! hnswlib at 99.5% recall@10, because the hot node block shrinks 784 → 400 bytes and HNSW
+//! search is memory-latency bound. `rerank_candidates: 0` drops the f32 vectors entirely
+//! (0.73x hnswlib's memory) at a recall ceiling near 98.9%.
 //!
-//! *Measured on SIFT10K with a two-phase search (1-bit filter, pool=100, exact rerank):
-//! `cargo run --release -p foxstash-benches --example quantizer_sift`.
+//! A standalone `SQ8HNSWIndex` used to exist. It was deleted: the storage mode beat it on
+//! recall, throughput *and* build time at every `ef` (see `benchmarks/RESULTS.md`), and it was
+//! a metric footgun — hardcoded L2 with no `metric` field, while [`HNSWConfig`] defaults to
+//! cosine, so swapping index types silently changed the question being asked.
 //!
-//! A plain zero-threshold binary quantizer is not offered: on non-negative data (SIFT,
-//! and most embedding models) every bit is set and the code carries no information — it
-//! measured 1.2% recall@10. RaBitQ centers each vector before thresholding, which is the
-//! whole difference. See `crate::vector::quantize` for the comparison.
+//! A plain zero-threshold binary quantizer is not offered: on non-negative data (SIFT, and
+//! most embedding models) every bit is set and the code carries no information — it measured
+//! 1.2% recall@10. RaBitQ centers each vector before thresholding, which is the whole
+//! difference. See `crate::vector::quantize` for the comparison.
 //!
 //! # Streaming Operations
 //!
@@ -63,7 +75,7 @@ pub use hnsw::{
     BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown, Searcher, Storage,
 };
 pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
-pub use hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
+pub use hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex};
 pub use streaming::{
     BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult, FilteredSearchBuilder,
     PaginationConfig, SearchPage, SearchResultIterator,
@@ -167,18 +179,65 @@ mod tests {
     }
 
     #[test]
-    fn vector_index_sq8() {
-        let mut index: Box<dyn VectorIndex> = Box::new(SQ8HNSWIndex::for_normalized(
+    fn vector_index_sq8_storage_is_object_safe() {
+        // SQ8 is a storage mode now, not an index type — but it must still work through
+        // `Box<dyn VectorIndex>`, which is what this asserts. (The standalone `SQ8HNSWIndex`
+        // this test used to construct was deleted: the storage mode beat it on recall,
+        // throughput and build time at every ef.)
+        //
+        // Quantized storage must be trained before it can encode anything — SQ8 needs the
+        // corpus's per-dimension min/scale. `train()` is therefore part of the object-safe
+        // path, and this test exists partly to keep it that way.
+        let mut sq8 = HNSWIndex::new(
             4,
-            QuantizedHNSWConfig::default(),
-        ));
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+        let sample = vec![
+            vec![0.5, -0.3, 0.8, 0.1],
+            vec![-0.2, 0.9, -0.5, 0.4],
+            vec![0.1, 0.1, 0.2, -0.9],
+        ];
+        sq8.train(&sample).unwrap();
 
+        let mut index: Box<dyn VectorIndex> = Box::new(sq8);
         index.add(make_doc("q", vec![0.5, -0.3, 0.8, 0.1])).unwrap();
         assert_eq!(index.len(), 1);
         assert_eq!(index.embedding_dim(), 4);
 
         let results = index.search(&[0.5, -0.3, 0.8, 0.1], 1).unwrap();
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "q");
+    }
+
+    #[test]
+    fn quantized_storage_rejects_add_before_train_instead_of_panicking() {
+        // This used to be an index-out-of-bounds panic on the very first document: the SQ8
+        // codebook was only ever fitted inside `build`/`build_parallel`, so `new()` + `add()`
+        // indexed into an empty `q_scale`. It was public, documented, reachable from
+        // foxstash-db (every insert on an SQ8 collection crashed) — and every SQ8 test went
+        // through `build_parallel`, so nothing could fail on it.
+        let mut index: Box<dyn VectorIndex> = Box::new(HNSWIndex::new(
+            4,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        ));
+
+        let err = index
+            .add(make_doc("q", vec![0.5, -0.3, 0.8, 0.1]))
+            .expect_err("untrained SQ8 must reject add(), not panic");
+
+        assert!(
+            matches!(err, crate::RagError::NotTrained(_)),
+            "expected NotTrained, got {err:?}"
+        );
     }
 
     #[test]

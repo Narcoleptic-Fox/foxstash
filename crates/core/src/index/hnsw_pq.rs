@@ -150,7 +150,8 @@ struct PQNode {
 /// `search` uses Asymmetric Distance Computation (ADC): a full-precision query against
 /// PQ-compressed database vectors, via a per-subspace centroid distance table.
 ///
-/// Unlike [`SQ8HNSWIndex`](super::hnsw_quantized::SQ8HNSWIndex) and
+/// Unlike the main [`HNSWIndex`](super::hnsw::HNSWIndex) with
+/// [`Storage::SQ8`](super::hnsw::Storage::SQ8) and
 /// [`RaBitQHNSWIndex`](super::hnsw_quantized::RaBitQHNSWIndex), this index has not been
 /// measured against real-data recall or throughput; see `benchmarks/RESULTS.md` for
 /// what has and has not been verified in this module before relying on a number.

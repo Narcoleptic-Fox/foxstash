@@ -14,7 +14,7 @@
 
 use foxstash_benches::sift::{l2_sq, Dataset};
 use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex};
-use foxstash_core::index::hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
+use foxstash_core::index::hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex};
 use foxstash_core::Document;
 use serde_json::json;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -236,29 +236,6 @@ fn main() {
              not an index defect).",
         ));
     }
-
-    // ---- SQ8 HNSW (4x) ----
-    eprintln!("[4/5] sq8-hnsw");
-    let t = Instant::now();
-    let mut sq8 = SQ8HNSWIndex::fit(&ds.base, QuantizedHNSWConfig::default());
-    for (i, v) in ds.base.iter().enumerate() {
-        sq8.add(doc(i, v)).unwrap();
-    }
-    let sq8_build = t.elapsed().as_secs_f64();
-    let sq8_r10 = ds.recall_at(10, |q| ids(sq8.search(q, 10).unwrap()));
-    let sq8_r100 = ds.recall_at(100, |q| ids(sq8.search(q, 100).unwrap()));
-    let sq8_qps = measure_qps(&ds, 10, |q| ids(sq8.search(q, 10).unwrap()));
-    out.push(record(
-        "sq8-hnsw",
-        &ds,
-        sq8_build,
-        sq8.memory_usage() as f64 / 1e6,
-        sq8_r10,
-        sq8_r100,
-        sq8_qps,
-        json!({ "compression": "4x" }),
-        "Scalar int8 quantization, asymmetric distance",
-    ));
 
     // ---- RaBitQ HNSW (32x), two-phase ----
     eprintln!("[5/5] rabitq-hnsw");

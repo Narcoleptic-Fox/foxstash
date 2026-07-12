@@ -11,8 +11,8 @@
 //! - Concurrent parallel search
 
 use foxstash_core::index::{
-    BatchBuilder, BatchConfig, FilteredSearchBuilder, FlatIndex, HNSWIndex, PQHNSWConfig,
-    PQHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex, SearchPage, SearchResultIterator,
+    BatchBuilder, BatchConfig, DistanceMetric, FilteredSearchBuilder, FlatIndex, HNSWConfig,
+    HNSWIndex, PQHNSWConfig, PQHNSWIndex, SearchPage, SearchResultIterator, Storage,
 };
 use foxstash_core::storage::compression::{self, Codec};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
@@ -409,8 +409,22 @@ mod quantized_accuracy {
             hnsw.add(doc.clone()).unwrap();
         }
 
-        // SQ8
-        let mut sq8 = SQ8HNSWIndex::for_normalized(dim, QuantizedHNSWConfig::default());
+        // SQ8 (as a storage mode on the main index, not a standalone type -
+        // see foxstash_core::index module docs)
+        let mut sq8 = HNSWIndex::new(
+            dim,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+        // Quantized storages need a fitted codebook before the first `add()` — see
+        // `HNSWIndex::train`. `build()`/`build_parallel()` do this internally from the full
+        // corpus; incremental construction via `add()` must do it explicitly.
+        let sample: Vec<Vec<f32>> = documents.iter().map(|d| d.embedding.clone()).collect();
+        sq8.train(&sample).unwrap();
         for doc in &documents {
             sq8.add(doc.clone()).unwrap();
         }
@@ -1152,7 +1166,15 @@ mod edge_cases {
 
     #[test]
     fn sq8_empty_search() {
-        let index = SQ8HNSWIndex::for_normalized(16, QuantizedHNSWConfig::default());
+        let index = HNSWIndex::new(
+            16,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
         let query = vec![0.5; 16];
         let results = index.search(&query, 10).unwrap();
         assert!(results.is_empty());

@@ -42,6 +42,8 @@ pub struct Collection {
 impl Collection {
     /// Open or create a collection at the given path.
     pub fn open(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
+        Self::reject_incremental_quantized_storage(&config)?;
+
         let storage =
             IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
@@ -74,6 +76,8 @@ impl Collection {
     /// Returns an error if the path already contains checkpoint or WAL data.
     /// Use [`open`](Self::open) to recover an existing collection.
     pub fn create(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
+        Self::reject_incremental_quantized_storage(&config)?;
+
         // Guard: refuse to create over existing data.
         if path.join("manifest.json").exists() {
             return Err(DbError::Validation(format!(
@@ -500,6 +504,34 @@ impl Collection {
 
     // ── private helpers ─────────────────────────────────────────────
 
+    /// Reject configs whose HNSW storage needs a codebook that `Collection` cannot supply.
+    ///
+    /// `Storage::SQ8` and `Storage::RaBitQ` both require a codebook fitted on a corpus
+    /// sample before the first vector is encoded — `HNSWIndex::build`/`build_parallel` fit
+    /// it up front from the whole corpus; `HNSWIndex::new` (what `Collection` uses, since it
+    /// ingests one document at a time via `insert`) leaves it empty. Encoding the first
+    /// vector against an empty codebook panics (`hnsw.rs`: `q_scale[d]` / `q_min[d]` index
+    /// out of bounds for SQ8, or an explicit `.expect()` for RaBitQ) — this turns that panic
+    /// into a constructor-time `Err` instead.
+    ///
+    /// Called from both `create` and `open`, before either touches the filesystem, so a bad
+    /// config fails immediately with no partial state left behind. `config.hnsw` is never
+    /// mutated after construction (it isn't exposed), so a `Collection` that passes this
+    /// check can never end up with quantized storage later — including in `compact()`, which
+    /// rebuilds the index via this same `HNSWIndex::new` path.
+    ///
+    /// TODO: once `HNSWIndex::train(&mut self, sample)` lands (fits a codebook from a
+    /// calibration sample instead of requiring the full corpus up front), `Collection` can
+    /// train from an initial batch and this restriction can be lifted for that case.
+    fn reject_incremental_quantized_storage(config: &DbConfig) -> Result<()> {
+        if config.hnsw.storage != foxstash_core::index::Storage::F32 {
+            return Err(DbError::UnsupportedIncrementalStorage {
+                storage: config.hnsw.storage,
+            });
+        }
+        Ok(())
+    }
+
     #[inline]
     fn unfiltered_fetch_count(&self, inner: &CollectionInner, k: usize) -> usize {
         k.saturating_add(inner.id_map.tombstone_count())
@@ -712,6 +744,58 @@ mod tests {
         col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0, 0.0], None)
             .unwrap();
         assert_eq!(col.len(), 1);
+    }
+
+    // Reproduces https://github.com/foxstash/foxstash (internal): a Collection configured
+    // with Storage::SQ8 used to panic on its first insert (HNSWIndex::new leaves the SQ8
+    // codebook untrained; push_node indexes into it unconditionally). Confirmed via
+    // `cargo test -p foxstash-db repro_sq8_storage_panics_on_insert -- --nocapture` before
+    // the guard existed:
+    //   thread '...' panicked at crates/core/src/index/hnsw.rs:978:41:
+    //   index out of bounds: the len is 0 but the index is 0
+    // `Collection::create`/`open` now reject non-F32 storage up front, so this asserts the
+    // clean `Err` instead.
+    #[test]
+    fn sq8_storage_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hnsw.storage = foxstash_core::index::Storage::SQ8;
+
+        match Collection::create("test", dir.path(), config) {
+            Err(DbError::UnsupportedIncrementalStorage {
+                storage: foxstash_core::index::Storage::SQ8,
+            }) => {}
+            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
+        }
+    }
+
+    #[test]
+    fn rabitq_storage_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hnsw.storage = foxstash_core::index::Storage::RaBitQ;
+
+        match Collection::create("test", dir.path(), config) {
+            Err(DbError::UnsupportedIncrementalStorage {
+                storage: foxstash_core::index::Storage::RaBitQ,
+            }) => {}
+            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
+        }
+    }
+
+    #[test]
+    fn sq8_storage_rejected_at_open() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hnsw.storage = foxstash_core::index::Storage::SQ8;
+
+        match Collection::open("test", dir.path(), config) {
+            Err(DbError::UnsupportedIncrementalStorage { .. }) => {}
+            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
+        }
     }
 
     #[test]

@@ -46,6 +46,9 @@ pub enum RagError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Index not trained: {0}")]
+    NotTrained(String),
 }
 
 /// Document with embedding

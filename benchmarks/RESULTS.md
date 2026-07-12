@@ -178,6 +178,33 @@ Foxstash builds **2.1x faster than hnswlib**. Its index is ~21% larger: 512 MB v
 378 MB of links and block headers, where the nested upper-layer `Vec`s cost a 24-byte header
 per node and the arena block carries padding to keep the vector 16-byte aligned.
 
+## Why `SQ8HNSWIndex` was deleted
+
+Two independent SQ8 implementations existed: `Storage::SQ8` on the main `HNSWIndex` (codes
+inline in the interleaved node arena, graph built with exact f32 distances, parallel build)
+and a standalone `SQ8HNSWIndex` (its own config, fat `Vec<HashSet<usize>>` adjacency,
+sequential build). SIFT100K, M=32, ef_c=200, rerank pool 100, serialized on an idle machine:
+
+| ef | index | recall@10 | QPS | build |
+|----|-------|-----------|-----|-------|
+| 50 | `HNSWIndex` + `Storage::SQ8` | **99.43%** | **12,128** | **7.2 s** |
+| 50 | `SQ8HNSWIndex` | 93.74% | 3,919 | 68.8 s |
+| 100 | `HNSWIndex` + `Storage::SQ8` | **99.88%** | **7,238** | **7.2 s** |
+| 100 | `SQ8HNSWIndex` | 95.80% | 2,453 | 67.1 s |
+| 200 | `HNSWIndex` + `Storage::SQ8` | **99.98%** | **4,440** | **7.2 s** |
+| 200 | `SQ8HNSWIndex` | 97.75% | 1,373 | 69.1 s |
+
+Dominated on every axis, and not narrowly: `SQ8HNSWIndex` at ef=200 (97.75%) never reaches
+what the arena does at ef=50 (99.43%) with 2.7x the throughput. It built 9.6x slower because
+it built sequentially.
+
+It was also a **metric footgun**: `QuantizedHNSWConfig` has no `metric` field and is hardcoded
+L2, while `HNSWConfig::metric` defaults to Cosine. Swapping index types to save memory
+silently changed the question being asked — recall would collapse and nothing would error.
+
+The bar for deletion was that the survivor win on recall *and* throughput *and* build time.
+It did.
+
 ## Quantized indexes — the metric was broken
 
 `ScalarQuantizer::distance_quantized` computed L2 directly on the raw 0-255 codes. But
@@ -205,20 +232,23 @@ whether or not it is scale-correct. A "symmetric" quantized index that passes a 
 test has proven nothing. Only held-out queries scored against real brute-force ground truth
 expose it.
 
-## Compressed traversal: thesis unproven, not disproven
+## Compressed traversal: thesis proven — but the first attempt hid it
+
+This section is kept because the wrong conclusion was very nearly drawn, twice.
 
 The reason to quantize is bandwidth. Search is memory-latency bound — 77–98 ns per distance
-computation, about one DRAM round-trip — so moving a quarter of the bytes per node visit
-ought to buy throughput. It does not. SIFT100K, matched ~99.4% recall:
+computation, about one DRAM round-trip — so moving a quarter of the bytes per node visit ought
+to buy throughput. The first measurement said it did the opposite. SIFT100K, matched ~99.4%
+recall:
 
 | | QPS | build | memory |
 |---|---|---|---|
 | full-precision HNSW | **8,867** | 7 s | 95 MB |
-| SQ8 + exact rerank | 1,541 | 135 s | 74 MB |
+| `SQ8HNSWIndex` + exact rerank | 1,541 | 135 s | 74 MB |
 
-SQ8 is **5.8x slower while touching a quarter of the vector bytes.** That is not a bandwidth
-result; it is a data-structure result. `SQ8HNSWIndex` is a wholly separate implementation that
-never touches the interleaved node arena:
+**5.8x slower while touching a quarter of the vector bytes.** Read naively, that kills the
+idea. It was not a bandwidth result; it was a data-structure result. `SQ8HNSWIndex` was a
+wholly separate implementation that never touched the interleaved node arena:
 
 ```rust
 struct SQ8Node {
@@ -230,45 +260,153 @@ struct SQ8Node {
 }
 ```
 
-Every node visit pointer-chases through a fat struct into a heap-allocated code vector and
-iterates neighbours through a **hash set** of 8-byte ids. The compression win is real and
-entirely swamped by the container carrying it. It also builds sequentially (135 s vs 7 s).
+Every node visit pointer-chased through a fat struct into a heap-allocated code vector and
+iterated neighbours through a **hash set** of 8-byte ids. The compression win was real and
+entirely swamped by the container carrying it. **The vehicle could not hold the experiment.**
 
-So compressed traversal is **untested**: the vehicle cannot hold the experiment. Testing it
-means making SQ8 a *storage mode of the main index* — sharing the arena, the u32 adjacency
-and the parallel builder — instead of a parallel codebase. The API unification is therefore on
-the critical path for performance, not merely for tidiness.
+Rebuilding SQ8 as a *storage mode* of the main index — sharing the arena, the packed u32
+adjacency and the parallel builder — is what actually tested the thesis. It holds: `Storage::SQ8`
+is **1.20x hnswlib at 99.5% recall on SIFT1M**, and the mechanism is exactly the predicted one
+(node block 784 → 400 bytes, ns/dist 87.1 → 67.3, distance count unchanged at ~3,491).
+
+**Then it nearly died a second time.** The first arena kernel was a scalar u8→f32 widening
+loop: **132 ns/dist, slower than the 87 ns f32 baseline it replaced.** The widening cost more
+than the bandwidth saved. That reads, again, as "compressed traversal doesn't work". It was the
+kernel. An AVX2 path (`_mm256_cvtepu8_epi32` → `cvtepi32_ps` → `fmadd`) took it to 67 ns.
+
+Two separate implementation defects, each of which produced a *plausible, coherent* negative
+result about the underlying idea. Neither was about the idea.
 
 ## What foxstash is genuinely better at
 
+- **Throughput at matched recall.** 1.11–1.33x hnswlib and 1.19–1.34x faiss on SIFT1M with
+  `Storage::SQ8`, widening as recall rises (see the top of this file).
 - **Recall per `ef`.** At every scale it needs a lower `ef` than hnswlib or faiss to reach a
-  given recall — the Algorithm-4 diversity heuristic builds a measurably better graph. This is
-  a real asset and the reason the matched-recall gap (0.78x) is *smaller* than the raw
-  fixed-`ef` gap.
+  given recall — the Algorithm-4 diversity heuristic builds a measurably better graph.
 - **Build throughput**, 2.1x hnswlib.
 
 ## Known issues
 
-1. **Still ~10% behind hnswlib at 1M**, cause not yet established. Layout and bounds checks are
-   both ruled out (above). Next step is to measure distance computations per query at matched
-   recall — that separates *doing more work* (a worse graph, or a search that stops too late)
-   from *doing the same work more slowly* (a worse inner loop, or worse latency hiding). Those
-   have completely different fixes and QPS alone cannot tell them apart.
-2. **Quantized indexes are unfinished.** `SQ8HNSWIndex` has **no rerank path at all**, which is
-   why it sits at 71.4% recall; `RaBitQHNSWIndex` has one but defaults to `ef_search: 50` where
-   `HNSWConfig` uses 100. Compressed traversal with exact rerank is the standard way to beat a
-   memory-bandwidth wall — it moves *fewer bytes* per node visit rather than moving the same
-   bytes better — and it is half-built here.
-3. **Metric inconsistency (a correctness footgun).** `HNSWIndex` defaults to cosine;
-   `SQ8HNSWIndex` and `RaBitQHNSWIndex` are L2-only. Swapping index type to save memory
-   silently changes your distance function, and nothing warns you.
-4. **Index memory is ~21% above hnswlib.**
-5. **`SQ8HNSWIndex::search_symmetric` has zero test coverage** — public, documented, a distinct
-   code path. Its sibling `PQHNSWIndex::search_symmetric` is tested. This is the same shape as
-   `BuildStrategy::Sequential`, which was public, documented, recommended, and panicked on every
-   input for an entire release while 247 tests passed.
-6. **PQ has never been measured on real data**, yet `hnsw_pq.rs` advertises "good search
-   quality" at up to 192x compression.
+1. **Memory: 1,076 MB against hnswlib's 776 MB** at the fastest setting. Rerank needs the
+   full-precision vectors, so the fastest configuration is also the largest. Setting
+   `rerank_candidates: 0` drops the f32 array entirely — 564 MB, **0.73x hnswlib** — but recall
+   then ceilings around 98.9%. Speed crown or memory crown; not both, yet.
+2. **Metric inconsistency (a correctness footgun), partially closed.** `HNSWIndex` defaults to
+   cosine, but `RaBitQHNSWIndex` and `PQHNSWIndex` have **no `metric` field at all** — they are
+   hardcoded L2. Swapping index type to save memory silently changes your distance function and
+   nothing warns you. `SQ8HNSWIndex` was the worst offender and is now deleted (above); the fix
+   for the remaining two is the same — make them storage modes of the one index, which honours
+   `HNSWConfig::metric`, rather than parallel index types.
+3. **PQ has never been measured on real data**, and `PQHNSWIndex` carries the same fat-node
+   pathology (`Vec<HashSet<usize>>` adjacency, sequential build) that made `SQ8HNSWIndex` 5.8x
+   slower than the arena. Its distance math is sound — verified, no unit-mismatch analog of the
+   SQ8 scale bug — but the vehicle is the one already proven not to hold the experiment.
+
+## `Storage::RaBitQ`: a negative result, and where the bottleneck actually went
+
+1-bit-per-dimension traversal was the obvious next step after SQ8's win. It does not pay off,
+and *why* it doesn't is the most useful thing in this file.
+
+SIFT1M, M=32/m0=64, single-threaded, matched recall:
+
+| | recall@10 | QPS | dist/query | ns/dist |
+|---|---|---|---|---|
+| `Storage::SQ8` | 92.99% | **13,107** | ~1,250 | 66.6 |
+| `Storage::RaBitQ` (rerank 400) | 92.67% | **1,100** | 13,085 | 61.9 |
+
+RaBitQ buys a **7% cheaper distance** and pays **10x more distances** to reach the same recall.
+~12x slower end to end. The coarser metric misleads the graph walk, and the walk's extra hops
+cost far more than the narrower codes save.
+
+*(A first pass with `rerank_candidates: 100` looked even worse — recall ceilinged at 74% and then
+**declined** with more ef, 74.09% → 73.01% → 72.03%. Non-monotonic recall is not a quality
+ceiling, it is a rerank-pool artifact: a coarse metric lets distractors crowd into a fixed top-100
+pool and evict true neighbours before the exact rescore ever sees them. Deepening the pool to 400
+restored monotonicity. Worth knowing: **if recall falls as ef rises, suspect the rerank pool, not
+the quantizer.**)*
+
+### The bottleneck moved from the vector to the adjacency list
+
+The node block is `header(m0) + vector`. At m0=64:
+
+| | header (2 + 64 ids + 1, padded) | vector | block |
+|---|---|---|---|
+| F32 | 272 B | 512 B | **784 B** |
+| SQ8 | 272 B | 128 B | **400 B** |
+| RaBitQ | 272 B | 24 B | **296 B** |
+
+SQ8 already harvested the large saving (512 → 128 B). RaBitQ shaves a further 104 B off a 400 B
+block — 26% — and pays for it with a drastically coarser metric. **The vector is now only ~32% of
+the block; the other 272 bytes are neighbour ids.** Compressing the vector further has hit
+diminishing returns by construction.
+
+Testing that directly — SQ8 at m0=32, a **272 B** block, *smaller than RaBitQ's* and with a far
+better metric — at matched recall on SIFT1M:
+
+| recall@10 | SQ8 m0=64 | SQ8 m0=32 | |
+|---|---|---|---|
+| ~98.85% | ~5,700 | **6,123** | +7% |
+| ~99.67% | ~3,300 | **3,670** | +11% |
+| ~99.90% | ~1,600 | **1,781** | +11% |
+
+Memory also falls, 1,076 → 948 MB. **At 128 dimensions, adjacency is the next lever, not the
+vector.**
+
+**Two limits on that claim, both load-bearing:**
+
+**1. It is not yet a competitive claim.** Trap 1 below cuts both ways: lowering M helps hnswlib and
+faiss too, roughly equally. So m0=32 is a better operating point for foxstash's own Pareto curve,
+but the multiple against the competition cannot be restated until they are re-run at matched M.
+The defaults have deliberately **not** been changed on the strength of this.
+
+**2. It is a statement about SIFT's 128 dimensions, and it very likely inverts at the
+dimensionality foxstash is actually used at.** The block is `header(m0) + vector`, so which half
+dominates is a pure function of `dim`. At m0=64:
+
+| dim | F32 block | SQ8 block | RaBitQ block | vector's share of the SQ8 block |
+|---|---|---|---|---|
+| 128 (SIFT) | 784 B | 400 B | 296 B | 32% |
+| 384 (MiniLM) | 1,808 B | 656 B | 320 B | 59% |
+| 768 | 3,344 B | 1,040 B | 368 B | 74% |
+| 1536 (OpenAI) | 6,416 B | 1,808 B | **472 B** | 85% |
+
+At 1536-d, RaBitQ shrinks the node block **3.8x below SQ8**, and the 272 B of adjacency is noise.
+The whole reason RaBitQ fails on SIFT — that it fights for 104 B out of 400 — simply does not
+apply there. Nobody runs a RAG pipeline on 128-d vectors; MiniLM is 384-d and OpenAI's embeddings
+are 1536-d.
+
+**So `Storage::RaBitQ` is NOT deleted, and the negative result above must not be quoted as
+general.** It is a 128-d result. The deciding experiment is GIST1M (960-d) or a real 768/1536-d
+embedding corpus, and until that is run the honest position is: *RaBitQ loses badly at low
+dimension, is untested where it should win, and SQ8 is the default.* Deleting it on SIFT evidence
+alone would be the same dataset-generalization error catalogued below — the one that has already
+caught this project four times.
+
+## The bugs that survived because nothing could fail
+
+Every one of these was public, documented, and green across the whole test suite. They are
+listed together because they share a single cause: the tests exercised the code, but none of
+them were *able* to fail.
+
+| bug | what it did | why the tests missed it |
+|---|---|---|
+| `BuildStrategy::Sequential` | **panicked on every input**, an entire release | no test or doctest ever selected it |
+| `keep_pruned_connections` | silently ignored in the parallel builder — degree saturated at 64.0/64 vs faiss's 25.4 | the config flag was named in a comment and never read; no test asserted graph density |
+| `ScalarQuantizer::distance_quantized` | ignored per-dimension scale → **7% recall, indistinguishable from chance**; the graph was *built* under the distorted metric | `search_symmetric` had zero tests — and self-retrieval **cannot** catch it (see below) |
+| `Storage::SQ8` + `add()` | **panicked on the first document** — codebook never fitted outside `build*()`. Reachable from `foxstash-db`, so every `insert` on an SQ8 collection crashed | every SQ8 test went through `build_parallel` |
+| `benchmarks/data/sift1m/` | held a **10,000**-vector base | nothing validated the corpus against its label |
+| `BinaryHNSWIndex` | 1.2% recall while the rustdoc advertised 90% | benchmarked only on synthetic vectors, where every ANN scores ~60% |
+
+**The test that could not fail.** The SQ8 metric bug's first regression test was self-retrieval,
+and it scored **100% on the completely broken metric**. Querying with an indexed vector
+re-quantizes to that vector's own code, so a quantized-vs-quantized distance returns 0 against
+itself no matter how wrong the scale factors are. A quantized index that passes a self-retrieval
+test has proven *nothing*. Only held-out queries scored against real brute-force ground truth
+expose it.
+
+The pattern to take from this: a test that exercises a code path is not the same as a test that
+can fail on it. Assert against an independent oracle (brute force), on held-out data, with a
+number that would move if the thing broke.
 
 > ### Historical note
 >

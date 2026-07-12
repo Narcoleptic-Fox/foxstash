@@ -43,7 +43,7 @@ pub mod store;
 // ── Desktop-only imports and types ──
 
 #[cfg(not(target_arch = "wasm32"))]
-use foxstash_core::index::HNSWConfig;
+use foxstash_core::index::{HNSWConfig, Storage};
 #[cfg(not(target_arch = "wasm32"))]
 use foxstash_core::storage::IncrementalConfig;
 #[cfg(not(target_arch = "wasm32"))]
@@ -79,6 +79,20 @@ pub enum DbError {
 
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// `Collection` ingests documents one at a time. Quantized storage needs a codebook
+    /// (`SQ8`'s per-dimension min/scale, or RaBitQ's rotation) fitted on a corpus sample
+    /// *before* the first vector is encoded — `HNSWIndex::build`/`build_parallel` do that,
+    /// `HNSWIndex::new` does not. A `Collection` backed by an untrained quantized index
+    /// panics on its first insert, so this is rejected up front instead.
+    #[error(
+        "collection storage must be Storage::F32: {storage:?} requires a codebook trained on \
+         a corpus sample before any vector can be encoded, but a collection ingests documents \
+         incrementally and has no such sample at construction time. For quantized storage, \
+         build the index once via foxstash_core::index::HNSWIndex::build_parallel over the \
+         full corpus instead of through Collection::insert."
+    )]
+    UnsupportedIncrementalStorage { storage: Storage },
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -41,14 +41,29 @@ fn main() {
     let (storage, rerank) = match std::env::args().nth(2).as_deref() {
         Some("sq8") => (Storage::SQ8, 100),
         Some("sq8-norerank") => (Storage::SQ8, 0),
+        Some("rabitq") => (Storage::RaBitQ, 100),
+        Some("rabitq-deep") => (Storage::RaBitQ, 400),
+        Some("rabitq-norerank") => (Storage::RaBitQ, 0),
         _ => (Storage::F32, 0),
     };
+    // m/m0 overridable, because the node block is `header(m0) + vector` and — now that SQ8 has
+    // shrunk the vector to 128 B — the m0 neighbour ids are the *larger* half. Sweeping m0 is
+    // how you test whether adjacency has become the bottleneck.
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let m = env("FOX_M", 32);
+    let m0 = env("FOX_M0", 64);
+
     let mut index = HNSWIndex::build_parallel(
         ds.base.clone(),
         HNSWConfig {
             metric: DistanceMetric::L2,
-            m: 32,
-            m0: 64,
+            m,
+            m0,
             ef_construction: 200,
             ef_search: 100,
             storage,
@@ -58,6 +73,7 @@ fn main() {
         },
     );
     let mem = index.memory_breakdown();
+    println!("m={m} m0={m0}");
     println!(
         "storage={storage:?} rerank={rerank}  index {:.0} MB\n",
         mem.total() as f64 / 1e6

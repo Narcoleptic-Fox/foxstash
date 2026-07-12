@@ -108,6 +108,21 @@ impl BitsetVisited {
     }
 }
 
+/// Per-query state computed once and threaded through [`HNSWIndex::search_layer`] and
+/// [`HNSWIndex::distance_to_node`] for the whole search (or the whole `insert_node` call).
+///
+/// `norm` is for cosine's fused distance. `rabitq` is `Some` only under [`Storage::RaBitQ`]:
+/// it is the query rotated into RaBitQ space, which costs an O(dim²) matrix-vector multiply
+/// and must be paid exactly once per query — not once per node visited, which is what
+/// recomputing it inside `distance_to_node` would do. Bundled into one struct (rather than two
+/// more parameters on `search_layer`) because that function was already at clippy's
+/// `too_many_arguments` ceiling; a struct scales if a future storage mode needs its own
+/// per-query state without every call site growing another positional argument.
+struct QueryPrep<'a> {
+    norm: f32,
+    rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
+}
+
 /// Per-query scratch space: the visited bitset and the two heaps.
 ///
 /// Private. Reusing it is [`Searcher`]'s job, and it is *not* a speed feature — see
@@ -346,9 +361,12 @@ pub enum DistanceMetric {
 /// |---|---|---|---|
 /// | `F32` | 272 B | 512 B | **784 B** |
 /// | `SQ8` | 272 B | 128 B | **400 B** |
+/// | `RaBitQ` | 272 B | 24 B | **296 B** |
 ///
-/// Note the adjacency does not shrink, so this is ~2x less traffic, not 4x — quantization
-/// cannot buy more than the vector's share of the block.
+/// Note the adjacency does not shrink, so this is ~2x less traffic under SQ8, not 4x —
+/// quantization cannot buy more than the vector's share of the block. `RaBitQ`'s vector share
+/// is 16 bytes of packed sign bits (1 bit/dim) plus 8 bytes for the two per-vector estimator
+/// scalars (`dtc_sq`, `est_factor`) — see [`Storage::RaBitQ`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Storage {
     /// Full-precision `f32` vectors in the arena. Exact distances, largest blocks.
@@ -361,6 +379,40 @@ pub enum Storage {
     /// vectors are retained in a cold side array and used to rescore the final candidates —
     /// they are never touched during the walk.
     SQ8,
+    /// 1-bit-per-dimension RaBitQ codes in the arena (see [`crate::vector::rabitq`]).
+    ///
+    /// Each node stores a packed sign-bit vector plus two `f32` scalars (`dtc_sq`,
+    /// `est_factor`) that the RaBitQ derivation needs to turn those bits into a real distance
+    /// estimate — not a Hamming proxy. Traversal is asymmetric in the same sense as `SQ8`:
+    /// the query is rotated into RaBitQ space once per query
+    /// ([`RaBitQuantizer::prepare_query`](crate::vector::rabitq::RaBitQuantizer::prepare_query)),
+    /// and every node visit thereafter is O(dim) with no further matrix work. As with `SQ8`,
+    /// the full-precision vectors live in a cold side array and are read only during rerank.
+    ///
+    /// # Do not reach for this at low dimension
+    ///
+    /// On SIFT1M (**128-d**) it is **~12x slower than [`Storage::SQ8`] at matched recall**: it
+    /// buys a 7% cheaper distance (66.6 → 61.9 ns) and pays **10x more distance computations**
+    /// (13,085 vs ~1,250 for ~93% recall@10), because the coarse metric misleads the graph walk.
+    /// Without rerank it collapses to **26% recall**. Use `SQ8`.
+    ///
+    /// The reason is dimensional, and it is why this variant still exists. A node block is
+    /// `header(m0) + vector`, and the header is 272 B at m0=64 regardless of `dim`. At 128-d the
+    /// SQ8 vector is already only 128 B, so 1-bit codes fight for 104 B out of a 400 B block and
+    /// wreck the metric to get it. At 1536-d the SQ8 vector is 1,536 B of an 1,808 B block, and
+    /// RaBitQ would cut that block to **472 B — 3.8x below SQ8** — with the adjacency as noise.
+    ///
+    /// | dim | SQ8 block | RaBitQ block |
+    /// |---|---|---|
+    /// | 128 | 400 B | 296 B |
+    /// | 384 | 656 B | 320 B |
+    /// | 1536 | 1,808 B | **472 B** |
+    ///
+    /// So the SIFT result is a *low-dimension* result and must not be generalized. It is
+    /// **unverified** at the dimensionality real embeddings actually use (384–1536). Until
+    /// someone runs GIST1M (960-d) or a real 768/1536-d corpus, treat this as: loses badly at
+    /// low dim, untested where it should win. See `benchmarks/RESULTS.md`.
+    RaBitQ,
 }
 
 impl Default for HNSWConfig {
@@ -467,16 +519,29 @@ const fn node_hdr_len(m0: usize) -> usize {
     (2 + m0 + 1).div_ceil(4) * 4
 }
 
+/// Words needed for `dim` packed RaBitQ sign bits (1 bit/dim, byte-packed then word-rounded).
+///
+/// Composed as `dim -> bytes -> words` (not a single `div_ceil(32)`) so it matches exactly
+/// how [`RaBitCode::bits`](crate::vector::rabitq::RaBitCode::bits) packs — `bits[i/8]` bit
+/// `i%8` — which is byte-granular, not word-granular.
+#[inline(always)]
+const fn rabitq_bit_words(dim: usize) -> usize {
+    dim.div_ceil(8).div_ceil(4)
+}
+
 /// Size, in 4-byte units, of the vector region of a node block.
 ///
 /// `F32` needs one word per dimension. `SQ8` packs one byte per dimension, rounded up to a
-/// whole word — the codes sit in the same arena as the links, so a node visit still touches
+/// whole word. `RaBitQ` packs one *bit* per dimension plus two `f32` scalars (`dtc_sq`,
+/// `est_factor`) that its distance estimator needs per vector — see [`Storage::RaBitQ`]. In
+/// every case the codes sit in the same arena as the links, so a node visit still touches
 /// exactly one contiguous block.
 #[inline(always)]
 const fn vec_words(storage: Storage, dim: usize) -> usize {
     match storage {
         Storage::F32 => dim,
         Storage::SQ8 => dim.div_ceil(4),
+        Storage::RaBitQ => 2 + rabitq_bit_words(dim),
     }
 }
 
@@ -549,6 +614,12 @@ pub struct HNSWIndex {
     /// block is the entire point: the walk must not pay for bytes it does not use.
     full: Vec<f32>,
 
+    // === RaBitQ storage (empty under other Storage variants) ===
+    /// The fitted quantizer: corpus centroid + shared random rotation. `encode`s each vector
+    /// at build time and `prepare_query`s each query once per search
+    /// (not once per node visit — see [`Self::distance_to_node`]).
+    rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
+
     // === GRAPH STRUCTURE (layers >= 1 only) ===
     /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
     ///
@@ -588,6 +659,7 @@ impl HNSWIndex {
             q_min: Vec::new(),
             q_scale: Vec::new(),
             full: Vec::new(),
+            rabitq: None,
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -596,26 +668,107 @@ impl HNSWIndex {
         }
     }
 
-    /// Fit the per-dimension SQ8 codebook over the corpus. No-op under `Storage::F32`.
+    /// Fit whatever codebook the configured storage needs, over the corpus. No-op under
+    /// `Storage::F32`.
     ///
-    /// Each dimension gets its own `min`/`scale` from its own observed range. A dimension with
-    /// no spread gets `scale = 0`, which dequantizes to a constant — correct, and it contributes
-    /// nothing to any distance, which is exactly right for a dimension carrying no information.
+    /// `SQ8`: each dimension gets its own `min`/`scale` from its own observed range. A
+    /// dimension with no spread gets `scale = 0`, which dequantizes to a constant — correct,
+    /// and it contributes nothing to any distance, which is exactly right for a dimension
+    /// carrying no information.
+    ///
+    /// `RaBitQ`: fits [`RaBitQuantizer`](crate::vector::rabitq::RaBitQuantizer) — a corpus
+    /// centroid plus a shared random rotation — used by [`Self::push_node`] to encode each
+    /// vector and by [`Self::distance_to_node`] to prepare each query.
     fn fit_codebook(&mut self, embeddings: &[Vec<f32>]) {
-        if self.config.storage != Storage::SQ8 || embeddings.is_empty() {
+        if embeddings.is_empty() {
             return;
         }
-        let dim = self.embedding_dim;
-        let mut lo = vec![f32::INFINITY; dim];
-        let mut hi = vec![f32::NEG_INFINITY; dim];
-        for v in embeddings {
-            for d in 0..dim {
-                lo[d] = lo[d].min(v[d]);
-                hi[d] = hi[d].max(v[d]);
+        match self.config.storage {
+            Storage::F32 => {}
+            Storage::SQ8 => {
+                let dim = self.embedding_dim;
+                let mut lo = vec![f32::INFINITY; dim];
+                let mut hi = vec![f32::NEG_INFINITY; dim];
+                for v in embeddings {
+                    for d in 0..dim {
+                        lo[d] = lo[d].min(v[d]);
+                        hi[d] = hi[d].max(v[d]);
+                    }
+                }
+                self.q_scale = (0..dim).map(|d| (hi[d] - lo[d]) / 255.0).collect();
+                self.q_min = lo;
+            }
+            Storage::RaBitQ => {
+                self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(embeddings));
             }
         }
-        self.q_scale = (0..dim).map(|d| (hi[d] - lo[d]) / 255.0).collect();
-        self.q_min = lo;
+    }
+
+    /// Whether this index's storage has what it needs to encode a vector.
+    ///
+    /// Always `true` under `Storage::F32` — an `f32` vector needs no fitted state to store.
+    /// Under `SQ8`/`RaBitQ` this is `true` once [`Self::fit_codebook`] has actually run
+    /// (via `build()`/`build_parallel()`, or [`Self::train`]) — checked by looking at the
+    /// codebook state itself rather than a separate `bool` flag, so there is no second
+    /// source of truth that could drift out of sync with it.
+    fn is_trained(&self) -> bool {
+        match self.config.storage {
+            Storage::F32 => true,
+            Storage::SQ8 => !self.q_scale.is_empty(),
+            Storage::RaBitQ => self.rabitq.is_some(),
+        }
+    }
+
+    /// Fit this index's codebook from a representative sample, ahead of incremental
+    /// [`Self::add`]/[`Self::add_embedding`] calls.
+    ///
+    /// The quantized storages (`SQ8`, `RaBitQ`) cannot encode a single vector without first
+    /// knowing the data distribution — `SQ8` needs each dimension's observed range, `RaBitQ`
+    /// needs a corpus centroid and rotation. `train()` makes that a named, explicit step
+    /// instead of an implicit one, the same shape as faiss's `index.train(xb)` before
+    /// `index.add(xb)`.
+    ///
+    /// `build()`/`build_parallel()` call this internally from the full corpus and remain the
+    /// right choice for bulk loads — reach for `train()` only when you are building the index
+    /// incrementally via `add()`/`add_embedding()` and need to fit the codebook from a sample
+    /// first (it need not be the whole corpus, just representative of it).
+    ///
+    /// A no-op that always succeeds under `Storage::F32`, which needs no codebook.
+    ///
+    /// # Errors
+    /// - [`RagError::InvalidInput`](crate::RagError::InvalidInput) if `sample` is empty (for
+    ///   a storage that needs one), or if the index already has documents — retraining a
+    ///   non-empty index would desynchronize the vectors already encoded under the old
+    ///   codebook from the new one, silently corrupting their distances.
+    /// - [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if any sample
+    ///   vector doesn't match this index's dimension.
+    pub fn train(&mut self, sample: &[Vec<f32>]) -> Result<()> {
+        if self.config.storage == Storage::F32 {
+            return Ok(());
+        }
+        if !self.is_empty() {
+            return Err(crate::RagError::InvalidInput(
+                "train() must be called before any add()/add_embedding() — retraining a \
+                 non-empty index would desynchronize already-encoded vectors from the new \
+                 codebook"
+                    .into(),
+            ));
+        }
+        if sample.is_empty() {
+            return Err(crate::RagError::InvalidInput(
+                "train() requires a non-empty sample to fit a codebook".into(),
+            ));
+        }
+        for v in sample {
+            if v.len() != self.embedding_dim {
+                return Err(crate::RagError::DimensionMismatch {
+                    expected: self.embedding_dim,
+                    actual: v.len(),
+                });
+            }
+        }
+        self.fit_codebook(sample);
+        Ok(())
     }
 
     /// Creates a new HNSW index with default configuration
@@ -814,8 +967,9 @@ impl HNSWIndex {
 
     /// Full-precision vector for a node.
     ///
-    /// Under `Storage::F32` this reads the arena (hot). Under `Storage::SQ8` it reads the cold
-    /// `full` array — correct, but NOT what the traversal uses; see `distance_to_node`.
+    /// Under `Storage::F32` this reads the arena (hot). Under the quantized storages it reads
+    /// the cold `full` array — correct, but NOT what the traversal uses; see
+    /// `distance_to_node`.
     ///
     /// Bounds-checked, deliberately. Replacing these with `get_unchecked` was measured at
     /// +1.3% on SIFT1M — inside run-to-run noise, and not worth `unsafe` in the hottest
@@ -827,7 +981,7 @@ impl HNSWIndex {
                 let start = node_id * self.stride + self.hdr;
                 bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
             }
-            Storage::SQ8 => {
+            Storage::SQ8 | Storage::RaBitQ => {
                 debug_assert!(
                     !self.full.is_empty(),
                     "full-precision vectors were dropped (rerank_candidates = 0); \
@@ -846,6 +1000,19 @@ impl HNSWIndex {
         let words = vec_words(Storage::SQ8, self.embedding_dim);
         let bytes: &[u8] = bytemuck::cast_slice(&self.nodes[start..start + words]);
         &bytes[..self.embedding_dim]
+    }
+
+    /// A node's RaBitQ code — `(dtc_sq, est_factor, packed sign bits)` — from the hot arena.
+    /// `Storage::RaBitQ` only.
+    #[inline(always)]
+    fn get_rabitq_code(&self, node_id: usize) -> (f32, f32, &[u8]) {
+        let base = node_id * self.stride + self.hdr;
+        let dtc_sq = f32::from_bits(self.nodes[base]);
+        let est_factor = f32::from_bits(self.nodes[base + 1]);
+        let bit_words = rabitq_bit_words(self.embedding_dim);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.nodes[base + 2..base + 2 + bit_words]);
+        let n_bytes = self.embedding_dim.div_ceil(8);
+        (dtc_sq, est_factor, &bytes[..n_bytes])
     }
 
     /// Precomputed L2 norm of a node's vector. Lives in the node's own block, so cosine
@@ -925,6 +1092,22 @@ impl HNSWIndex {
                     self.full.extend_from_slice(embedding);
                 }
             }
+            Storage::RaBitQ => {
+                let rq = self
+                    .rabitq
+                    .as_ref()
+                    .expect("RaBitQ storage requires fit_codebook to run before push_node");
+                let code = rq.encode(embedding);
+                self.nodes[v] = code.dtc_sq.to_bits();
+                self.nodes[v + 1] = code.est_factor.to_bits();
+                let bit_words = rabitq_bit_words(self.embedding_dim);
+                let bytes: &mut [u8] =
+                    bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + bit_words]);
+                bytes[..code.bits.len()].copy_from_slice(&code.bits);
+                if self.config.rerank_candidates > 0 {
+                    self.full.extend_from_slice(embedding);
+                }
+            }
         }
     }
 
@@ -950,13 +1133,26 @@ impl HNSWIndex {
     /// * `document` - Document with embedding to add
     ///
     /// # Errors
-    /// Returns error if embedding dimension doesn't match index dimension
+    /// - Returns [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if the
+    ///   embedding dimension doesn't match the index dimension.
+    /// - Returns [`RagError::NotTrained`](crate::RagError::NotTrained) if this index's
+    ///   storage is quantized (`SQ8`/`RaBitQ`) and [`Self::train`] hasn't been called yet —
+    ///   those storages cannot encode a vector without a fitted codebook.
     pub fn add(&mut self, document: Document) -> Result<()> {
         if document.embedding.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
                 expected: self.embedding_dim,
                 actual: document.embedding.len(),
             });
+        }
+
+        if !self.is_trained() {
+            return Err(crate::RagError::NotTrained(format!(
+                "Storage::{:?} requires a fitted codebook before add() — call \
+                 `index.train(&sample)` first, or build the index via `HNSWIndex::build`/ \
+                 `build_parallel`, which trains internally from the full corpus",
+                self.config.storage
+            )));
         }
 
         if document.embedding.iter().any(|v| !v.is_finite()) {
@@ -1008,13 +1204,25 @@ impl HNSWIndex {
     /// * `embedding` - The embedding vector to add
     ///
     /// # Errors
-    /// Returns error if embedding dimension doesn't match index dimension
+    /// - Returns [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if the
+    ///   embedding dimension doesn't match the index dimension.
+    /// - Returns [`RagError::NotTrained`](crate::RagError::NotTrained) if this index's
+    ///   storage is quantized (`SQ8`/`RaBitQ`) and [`Self::train`] hasn't been called yet.
     pub fn add_embedding(&mut self, id: String, embedding: Vec<f32>) -> Result<()> {
         if embedding.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
                 expected: self.embedding_dim,
                 actual: embedding.len(),
             });
+        }
+
+        if !self.is_trained() {
+            return Err(crate::RagError::NotTrained(format!(
+                "Storage::{:?} requires a fitted codebook before add_embedding() — call \
+                 `index.train(&sample)` first, or build the index via `HNSWIndex::build`/ \
+                 `build_parallel`, which trains internally from the full corpus",
+                self.config.storage
+            )));
         }
 
         if embedding.iter().any(|v| !v.is_finite()) {
@@ -1118,8 +1326,17 @@ impl HNSWIndex {
             *ctx = SearchContext::new(self.len());
         }
 
-        // Precompute query norm once for fused distance
+        // Precompute query norm (cosine) and, under RaBitQ, rotate the query into RaBitQ space
+        // — once for the whole search. The rotation is an O(dim²) matvec; recomputing it per
+        // node visit (as calling `distance_to_node` naively might invite) would turn every
+        // O(dim) distance in the walk back into an O(dim²) one, the exact regression
+        // `Storage::RaBitQ` exists to avoid.
         let query_norm = crate::vector::simd::norm_simd(query);
+        let rq_prepared = self.prepare_rabitq_query(query);
+        let qprep = QueryPrep {
+            norm: query_norm,
+            rabitq: rq_prepared.as_ref(),
+        };
 
         let entry_point = self.entry_point.unwrap();
         let mut current_nearest = vec![entry_point];
@@ -1127,7 +1344,7 @@ impl HNSWIndex {
         // Search from top layer to layer 1 (ef=1 greedy descent — ids only)
         for layer in (1..=self.max_layer).rev() {
             current_nearest = self
-                .search_layer(query, &current_nearest, 1, layer, ctx, query_norm)
+                .search_layer(query, &current_nearest, 1, layer, ctx, &qprep)
                 .into_iter()
                 .map(|(_, id)| id)
                 .collect();
@@ -1135,13 +1352,13 @@ impl HNSWIndex {
 
         // Search layer 0 with ef_search candidates
         let ef = self.config.ef_search.max(k);
-        let mut found = self.search_layer(query, &current_nearest, ef, 0, ctx, query_norm);
+        let mut found = self.search_layer(query, &current_nearest, ef, 0, ctx, &qprep);
 
-        // Under SQ8 the walk ranked by an approximate distance, so its top-k is not the true
-        // top-k. Rescore a pool with exact distances and re-sort. The pool is read from the
-        // cold `full` array — O(pool) reads, against O(nodes visited) during the walk, which
-        // is why the walk gets to keep its small blocks.
-        if self.config.storage == Storage::SQ8 && self.config.rerank_candidates > 0 {
+        // Under the quantized storages the walk ranked by an approximate distance, so its
+        // top-k is not the true top-k. Rescore a pool with exact distances and re-sort. The
+        // pool is read from the cold `full` array — O(pool) reads, against O(nodes visited)
+        // during the walk, which is why the walk gets to keep its small blocks.
+        if self.config.storage != Storage::F32 && self.config.rerank_candidates > 0 {
             let pool = self.config.rerank_candidates.max(k).min(found.len());
             found.truncate(pool);
             for entry in found.iter_mut() {
@@ -1346,6 +1563,12 @@ impl HNSWIndex {
         // Get embedding once (hot path optimization)
         let node_embedding = self.get_embedding(node_id).to_vec();
         let query_norm = crate::vector::simd::norm_simd(&node_embedding);
+        // See `search_inner`: prepared once per inserted node, not once per distance call.
+        let rq_prepared = self.prepare_rabitq_query(&node_embedding);
+        let qprep = QueryPrep {
+            norm: query_norm,
+            rabitq: rq_prepared.as_ref(),
+        };
         let mut ctx = SearchContext::new(self.len());
 
         // Search for nearest neighbors from top to target layer + 1
@@ -1357,7 +1580,7 @@ impl HNSWIndex {
                     1,
                     layer,
                     &mut ctx,
-                    query_norm,
+                    &qprep,
                 )
                 .into_iter()
                 .map(|(_, id)| id)
@@ -1373,7 +1596,7 @@ impl HNSWIndex {
                     self.config.ef_construction,
                     layer,
                     &mut ctx,
-                    query_norm,
+                    &qprep,
                 )
                 .into_iter()
                 .map(|(_, id)| id)
@@ -1462,13 +1685,13 @@ impl HNSWIndex {
         ef: usize,
         layer: usize,
         ctx: &mut SearchContext,
-        query_norm: f32,
+        qprep: &QueryPrep,
     ) -> Vec<(f32, usize)> {
         ctx.reset();
 
         // Initialize with entry points
         for &ep in entry_points {
-            let dist = self.distance_to_node(query, ep, query_norm);
+            let dist = self.distance_to_node(query, ep, qprep);
             ctx.distance_calls += 1;
             ctx.candidates.push(Reverse((OrderedFloat(dist), ep)));
             ctx.best.push((OrderedFloat(dist), ep));
@@ -1542,7 +1765,7 @@ impl HNSWIndex {
 
                     if !ctx.is_visited(neighbor_id) {
                         ctx.mark_visited(neighbor_id);
-                        let dist = self.distance_to_node(query, neighbor_id, query_norm);
+                        let dist = self.distance_to_node(query, neighbor_id, qprep);
                         ctx.distance_calls += 1;
                         if batch_count < batch_buf.len() {
                             batch_buf[batch_count] = (dist, neighbor_id);
@@ -1732,12 +1955,31 @@ impl HNSWIndex {
         }
     }
 
+    /// Rotate `query` into RaBitQ space, once, for a whole search or insertion. `None` under
+    /// any other storage.
+    ///
+    /// The result must be computed exactly once per top-level query and threaded through
+    /// every [`Self::search_layer`]/[`Self::distance_to_node`] call it makes — calling this
+    /// per node visit would replace an O(dim) distance with an O(dim²) matvec on every hop.
+    #[inline]
+    fn prepare_rabitq_query(&self, query: &[f32]) -> Option<crate::vector::rabitq::PreparedQuery> {
+        if self.config.storage != Storage::RaBitQ {
+            return None;
+        }
+        let rq = self
+            .rabitq
+            .as_ref()
+            .expect("RaBitQ storage requires fit_codebook to run before any query");
+        Some(rq.prepare_query(query))
+    }
+
     /// Fused distance from query to a stored node.
     ///
     /// Cosine uses the precomputed norms for a single SIMD dispatch and a single pass.
-    /// L2 needs no norms, so `query_norm` is ignored there.
+    /// L2 needs no norms, so `qprep.norm` is ignored there. `qprep.rabitq` must be `Some`
+    /// whenever storage is [`Storage::RaBitQ`] — see [`Self::prepare_rabitq_query`].
     #[inline]
-    fn distance_to_node(&self, query: &[f32], node_id: usize, query_norm: f32) -> f32 {
+    fn distance_to_node(&self, query: &[f32], node_id: usize, qprep: &QueryPrep) -> f32 {
         // Under SQ8 the walk reads 8-bit codes straight out of the node's own block and
         // never touches `full`. This is the whole point of the storage mode: the block
         // shrinks from 784 bytes to 400, and the search is bound by exactly these reads.
@@ -1750,12 +1992,29 @@ impl HNSWIndex {
             );
         }
 
+        // Under RaBitQ the walk reads one packed sign-bit code plus two scalars, straight out
+        // of the node's own block — the block shrinks to 296 bytes (vs SQ8's 400), and the
+        // query's rotation was already paid for once, by the caller, in `qprep.rabitq`.
+        if self.config.storage == Storage::RaBitQ {
+            let prepared = qprep.rabitq.expect(
+                "Storage::RaBitQ traversal requires a query prepared via prepare_rabitq_query",
+            );
+            let (dtc_sq, est_factor, bits) = self.get_rabitq_code(node_id);
+            return crate::vector::simd::rabitq_asymmetric_l2_simd(
+                prepared.rq(),
+                bits,
+                dtc_sq,
+                est_factor,
+                prepared.qn_sq(),
+            );
+        }
+
         let embedding = self.get_embedding(node_id);
         match self.config.metric {
             DistanceMetric::Cosine => {
                 let norm_b = self.get_norm(node_id);
                 // We compute: 1 - dot(q, e) / (||q|| * ||e||)
-                if query_norm == 0.0 || norm_b == 0.0 {
+                if qprep.norm == 0.0 || norm_b == 0.0 {
                     return 1.0;
                 }
                 crate::vector::simd::cosine_distance_prenorm(query, embedding, norm_b)
@@ -2159,6 +2418,7 @@ impl HNSWIndex {
             q_min: Vec::new(),
             q_scale: Vec::new(),
             full: Vec::new(),
+            rabitq: None,
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
@@ -2167,7 +2427,7 @@ impl HNSWIndex {
         };
         index.fit_codebook(&points);
         index.nodes.reserve(n * index.stride);
-        if index.config.storage == Storage::SQ8 && index.config.rerank_candidates > 0 {
+        if index.config.storage != Storage::F32 && index.config.rerank_candidates > 0 {
             index.full.reserve(n * embedding_dim);
         }
         for p in &points {
@@ -2182,6 +2442,11 @@ impl HNSWIndex {
     fn build_single(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         let embedding_dim = embeddings[0].len();
         let mut index = Self::new(embedding_dim, config);
+        // Same requirement as every other build path: a quantized storage needs a fitted
+        // codebook before the first `push_node`. This path is easy to miss because it only
+        // runs for a single-vector corpus (`build_parallel` special-cases n == 1) — exactly
+        // the kind of default-only-tested gap that let `Storage::SQ8` + `add()` panic.
+        index.fit_codebook(&embeddings);
         index.push_node(&embeddings[0]);
         index.connections.push(vec![Vec::new()]);
         index.ids.push("0".to_string());
@@ -2679,7 +2944,11 @@ mod tests {
         index.l0_replace(0, &neighbors);
 
         let mut ctx = SearchContext::new(index.len());
-        let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, 1.0);
+        let qprep = QueryPrep {
+            norm: 1.0,
+            rabitq: None,
+        };
+        let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, &qprep);
         assert!(
             candidates.iter().any(|&(_, id)| id == 65),
             "best neighbor from position >64 should be considered"
@@ -2702,6 +2971,193 @@ mod tests {
         let doc = create_test_document("doc1", vec![1.0, 0.0]); // Wrong dimension
 
         assert!(index.add(doc).is_err());
+    }
+
+    // ========================================================================
+    // train() / is_trained() — quantized storages must not panic on add()
+    // ========================================================================
+
+    /// `Storage::SQ8` + `new()` + `add()`, skipping `train()`, must return `Err`, never
+    /// panic. This is the exact bug that used to crash on the first `add()`: `push_node`
+    /// indexed into `q_scale`/`q_min`, which stay empty until a codebook is fit.
+    #[test]
+    fn sq8_add_without_train_errs_not_panics() {
+        let mut index = HNSWIndex::new(
+            4,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+        let err = index
+            .add(create_test_document("doc1", vec![0.5, -0.3, 0.8, 0.1]))
+            .expect_err("add() before train() must error, not panic");
+        assert!(
+            matches!(err, crate::RagError::NotTrained(_)),
+            "expected NotTrained, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("train("),
+            "error message should name the method to call: {msg}"
+        );
+    }
+
+    /// Same bug class, `Storage::RaBitQ`: `push_node` calls `self.rabitq.as_ref().expect(...)`,
+    /// which would panic identically without this guard.
+    #[test]
+    fn rabitq_add_without_train_errs_not_panics() {
+        let mut index = HNSWIndex::new(
+            4,
+            HNSWConfig {
+                storage: Storage::RaBitQ,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+        let err = index
+            .add(create_test_document("doc1", vec![0.5, -0.3, 0.8, 0.1]))
+            .expect_err("add() before train() must error, not panic");
+        assert!(
+            matches!(err, crate::RagError::NotTrained(_)),
+            "expected NotTrained, got {err:?}"
+        );
+    }
+
+    /// `Storage::F32` needs no codebook, so `add()` without `train()` must keep working
+    /// exactly as before — `train()` is a no-op there and must never gate it.
+    #[test]
+    fn f32_add_works_without_training() {
+        let mut index = HNSWIndex::new(4, HNSWConfig::default());
+        assert!(index
+            .add(create_test_document("doc1", vec![0.5, -0.3, 0.8, 0.1]))
+            .is_ok());
+        assert_eq!(index.len(), 1);
+        assert!(index.search(&[0.5, -0.3, 0.8, 0.1], 1).unwrap()[0].id == "doc1");
+    }
+
+    /// End-to-end: `new()` -> `train(sample)` -> incremental `add_embedding()` -> search,
+    /// for both quantized storages. Ground truth is brute-force exact L2 over the base set;
+    /// queries are HELD OUT (never added), for the same reason as the build_parallel recall
+    /// test — self-retrieval can't distinguish a working metric from a broken one.
+    fn train_then_add_recall(storage: Storage) -> f32 {
+        let mut rng = StdRng::seed_from_u64(303);
+        let dim = 16;
+        let n_clusters = 8;
+        let per_cluster = 40;
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
+            .map(|i| {
+                let c = &centers[i % n_clusters];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.4).collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|i| {
+                let c = &centers[i % n_clusters];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.4).collect()
+            })
+            .collect();
+
+        let mut index = HNSWIndex::new(
+            dim,
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                m: 16,
+                m0: 32,
+                ef_construction: 150,
+                ef_search: 150,
+                storage,
+                rerank_candidates: 50,
+                ..Default::default()
+            },
+        );
+        // Train from a sample (need not be the whole corpus — half of it here), then add
+        // every vector incrementally, the way a caller without the full corpus up front
+        // would use this API.
+        index.train(&base[..base.len() / 2]).expect("train");
+        for (i, v) in base.iter().enumerate() {
+            index
+                .add_embedding(i.to_string(), v.clone())
+                .expect("add_embedding");
+        }
+
+        let k = 10;
+        let mut total_recall = 0.0f32;
+        for q in &queries {
+            let mut exact: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (d, i)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: HashSet<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
+
+            let got: HashSet<usize> = index
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+            total_recall += truth.intersection(&got).count() as f32 / k as f32;
+        }
+        total_recall / queries.len() as f32
+    }
+
+    /// SQ8 via incremental `train()` + `add_embedding()` — not `build_parallel`, so
+    /// construction itself uses the quantized metric, a strictly harder case than the
+    /// build-time recall tests. Measured on this exact seed/config: 100%; floor set well
+    /// below that for margin, not at the measurement (see `lesson_untested_public_options`).
+    #[test]
+    fn sq8_train_then_add_retrieves_correctly() {
+        let recall = train_then_add_recall(Storage::SQ8);
+        assert!(
+            recall > 0.6,
+            "Storage::SQ8 via train()+add_embedding(): recall@10 = {:.1}%, held-out queries, \
+             brute-force ground truth",
+            recall * 100.0
+        );
+    }
+
+    /// Same as above for RaBitQ. Measured on this exact seed/config: 100%.
+    #[test]
+    fn rabitq_train_then_add_retrieves_correctly() {
+        let recall = train_then_add_recall(Storage::RaBitQ);
+        assert!(
+            recall > 0.6,
+            "Storage::RaBitQ via train()+add_embedding(): recall@10 = {:.1}%, held-out \
+             queries, brute-force ground truth",
+            recall * 100.0
+        );
+    }
+
+    /// `train()` on a non-empty index must refuse — retraining would desynchronize vectors
+    /// already encoded under the old codebook.
+    #[test]
+    fn train_on_nonempty_index_errs() {
+        let mut index = HNSWIndex::new(
+            3,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                ..Default::default()
+            },
+        );
+        index.train(&[vec![1.0, 2.0, 3.0]]).expect("first train");
+        index
+            .add_embedding("0".into(), vec![1.0, 2.0, 3.0])
+            .expect("add after train");
+        assert!(
+            index.train(&[vec![4.0, 5.0, 6.0]]).is_err(),
+            "retraining a non-empty index must be rejected"
+        );
     }
 
     #[test]
@@ -3276,6 +3732,164 @@ mod tests {
                 "{strategy:?}: self-retrieval recall {:.1}%, graph is broken",
                 recall * 100.0,
             );
+        }
+    }
+
+    // ========================================================================
+    // Storage::RaBitQ
+    // ========================================================================
+
+    /// `vec_words`/`node_stride` must match the documented arena layout: 2 scalar words
+    /// (`dtc_sq`, `est_factor`) plus `dim` packed sign bits, byte-then-word-rounded — not a
+    /// bare `dim.div_ceil(32)`, which would silently disagree with `RaBitCode::bits`' byte
+    /// granularity whenever `dim` isn't a multiple of 32 but is a multiple of 8.
+    #[test]
+    fn rabitq_vec_words_matches_documented_layout() {
+        // dim = 40: divisible by 8 (5 bytes) but not by 32, so a naive dim.div_ceil(32)
+        // would round to the same 2 words as dim.div_ceil(8).div_ceil(4) here — pick a case
+        // where they'd actually differ: dim = 100.
+        // bytes = ceil(100/8) = 13, words = ceil(13/4) = 4.
+        assert_eq!(rabitq_bit_words(100), 4);
+        assert_eq!(vec_words(Storage::RaBitQ, 100), 2 + 4);
+
+        // dim = 128 (SIFT-adjacent): bytes = 16, words = 4 -> vector region = 24 bytes,
+        // matching the doc comment on `Storage`.
+        assert_eq!(vec_words(Storage::RaBitQ, 128), 2 + 4);
+        assert_eq!(vec_words(Storage::RaBitQ, 128) * 4, 24);
+    }
+
+    /// End-to-end recall gate for `Storage::RaBitQ`, built the same way the benchmarks do
+    /// (`build_parallel`, which builds the graph in exact f32 space and only quantizes the
+    /// traversal storage afterward — see `convert_parallel_to_index`).
+    ///
+    /// Ground truth is exact brute-force L2 over the base set. Queries are HELD OUT: distinct
+    /// vectors near (not equal to) cluster centers, never inserted into the index. Querying
+    /// with an indexed vector would re-derive that vector's own RaBitQ code and could score
+    /// well even against a broken estimator — see `lesson_untestable_by_construction`. Data is
+    /// clustered, not uniform-random, for the same reason every other recall test here is:
+    /// uniform-random vectors have no structure to lose and every ANN scores ~60% on them
+    /// regardless of whether the graph or the metric is correct.
+    #[test]
+    fn rabitq_recall_on_clustered_data_with_held_out_queries() {
+        let mut rng = StdRng::seed_from_u64(2024);
+        let dim = 32;
+        let n_clusters = 16;
+        let per_cluster = 50;
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 20.0).collect())
+            .collect();
+
+        let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
+            .map(|i| {
+                let c = &centers[i % n_clusters];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.8).collect()
+            })
+            .collect();
+
+        // Held-out queries: fresh noise around the same centers, drawn from the same RNG
+        // stream *after* all base vectors, so none of them coincides with a base vector.
+        let n_queries = 60;
+        let queries: Vec<Vec<f32>> = (0..n_queries)
+            .map(|i| {
+                let c = &centers[i % n_clusters];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.8).collect()
+            })
+            .collect();
+
+        let config = HNSWConfig {
+            metric: DistanceMetric::L2,
+            m: 16,
+            m0: 32,
+            ef_construction: 150,
+            ef_search: 150,
+            storage: Storage::RaBitQ,
+            rerank_candidates: 50,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let index = HNSWIndex::build_parallel(base.clone(), config);
+
+        let k = 10;
+        let mut total_recall = 0.0f32;
+        for q in &queries {
+            let mut exact: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (d, i)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: HashSet<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
+
+            let got: HashSet<usize> = index
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+
+            total_recall += truth.intersection(&got).count() as f32 / k as f32;
+        }
+        let recall = total_recall / n_queries as f32;
+
+        // Measured on this exact seed/config at the time this test was written: 100%. (These
+        // are well-separated Gaussian-ish blobs at ef_search=150 for n=800 — an easy corpus,
+        // deliberately: the point of this test is to catch a broken *metric*, and a
+        // discriminating-power check confirms it does. With the traversal kernel sabotaged to
+        // return a constant (carrying zero information), recall on this exact test collapsed
+        // to 7% — so the floor below is not a rubber stamp, and 0.75 leaves a wide margin
+        // below the real 100% for run-to-run noise without coming anywhere near the ~7% a
+        // broken kernel produces. See `lesson_untested_public_options`: a floor equal to the
+        // measurement is not a regression test, it is a coin flip against float
+        // non-determinism.
+        assert!(
+            recall > 0.75,
+            "Storage::RaBitQ recall@{k} on clustered data = {:.1}% (held-out queries, \
+             brute-force ground truth) — below floor, traversal metric likely broken",
+            recall * 100.0,
+        );
+    }
+
+    /// `rerank_candidates: 0` must work: codes-only, the cold `full` array dropped entirely,
+    /// and the estimate itself used as the final ranking with no exact-distance correction.
+    /// Must not panic even though `full` stays empty for the whole life of the index.
+    #[test]
+    fn rabitq_zero_rerank_drops_full_precision_vectors_and_does_not_panic() {
+        let mut rng = StdRng::seed_from_u64(55);
+        let dim = 24;
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..320)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        let config = HNSWConfig {
+            metric: DistanceMetric::L2,
+            storage: Storage::RaBitQ,
+            rerank_candidates: 0,
+            seed: Some(3),
+            ..Default::default()
+        };
+        // `build_parallel` explicitly: it quantizes via `push_node` without ever calling
+        // `get_embedding` on quantized storage mid-build (unlike `insert_node`, which
+        // `Sequential` uses and which — like `Storage::SQ8` — assumes `full` is populated
+        // whenever it needs a candidate's embedding for neighbour selection).
+        let index = HNSWIndex::build_parallel(base.clone(), config);
+
+        assert!(
+            index.full.is_empty(),
+            "rerank_candidates = 0 must drop the full-precision side array"
+        );
+
+        for q in base.iter().step_by(37) {
+            let results = index.search(q, 5).expect("search must not panic");
+            assert_eq!(results.len(), 5);
         }
     }
 }
