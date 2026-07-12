@@ -121,6 +121,17 @@ pub struct SearchContext {
     candidates: BinaryHeap<Reverse<(OrderedFloat, usize)>>,
     /// Reusable max-heap for best results
     best: BinaryHeap<(OrderedFloat, usize)>,
+    /// Distance computations performed, cumulative until [`Self::reset_stats`].
+    ///
+    /// The unit of work an HNSW search is made of. Comparing *this* between two
+    /// implementations at matched recall separates the two ways one can be slower: doing
+    /// more work (a worse graph, or a search that stops too late) from doing the same work
+    /// more slowly (a worse inner loop, or worse latency hiding). Without it you are
+    /// guessing, and guessing is how this project shipped three false performance claims.
+    ///
+    /// faiss exposes the same counter as `hnsw_stats.ndis`; hnswlib's Python bindings do
+    /// not expose theirs.
+    distance_calls: u64,
 }
 
 impl SearchContext {
@@ -131,7 +142,19 @@ impl SearchContext {
             capacity: n,
             candidates: BinaryHeap::with_capacity(256),
             best: BinaryHeap::with_capacity(256),
+            distance_calls: 0,
         }
+    }
+
+    /// Distance computations since the last [`Self::reset_stats`]. See [`Self::distance_calls`].
+    pub fn distance_calls(&self) -> u64 {
+        self.distance_calls
+    }
+
+    /// Zero the distance counter. Not done by `reset()` — the counter is meant to
+    /// accumulate across a whole query set.
+    pub fn reset_stats(&mut self) {
+        self.distance_calls = 0;
     }
 
     /// Reset for a new search — clears bitset (~12.5 KB memset for 100K nodes)
@@ -1047,6 +1070,26 @@ impl HNSWIndex {
     ///
     /// Prefer this over measuring RSS: RSS around a build also captures the builder's
     /// transient allocations and whatever the allocator declines to return to the OS.
+    /// Mean number of layer-0 neighbours per node.
+    ///
+    /// The cost of one hop. A search performs roughly `nodes_expanded * avg_degree` distance
+    /// computations, so this is half of the "how much work does a query do" equation — and it
+    /// is a property of the *graph*, fixed at build time, not of the search.
+    ///
+    /// Worth checking against the competition: at matched recall on SIFT1M, foxstash performs
+    /// ~32% more distance computations per query than faiss while being ~15% *faster* per
+    /// computation. Work per query, not speed per unit of work, is where the remaining gap
+    /// lives, and out-degree is the first place to look for it.
+    pub fn avg_degree_l0(&self) -> f32 {
+        if self.is_empty() {
+            return 0.0;
+        }
+        let total: usize = (0..self.len())
+            .map(|i| self.get_neighbors_l0(i).len())
+            .sum();
+        total as f32 / self.len() as f32
+    }
+
     pub fn memory_breakdown(&self) -> MemoryBreakdown {
         let vec_header = std::mem::size_of::<Vec<u32>>();
 
@@ -1237,6 +1280,7 @@ impl HNSWIndex {
         // Initialize with entry points
         for &ep in entry_points {
             let dist = self.distance_to_node(query, ep, query_norm);
+            ctx.distance_calls += 1;
             ctx.candidates.push(Reverse((OrderedFloat(dist), ep)));
             ctx.best.push((OrderedFloat(dist), ep));
             ctx.mark_visited(ep);
@@ -1310,6 +1354,7 @@ impl HNSWIndex {
                     if !ctx.is_visited(neighbor_id) {
                         ctx.mark_visited(neighbor_id);
                         let dist = self.distance_to_node(query, neighbor_id, query_norm);
+                        ctx.distance_calls += 1;
                         if batch_count < batch_buf.len() {
                             batch_buf[batch_count] = (dist, neighbor_id);
                             batch_count += 1;
@@ -1605,7 +1650,7 @@ impl HNSWIndex {
         let mut layers: Vec<Vec<UpperNode>> = vec![Vec::new(); top.0];
 
         // Search pool for thread-local state reuse
-        let pool = SearchPool::new(n, config.metric);
+        let pool = SearchPool::new(n, config.metric, config.keep_pruned_connections);
 
         // Process batches from top to bottom
         for (batch, range) in ranges {
@@ -1669,6 +1714,7 @@ impl HNSWIndex {
         top: LayerId,
     ) {
         let metric = pool.metric;
+        let keep_pruned = pool.keep_pruned;
         let mut search = pool.pop();
         search.visited.reserve(points.len());
 
@@ -1708,7 +1754,8 @@ impl HNSWIndex {
         // poorly bridged and tanks recall on structured data. The heuristic keeps
         // a diverse neighbor set so search can cross cluster boundaries — matching
         // the sequential build path.
-        let found = Self::par_select_heuristic(metric, search.select_simple(), points, M0_MAX);
+        let found =
+            Self::par_select_heuristic(metric, search.select_simple(), points, M0_MAX, keep_pruned);
 
         // Add connections: new node → neighbors (in zero layer)
         {
@@ -1720,7 +1767,7 @@ impl HNSWIndex {
 
         // Add reverse connections: neighbors → new node (bidirectional)
         for candidate in found.iter().take(M0_MAX) {
-            Self::add_reverse_connection(metric, zero, points, new, candidate.pid);
+            Self::add_reverse_connection(metric, zero, points, new, candidate.pid, keep_pruned);
         }
 
         pool.push(search);
@@ -1728,16 +1775,24 @@ impl HNSWIndex {
 
     /// Algorithm-4 diversity neighbor selection for the parallel build path.
     ///
-    /// `sorted` must be ascending by distance to the new point (as produced by
-    /// the search's `nearest` list). Mirrors the sequential `select_neighbors`
-    /// with `keep_pruned_connections = true`: keep a candidate only if it is
-    /// closer to the new point than to any already-selected neighbor, then
-    /// backfill from the pruned candidates (closest first) to reach `m`.
+    /// `sorted` must be ascending by distance to the new point (as produced by the search's
+    /// `nearest` list). Keep a candidate only if it is closer to the new point than to any
+    /// already-selected neighbour — that is, drop the ones sitting "behind" a node we have
+    /// already taken.
+    ///
+    /// `keep_pruned` then optionally backfills to `m` from the rejected candidates. Note what
+    /// that does: it puts back exactly the neighbours the heuristic just decided were
+    /// redundant, which drives every node to the maximum degree `m` and undoes the pruning.
+    /// This backfill used to be unconditional here — the config flag was named in a comment
+    /// and never read — so the parallel builder (the default) saturated every node to `m0=64`
+    /// while faiss, at the same `M`, averages 25. Every hop then scans 2.5x more neighbours,
+    /// which is where foxstash's extra ~32% of distance computations per query came from.
     fn par_select_heuristic(
         metric: DistanceMetric,
         sorted: &[Candidate],
         points: &[Vec<f32>],
         m: usize,
+        keep_pruned: bool,
     ) -> Vec<Candidate> {
         let mut selected: Vec<Candidate> = Vec::with_capacity(m);
         for &cand in sorted {
@@ -1756,9 +1811,7 @@ impl HNSWIndex {
             }
         }
 
-        // keep_pruned_connections: backfill to `m` with the closest remaining
-        // candidates so node degree stays high enough for connectivity.
-        if selected.len() < m {
+        if keep_pruned && selected.len() < m {
             for &cand in sorted {
                 if selected.len() >= m {
                     break;
@@ -1773,12 +1826,14 @@ impl HNSWIndex {
 
     /// Add reverse connection from neighbor to new node, maintaining SORTED order by distance
     /// This is critical: UpperNode::from_zero takes the first M entries, so they must be the M closest
+    #[allow(clippy::too_many_arguments)]
     fn add_reverse_connection(
         metric: DistanceMetric,
         zero: &[RwLock<ZeroNode>],
         points: &[Vec<f32>],
         new: PointId,
         neighbor: PointId,
+        keep_pruned: bool,
     ) {
         let mut node = zero[neighbor.as_usize()].write();
         let neighbor_point = &points[neighbor.as_usize()];
@@ -1830,12 +1885,13 @@ impl HNSWIndex {
             })
             .collect();
         cands.sort_unstable();
-        let selected = Self::par_select_heuristic(metric, &cands, points, M0_MAX);
+        let selected = Self::par_select_heuristic(metric, &cands, points, M0_MAX, keep_pruned);
 
-        // |cands| = M0_MAX + 1 > M0_MAX, so the heuristic returns exactly M0_MAX
-        // (diverse picks + backfill) and every slot is overwritten.
-        for (slot, cand) in node.nearest.iter_mut().zip(selected.iter()) {
-            *slot = cand.pid;
+        // Without the backfill the heuristic may return fewer than M0_MAX, so the tail must
+        // be padded: `ZeroNode::iter` stops at the first INVALID, and leaving stale ids there
+        // would resurrect neighbours we just pruned.
+        for (i, slot) in node.nearest.iter_mut().enumerate() {
+            *slot = selected.get(i).map_or(PointId(INVALID), |c| c.pid);
         }
     }
 
@@ -2287,13 +2343,17 @@ struct SearchPool {
     pool: Mutex<Vec<Search>>,
     capacity: usize,
     metric: DistanceMetric,
+    /// Whether to backfill a node's neighbour list to `m` with candidates the diversity
+    /// heuristic rejected. See `par_select_heuristic` — this used to be ignored entirely.
+    keep_pruned: bool,
 }
 
 impl SearchPool {
-    fn new(capacity: usize, metric: DistanceMetric) -> Self {
+    fn new(capacity: usize, metric: DistanceMetric, keep_pruned: bool) -> Self {
         Self {
             pool: Mutex::new(Vec::new()),
             capacity,
+            keep_pruned,
             metric,
         }
     }
@@ -2896,6 +2956,60 @@ mod tests {
     /// This asserts *recall*, not merely absence of a panic: the same refactor left a
     /// `build_l0_cache()` call that would have copied an empty nested layer 0 over the real
     /// graph, erasing every layer-0 link and failing silently with a still-"working" index.
+    #[test]
+    /// `keep_pruned_connections` must actually do something in **both** builders.
+    ///
+    /// It did not. The parallel builder — the default path, and the one every benchmark uses —
+    /// backfilled each node's neighbour list to `m0` unconditionally: the config flag was named
+    /// in a comment above the backfill and never read. So the Algorithm-4 diversity heuristic
+    /// ran, correctly pruned, and had its output immediately refilled with the exact candidates
+    /// it had just rejected. Every node ended up saturated at `m0` (measured: degree 64.0/64,
+    /// against faiss's 25.4 at the same M), and every hop paid for it.
+    ///
+    /// Nothing caught it because no test ever set the flag to `false` — the same DEFAULT-ONLY
+    /// blind spot that let `BuildStrategy::Sequential` panic on every input for a release.
+    /// A flag that is only ever exercised at its default is not tested, it is assumed.
+    #[test]
+    fn keep_pruned_connections_controls_graph_density_in_both_builders() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let centers: Vec<Vec<f32>> = (0..12)
+            .map(|_| (0..24).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..600)
+            .map(|i| {
+                let c = &centers[i % 12];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        for strategy in [BuildStrategy::Sequential, BuildStrategy::Parallel] {
+            let build = |keep: bool| {
+                HNSWIndex::build(
+                    embeddings.clone(),
+                    HNSWConfig {
+                        m: 16,
+                        m0: 32,
+                        ef_construction: 100,
+                        keep_pruned_connections: keep,
+                        build_strategy: strategy,
+                        seed: Some(3),
+                        ..Default::default()
+                    },
+                )
+            };
+
+            let dense = build(true).avg_degree_l0();
+            let sparse = build(false).avg_degree_l0();
+
+            assert!(
+                sparse < dense,
+                "{strategy:?}: keep_pruned_connections has no effect \
+                 (degree {sparse:.1} with it off vs {dense:.1} with it on) — \
+                 the flag is being ignored and the diversity heuristic's pruning is discarded"
+            );
+        }
+    }
+
     #[test]
     fn every_build_strategy_produces_a_searchable_graph() {
         // Clustered, not uniform-random: random vectors have no structure to recover, and

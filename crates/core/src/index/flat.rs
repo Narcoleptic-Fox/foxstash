@@ -702,4 +702,176 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(index.len(), 0);
     }
+
+    #[test]
+    fn test_remove_deleted_document_not_searchable() {
+        // Test that removing a document actually removes it from search results.
+        // A bug here would manifest as the removed document still being returned
+        // (e.g., if remove corrupted storage but didn't actually delete the entry).
+        let mut index = FlatIndex::new(3);
+
+        // Add three documents with different embeddings
+        let doc_keep1 = create_test_document("keep_1", vec![1.0, 0.0, 0.0]);
+        let doc_remove = create_test_document("remove_me", vec![0.9, 0.1, 0.0]);
+        let doc_keep2 = create_test_document("keep_2", vec![0.0, 1.0, 0.0]);
+
+        index.add(doc_keep1).unwrap();
+        index.add(doc_remove).unwrap();
+        index.add(doc_keep2).unwrap();
+
+        assert_eq!(index.len(), 3);
+
+        // Query should rank remove_me second (between keep_1 and keep_2)
+        let query = vec![1.0, 0.0, 0.0];
+        let results_before = index.search(&query, 3).unwrap();
+        assert_eq!(results_before.len(), 3);
+        assert_eq!(results_before[0].id, "keep_1");
+        assert_eq!(results_before[1].id, "remove_me");
+        assert_eq!(results_before[2].id, "keep_2");
+
+        // Remove the middle document
+        let removed = index.remove("remove_me");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().id, "remove_me");
+        assert_eq!(index.len(), 2);
+
+        // Search again: removed document must NOT appear
+        let results_after = index.search(&query, 3).unwrap();
+        assert_eq!(
+            results_after.len(),
+            2,
+            "Removed document should not appear in search results"
+        );
+
+        // Verify remaining documents are in correct order
+        assert_eq!(results_after[0].id, "keep_1");
+        assert_eq!(results_after[1].id, "keep_2");
+
+        // Double-check: no result should have id "remove_me"
+        for result in &results_after {
+            assert_ne!(
+                result.id, "remove_me",
+                "Removed document appeared in results"
+            );
+        }
+    }
+
+    #[test]
+    fn test_remove_preserves_surviving_document_content() {
+        // Test that surviving documents retain their correct content after removal.
+        // A bug here would manifest if remove uses swap_remove or similar
+        // and corrupts the backing storage entry.
+        let mut index = FlatIndex::new(3);
+
+        let mut doc1 = create_test_document("doc1", vec![1.0, 0.0, 0.0]);
+        doc1.metadata = Some(serde_json::json!({"tag": "first"}));
+
+        let mut doc2 = create_test_document("doc2", vec![0.5, 0.5, 0.0]);
+        doc2.metadata = Some(serde_json::json!({"tag": "second"}));
+
+        let mut doc3 = create_test_document("doc3", vec![0.0, 1.0, 0.0]);
+        doc3.metadata = Some(serde_json::json!({"tag": "third"}));
+
+        index.add(doc1).unwrap();
+        index.add(doc2).unwrap();
+        index.add(doc3).unwrap();
+
+        // Remove doc2 (middle document)
+        index.remove("doc2").unwrap();
+        assert_eq!(index.len(), 2);
+
+        // Search with query close to doc1
+        let query = vec![1.0, 0.0, 0.0];
+        let results = index.search(&query, 10).unwrap();
+
+        // Verify doc1 is returned with correct content and metadata
+        let doc1_result = results
+            .iter()
+            .find(|r| r.id == "doc1")
+            .expect("doc1 not found");
+        assert_eq!(doc1_result.content, "Test document doc1");
+        assert!(doc1_result.metadata.is_some());
+        assert_eq!(
+            doc1_result.metadata.as_ref().unwrap().get("tag").unwrap(),
+            "first"
+        );
+
+        // Verify doc3 is returned with correct content and metadata
+        let doc3_result = results
+            .iter()
+            .find(|r| r.id == "doc3")
+            .expect("doc3 not found");
+        assert_eq!(doc3_result.content, "Test document doc3");
+        assert!(doc3_result.metadata.is_some());
+        assert_eq!(
+            doc3_result.metadata.as_ref().unwrap().get("tag").unwrap(),
+            "third"
+        );
+
+        // Verify doc2 does NOT appear
+        assert!(
+            results.iter().find(|r| r.id == "doc2").is_none(),
+            "Removed doc2 should not appear"
+        );
+    }
+
+    #[test]
+    fn test_remove_last_remaining_document() {
+        // Test the edge case of removing the only document in the index.
+        let mut index = FlatIndex::new(3);
+        let doc = create_test_document("only", vec![1.0, 0.0, 0.0]);
+        index.add(doc).unwrap();
+
+        assert_eq!(index.len(), 1);
+        assert!(!index.is_empty());
+
+        let removed = index.remove("only");
+        assert!(removed.is_some());
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
+
+        // Search on empty index should return no results
+        let results = index.search(&vec![1.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_in_sequence_maintains_index() {
+        // Test removing multiple documents sequentially to verify
+        // the index remains consistent.
+        let mut index = FlatIndex::new(3);
+
+        // Add 5 documents with distinct, clustered embeddings
+        for i in 0..5 {
+            let embedding = vec![i as f32, 0.1, 0.1];
+            index
+                .add(create_test_document(&format!("doc{}", i), embedding))
+                .unwrap();
+        }
+        assert_eq!(index.len(), 5);
+
+        // Remove docs 1 and 3
+        index.remove("doc1").unwrap();
+        index.remove("doc3").unwrap();
+        assert_eq!(index.len(), 3);
+
+        // Search query near doc0
+        let query = vec![0.0, 0.1, 0.1];
+        let results = index.search(&query, 10).unwrap();
+
+        // Should only find doc0, doc2, doc4
+        assert_eq!(results.len(), 3);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"doc0"));
+        assert!(ids.contains(&"doc2"));
+        assert!(ids.contains(&"doc4"));
+        assert!(!ids.contains(&"doc1"));
+        assert!(!ids.contains(&"doc3"));
+
+        // Verify all remaining docs are searchable and return correct content
+        for result in &results {
+            let expected_content = format!("Test document {}", result.id);
+            assert_eq!(result.content, expected_content);
+        }
+    }
 }

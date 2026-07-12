@@ -15,7 +15,7 @@
 //! - Functions are marked with inline hints for small vectors
 //! - Efficient iterator usage for auto-vectorization
 //! - Minimal allocations and cache-friendly access patterns
-//! - SIMD acceleration with runtime CPU detection (3-4x speedup)
+//! - SIMD acceleration with runtime CPU detection
 //!
 //! # SIMD Acceleration
 //!
@@ -68,7 +68,7 @@ pub use simd::{
 ///
 /// This function uses runtime CPU detection to choose the fastest available
 /// implementation. On x86_64 with AVX2 or ARM with NEON, it uses SIMD
-/// acceleration for 3-4x speedup. Otherwise, it falls back to scalar operations.
+/// instructions. Otherwise, it falls back to scalar operations.
 ///
 /// # Arguments
 ///

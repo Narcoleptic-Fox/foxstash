@@ -43,20 +43,23 @@
 //!
 //! # Memory Comparison (1M vectors × 384 dims)
 //!
-//! | Index Type | Memory | Recall@10 (SIFT10K, pool=100) |
-//! |------------|--------|-------------------------------|
-//! | Full f32   | 1.5 GB | 100% baseline                 |
-//! | SQ8        | 384 MB | 100.0%                        |
-//! | RaBitQ     | 48 MB  | 73.2%                         |
-//! | Binary     | 48 MB  | 1.2% — deprecated, see below  |
+//! | Index Type | Memory | Traversal reads          | Rerank            |
+//! |------------|--------|---------------------------|--------------------|
+//! | Full f32   | 1.5 GB | full vector per node visit | n/a (already exact) |
+//! | SQ8        | 384 MB | 1-byte/dim code per visit | `search_and_rerank` against retained f32 |
+//! | RaBitQ     | 48 MB  | 1-bit/dim code per visit  | `search_and_rerank` against retained f32 |
+//! | Binary     | 48 MB  | 1-bit/dim code per visit  | deprecated, see below |
 //!
-//! Recall figures are measured, not estimated: `cargo run --release -p foxstash-benches
-//! --example quantizer_sift` (10k vectors, 128d, 1000 queries, top-10, rerank pool=100,
-//! ground truth shipped with the dataset).
+//! SQ8 and RaBitQ both traverse the graph on their compressed code only — the retained
+//! full-precision vector, if any, is never touched during traversal, only during the
+//! rerank pass over the final candidate pool. Recall for either depends on the rerank
+//! pool size and is not asserted here; measure it with `cargo run --release -p
+//! foxstash-benches --example quantizer_sift` before relying on a number, per this
+//! repo's history of stale benchmark claims (see `benchmarks/RESULTS.md`).
 //!
-//! Binary's 1.2% is not a typo. Its zero threshold sets every bit on non-negative data
-//! (SIFT, and any ReLU-activated embedding), collapsing every code to all-ones. At the
-//! same 32x compression RaBitQ centers the data and reaches 73.2%.
+//! Binary is deprecated regardless of pool size: its zero threshold sets every bit on
+//! non-negative data (SIFT, and any ReLU-activated embedding), collapsing every code to
+//! all-ones, so the coarse stage it feeds into carries no signal.
 
 use crate::vector::quantize::{
     BinaryQuantizedVector, BinaryQuantizer, Quantizer, ScalarQuantizedVector, ScalarQuantizer,
@@ -78,7 +81,22 @@ pub struct QuantizedHNSWConfig {
     /// Size of the dynamic candidate list during construction
     pub ef_construction: usize,
     /// Size of the dynamic candidate list during search
+    ///
+    /// This bounds the coarse (quantized-code) traversal, matching
+    /// [`HNSWConfig`](super::hnsw::HNSWConfig)'s default so the two index families are
+    /// tuned comparably rather than one silently exploring a smaller candidate set.
     pub ef_search: usize,
+    /// Candidate pool size for the rerank stage (`search_and_rerank`), on index variants
+    /// that support one.
+    ///
+    /// This is a separate knob from `ef_search`: `ef_search` bounds how far the *coarse*
+    /// traversal looks, `rerank_candidates` bounds how many of those coarse hits get
+    /// rescored against full-precision vectors. A larger pool costs more exact-distance
+    /// computations at rerank time — each one touches a full-precision vector, spending
+    /// back some of the DRAM traffic the compressed traversal saved — but a pool smaller
+    /// than the true top-k's rank under the coarse metric will silently drop correct
+    /// results before rerank ever sees them.
+    pub rerank_candidates: usize,
     /// Normalization factor for level generation
     pub ml: f32,
 }
@@ -90,7 +108,8 @@ impl Default for QuantizedHNSWConfig {
             m,
             m0: m * 2,
             ef_construction: 200,
-            ef_search: 50,
+            ef_search: 100,
+            rerank_candidates: 100,
             ml: 1.0 / (m as f32).ln(),
         }
     }
@@ -106,14 +125,22 @@ struct SQ8Node {
     id: String,
     content: String,
     quantized: ScalarQuantizedVector,
+    /// Optional full-precision vector for `search_and_rerank`. Graph traversal
+    /// (`search_layer`, `select_neighbors`, `insert_node`) never reads this field — only
+    /// `quantized` — so its presence does not add to the bytes touched per node visit.
+    full_precision: Option<Vec<f32>>,
     metadata: Option<serde_json::Value>,
     connections: Vec<HashSet<usize>>,
 }
 
 /// HNSW index with scalar quantization (SQ8)
 ///
-/// Stores vectors as u8 (4x compression) while maintaining high recall.
-/// Supports asymmetric search (full precision query vs quantized database).
+/// Stores vectors as u8 (4x compression). Graph traversal reads only the quantized
+/// code, so a node visit moves 4x fewer bytes than a full-precision `HNSWIndex` visit.
+/// [`SQ8HNSWIndex::search`] scores the traversal's output with the asymmetric distance
+/// (full-precision query vs quantized database) directly; for a candidate pool rescored
+/// against retained full-precision vectors, use
+/// [`SQ8HNSWIndex::add_with_full_precision`] and [`SQ8HNSWIndex::search_and_rerank`].
 ///
 /// # Example
 ///
@@ -135,6 +162,32 @@ struct SQ8Node {
 ///
 /// // Search
 /// let results = index.search(&vec![0.1; 384], 5).unwrap();
+/// ```
+///
+/// # Two-phase search
+///
+/// ```
+/// use foxstash_core::index::hnsw_quantized::{SQ8HNSWIndex, QuantizedHNSWConfig};
+/// use foxstash_core::Document;
+///
+/// let dim = 8;
+/// let training: Vec<Vec<f32>> = (0..32)
+///     .map(|i| (0..dim).map(|d| ((i + d) % 5) as f32).collect())
+///     .collect();
+///
+/// let mut index = SQ8HNSWIndex::fit(&training, QuantizedHNSWConfig::default());
+/// for (i, v) in training.iter().enumerate() {
+///     index.add_with_full_precision(Document {
+///         id: format!("doc{}", i),
+///         content: format!("Content {}", i),
+///         embedding: v.clone(),
+///         metadata: None,
+///     }).unwrap();
+/// }
+///
+/// // Compressed traversal (100 candidates) -> exact rerank (top 2)
+/// let results = index.search_and_rerank(&training[0], 100, 2).unwrap();
+/// assert!(results.len() <= 2);
 /// ```
 pub struct SQ8HNSWIndex {
     embedding_dim: usize,
@@ -170,8 +223,22 @@ impl SQ8HNSWIndex {
         Self::new(quantizer, config)
     }
 
-    /// Add a document to the index
+    /// Add a document, storing only its SQ8 code (4x compression).
+    ///
+    /// Without a retained full-precision vector, [`SQ8HNSWIndex::search_and_rerank`]
+    /// falls back to the asymmetric distance for this document instead of an exact one;
+    /// use [`SQ8HNSWIndex::add_with_full_precision`] if you want a true rerank.
     pub fn add(&mut self, document: Document) -> Result<()> {
+        self.add_inner(document, false)
+    }
+
+    /// Add a document, also retaining its full-precision vector for exact reranking via
+    /// [`SQ8HNSWIndex::search_and_rerank`].
+    pub fn add_with_full_precision(&mut self, document: Document) -> Result<()> {
+        self.add_inner(document, true)
+    }
+
+    fn add_inner(&mut self, document: Document, keep_full: bool) -> Result<()> {
         if document.embedding.len() != self.embedding_dim {
             return Err(RagError::DimensionMismatch {
                 expected: self.embedding_dim,
@@ -194,11 +261,13 @@ impl SQ8HNSWIndex {
         }
 
         let quantized = self.quantizer.quantize(&document.embedding);
+        let full_precision = keep_full.then(|| document.embedding.clone());
 
         let node = SQ8Node {
             id: document.id,
             content: document.content,
             quantized,
+            full_precision,
             metadata: document.metadata,
             connections,
         };
@@ -321,6 +390,87 @@ impl SQ8HNSWIndex {
         Ok(results)
     }
 
+    /// Two-phase search: graph traversal on SQ8 codes only for `candidates` results,
+    /// then rerank that pool by exact L2 against retained full-precision vectors and
+    /// cut to `k`.
+    ///
+    /// Traversal (`search_layer`) reads only [`SQ8Node::quantized`] — a node visit
+    /// moves the compressed code, not the full-precision vector — so the bandwidth
+    /// saving is in the walk, not the rerank. The rerank pass then pays a full-precision
+    /// read per pooled candidate, which is why `candidates` is the tradeoff: too small
+    /// and it can drop a true neighbor the coarse code ranked outside the pool; too
+    /// large and the rerank starts eating back the traversal's savings.
+    ///
+    /// Nodes added via [`SQ8HNSWIndex::add`] have no full-precision vector and fall back
+    /// to the asymmetric distance for their rerank score, so mixing the two `add`
+    /// methods will rank exact and asymmetric distances against each other. Prefer
+    /// [`SQ8HNSWIndex::add_with_full_precision`] for every document if you use this.
+    pub fn search_and_rerank(
+        &self,
+        query: &[f32],
+        candidates: usize,
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
+        if query.len() != self.embedding_dim {
+            return Err(RagError::DimensionMismatch {
+                expected: self.embedding_dim,
+                actual: query.len(),
+            });
+        }
+
+        if self.nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 1: cheap traversal on SQ8 codes only.
+        let query_quantized = self.quantizer.quantize(query);
+        let entry_point = self.entry_point.unwrap();
+        let mut current_nearest = vec![entry_point];
+
+        for layer in (1..=self.max_layer).rev() {
+            current_nearest = self.search_layer(&query_quantized, &current_nearest, 1, layer);
+        }
+
+        let ef = self.config.ef_search.max(candidates).max(k);
+        current_nearest = self.search_layer(&query_quantized, &current_nearest, ef, 0);
+        current_nearest.truncate(candidates.max(k));
+
+        // Phase 2: rerank against full precision (falls back to asymmetric distance for
+        // any node that wasn't added with a retained vector). `distance_asymmetric`
+        // returns sqrt(sum_sq) while `l2_sq` is the squared distance; square the
+        // fallback so both live on the same scale before they're sorted together.
+        let mut reranked: Vec<(f32, usize)> = current_nearest
+            .iter()
+            .map(|&node_id| {
+                let node = &self.nodes[node_id];
+                let dist = match &node.full_precision {
+                    Some(full) => l2_sq(query, full),
+                    None => {
+                        let d = self.quantizer.distance_asymmetric(query, &node.quantized);
+                        d * d
+                    }
+                };
+                (dist, node_id)
+            })
+            .collect();
+
+        reranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        reranked.truncate(k);
+
+        Ok(reranked
+            .into_iter()
+            .map(|(dist, node_id)| {
+                let node = &self.nodes[node_id];
+                SearchResult {
+                    id: node.id.clone(),
+                    content: node.content.clone(),
+                    score: 1.0 / (1.0 + dist.max(0.0)),
+                    metadata: node.metadata.clone(),
+                }
+            })
+            .collect())
+    }
+
     /// Returns number of documents in the index
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -355,8 +505,13 @@ impl SQ8HNSWIndex {
         }
 
         let vec_size = self.embedding_dim; // u8 per dimension
+        let full_size = if self.nodes[0].full_precision.is_some() {
+            self.embedding_dim * 4 // f32, only present when added via add_with_full_precision
+        } else {
+            0
+        };
         let overhead_per_node = 100; // Approximate: id, content, connections
-        self.nodes.len() * (vec_size + overhead_per_node)
+        self.nodes.len() * (vec_size + full_size + overhead_per_node)
     }
 
     fn random_level(&self) -> usize {
@@ -1482,7 +1637,7 @@ impl crate::index::VectorIndex for RaBitQHNSWIndex {
     }
 
     fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.search_and_rerank(query, self.config.ef_search.max(k), k)
+        self.search_and_rerank(query, self.config.rerank_candidates.max(k), k)
     }
 
     fn len(&self) -> usize {
@@ -1595,6 +1750,297 @@ mod tests {
             "SQ8 memory: {}, full: {}",
             memory,
             full_precision
+        );
+    }
+
+    #[test]
+    fn quantized_hnsw_config_defaults_match_full_precision_ef_search() {
+        let config = QuantizedHNSWConfig::default();
+        // Regression guard: this used to be 50, silently exploring half the candidate
+        // set that HNSWConfig's default (100) does.
+        assert_eq!(config.ef_search, 100);
+        assert!(config.rerank_candidates > 0);
+    }
+
+    #[test]
+    fn sq8_search_retrieves_exactly_on_clustered_data() {
+        // Plain `search()` (asymmetric distance, no rerank stage) on well-conditioned
+        // (roughly uniform per-dimension scale) clustered data — the fixture
+        // `sq8_search_symmetric_recall_on_heterogeneous_per_dimension_scale` exists
+        // specifically to isolate the opposite regime.
+        let dim = 32;
+        let vectors = sift_like(128, dim);
+        let mut index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
+        for (i, v) in vectors.iter().enumerate() {
+            index
+                .add(create_test_document(&format!("doc{i}"), v.clone()))
+                .unwrap();
+        }
+
+        let mut hits = 0;
+        for (i, v) in vectors.iter().enumerate() {
+            let results = index.search(v, 1).unwrap();
+            if results.first().map(|r| r.id.as_str()) == Some(format!("doc{i}").as_str()) {
+                hits += 1;
+            }
+        }
+
+        assert!(
+            hits >= 115, // >= 90% of 128; asymmetric distance is lossy (no rerank), so
+            // this is intentionally a looser bar than the rerank variant's 126/128.
+            "SQ8 plain search() self-retrieval on clustered data: {hits}/128 (expected >= 115)"
+        );
+    }
+
+    #[test]
+    fn sq8_search_and_rerank_retrieves_exactly_on_clustered_data() {
+        let dim = 32;
+        let vectors = sift_like(128, dim);
+
+        let mut index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
+        for (i, v) in vectors.iter().enumerate() {
+            index
+                .add_with_full_precision(create_test_document(&format!("doc{i}"), v.clone()))
+                .unwrap();
+        }
+        assert_eq!(index.len(), vectors.len());
+
+        // Query with vectors already in the index: the top hit must be itself. SQ8's
+        // 8-bit code carries far more signal than a 1-bit code, so self-retrieval
+        // through the coarse traversal + exact rerank should be near-perfect.
+        let mut hits = 0;
+        for (i, v) in vectors.iter().enumerate() {
+            let results = index.search_and_rerank(v, 64, 1).unwrap();
+            if results.first().map(|r| r.id.as_str()) == Some(format!("doc{i}").as_str()) {
+                hits += 1;
+            }
+        }
+
+        assert!(
+            hits >= 126, // >= 98% of 128
+            "SQ8 self-retrieval on clustered data: {hits}/128 (expected >= 126)"
+        );
+    }
+
+    #[test]
+    fn sq8_search_and_rerank_recovers_exact_top_k_when_pool_covers_index() {
+        let dim = 24;
+        let vectors = sift_like(48, dim);
+
+        let mut index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
+        for (i, v) in vectors.iter().enumerate() {
+            index
+                .add_with_full_precision(create_test_document(&format!("doc{i}"), v.clone()))
+                .unwrap();
+        }
+
+        let k = 5;
+        // A handful of held-out (non-indexed) queries, interpolated between cluster
+        // members so they don't trivially match any single stored vector.
+        let queries: Vec<Vec<f32>> = (0..8)
+            .map(|q| {
+                let a = &vectors[q * 2];
+                let b = &vectors[q * 2 + 1];
+                a.iter().zip(b).map(|(&x, &y)| (x + y) / 2.0).collect()
+            })
+            .collect();
+
+        let mut exact_hits = 0;
+        for query in &queries {
+            // Pool covers the whole index, so rerank should be free to recover the
+            // true top-k regardless of how the coarse SQ8 traversal ordered them.
+            let results = index.search_and_rerank(query, vectors.len(), k).unwrap();
+
+            let mut brute_force: Vec<(usize, f32)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, l2_sq(query, v)))
+                .collect();
+            brute_force.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let ground_truth: HashSet<String> = brute_force[..k]
+                .iter()
+                .map(|(i, _)| format!("doc{i}"))
+                .collect();
+
+            let got: HashSet<String> = results.into_iter().map(|r| r.id).collect();
+            exact_hits += ground_truth.intersection(&got).count();
+        }
+
+        // 8 queries * k=5 = 40 possible hits. Exact rerank against a full-coverage pool
+        // should recover the true top-k almost every time.
+        assert!(
+            exact_hits >= 38,
+            "SQ8 rerank recall vs brute force: {exact_hits}/40 (expected >= 38)"
+        );
+    }
+
+    #[test]
+    fn sq8_search_and_rerank_without_full_precision_falls_back_and_stays_sorted() {
+        let dim = 16;
+        let vectors = sift_like(64, dim);
+        let mut index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
+
+        // Added via plain `add`: no full-precision vector retained, so rerank must fall
+        // back to the asymmetric distance for every candidate.
+        for (i, v) in vectors.iter().enumerate() {
+            index
+                .add(create_test_document(&format!("doc{i}"), v.clone()))
+                .unwrap();
+        }
+
+        let results = index.search_and_rerank(&vectors[0], 32, 10).unwrap();
+        assert_eq!(results.len(), 10);
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].score >= pair[1].score,
+                "fallback rerank results must stay sorted by score descending"
+            );
+        }
+        // Querying with an indexed vector should still surface itself near the top even
+        // without exact rerank, since the asymmetric distance is already a close proxy.
+        assert!(results.iter().any(|r| r.id == "doc0"));
+    }
+
+    #[test]
+    fn sq8_search_and_rerank_rejects_dimension_mismatch() {
+        let vectors = sift_like(32, 16);
+        let mut index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
+        index
+            .add_with_full_precision(create_test_document("a", vectors[0].clone()))
+            .unwrap();
+
+        assert!(index.search_and_rerank(&[1.0; 8], 10, 1).is_err());
+    }
+
+    #[test]
+    fn sq8_search_and_rerank_empty_index_returns_no_results() {
+        let vectors = sift_like(16, 8);
+        let index = SQ8HNSWIndex::fit(&vectors, QuantizedHNSWConfig::default());
+
+        assert!(index.is_empty());
+        assert!(index
+            .search_and_rerank(&vectors[0], 10, 5)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Fixture with one "signal" dimension (wide range, carries all real cluster
+    /// structure) and several "noise" dimensions (near-constant range, no cluster
+    /// signal). Realistic stand-in for embeddings whose dimensions have very different
+    /// variances — common whenever features aren't independently normalized.
+    fn heterogeneous_scale_fixture(count: usize, noise_dims: usize) -> Vec<Vec<f32>> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let clusters = 8;
+        (0..count)
+            .map(|i| {
+                let cluster = i % clusters;
+                // Clusters are 120 apart on the signal dim; within-cluster noise is only
+                // +/-10, so the signal dim alone determines the true nearest neighbors.
+                let signal = cluster as f32 * 120.0 + (next() % 21) as f32;
+                let mut v = vec![signal];
+                for _ in 0..noise_dims {
+                    // Full [0, 1) range, uncorrelated with cluster — negligible real
+                    // magnitude, but consumes the same 0..255 code budget as the signal.
+                    v.push((next() % 1000) as f32 / 1000.0);
+                }
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sq8_search_symmetric_recall_on_heterogeneous_per_dimension_scale() {
+        // `distance_quantized` (ScalarQuantizer, quantize.rs) computes L2 on raw u8 codes
+        // with no per-dimension scale correction, despite `ScalarQuantizer::fit` giving
+        // each dimension an independent min/max/scale. `search_symmetric` uses it directly
+        // for the final score; `search_layer` (shared by every search method, plus
+        // `insert_node`/`select_neighbors` during construction) uses it as the traversal
+        // metric. When one dimension carries the real signal and others are
+        // near-constant, a near-constant dimension's full-range code swing can
+        // numerically dominate the signal dimension's modest code difference.
+        //
+        // Recall@k against held-out queries (not self-retrieval — querying with an
+        // indexed vector re-quantizes to that vector's own code, which trivially wins
+        // under ANY quantize-vs-quantize metric regardless of whether it's scale-correct,
+        // so self-retrieval can't isolate this bug).
+        let noise_dims = 8;
+        let all_vectors = heterogeneous_scale_fixture(160, noise_dims);
+        let (queries, corpus) = all_vectors.split_at(20);
+
+        let mut index = SQ8HNSWIndex::fit(corpus, QuantizedHNSWConfig::default());
+        for (i, v) in corpus.iter().enumerate() {
+            index
+                .add(create_test_document(&format!("doc{i}"), v.clone()))
+                .unwrap();
+        }
+
+        let k = 5;
+        let mut symmetric_hits = 0usize;
+        let mut asymmetric_hits = 0usize;
+
+        for query in queries {
+            let mut brute_force: Vec<(usize, f32)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, l2_sq(query, v)))
+                .collect();
+            brute_force.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let ground_truth: HashSet<String> = brute_force[..k]
+                .iter()
+                .map(|(i, _)| format!("doc{i}"))
+                .collect();
+
+            let symmetric: HashSet<String> = index
+                .search_symmetric(query, k)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            let asymmetric: HashSet<String> = index
+                .search(query, k)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+
+            symmetric_hits += ground_truth.intersection(&symmetric).count();
+            asymmetric_hits += ground_truth.intersection(&asymmetric).count();
+        }
+
+        let total_possible = queries.len() * k;
+        eprintln!(
+            "heterogeneous-scale recall@{k} over {} held-out queries: \
+             search_symmetric={symmetric_hits}/{total_possible} search={asymmetric_hits}/{total_possible}",
+            queries.len()
+        );
+
+        // `search`'s final rescoring with `distance_asymmetric` dequantizes before
+        // diffing, so it's per-dimension-scale-correct and should stay reliable
+        // regardless of scale heterogeneity — confirms the fixture isn't just hard to
+        // search in general.
+        assert!(
+            asymmetric_hits * 2 >= total_possible,
+            "search (asymmetric) recall unexpectedly degraded on heterogeneous-scale data: \
+             {asymmetric_hits}/{total_possible} — fixture may not isolate the bug as intended"
+        );
+
+        // Pin the bug: search_symmetric's final score has no scale correction, so it
+        // should measurably underperform search's real recall on this fixture. If this
+        // assertion ever starts failing because symmetric_hits caught up, distance_quantized
+        // has gained a scale correction and search_symmetric's doc comment should be
+        // revisited.
+        assert!(
+            symmetric_hits < asymmetric_hits,
+            "search_symmetric ({symmetric_hits}/{total_possible}) should underperform search \
+             ({asymmetric_hits}/{total_possible}) when per-dimension quantization scale is \
+             heterogeneous — if it doesn't, distance_quantized's missing scale correction may \
+             have been fixed"
         );
     }
 

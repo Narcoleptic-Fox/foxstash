@@ -1,0 +1,210 @@
+name: Benchmark Correctness Gate
+
+# Strategy: gate merges on RECALL AT SCALE, not micro-benchmark timing.
+#
+# benchmarks.yml (criterion + critcmp) times individual ops in vector_simd,
+# quantization, and embedding. It has never caught, and structurally cannot
+# catch, any of the failures that actually shipped from this codebase:
+#   - a quantizer landing at 1.1% recall (RaBitQ bug) — a correctness bug, not
+#     a timing regression. Every micro-op it calls still runs in the same time.
+#   - benchmark corpora 100x smaller than their directory name claimed — a
+#     data problem, invisible to a harness that never loads real data.
+#   - `BuildStrategy::Sequential` panicking on every input while 247 unit
+#     tests passed — `cargo test` never builds a real graph at scale.
+#   - a "1.03-1.10x faster than hnswlib" headline true on exactly one dataset
+#     small enough to fit in L3 cache — a claim about behaviour *at scale*
+#     that a 10k-vector op-level benchmark cannot represent, let alone gate.
+#
+# This workflow runs crates/benches/examples/pareto.rs against real SIFT10K
+# (5.8 MB, ~1s build — the only corpus small enough for a GitHub-hosted
+# runner; sift100k/sift1m are correct but too slow/big for CI and are
+# exercised only by benchmarks/run-scoreboard.sh on dedicated, idle-gated
+# hardware) and hard-fails the build if recall@10 at a fixed ef drops below a
+# checked-in floor. Thresholds and the reasoning behind them live in
+# benchmarks/ci-thresholds.env, not in this file, so changing them is a
+# reviewable diff.
+#
+# QPS is reported in the job summary, not gated — see the "Evaluate gate"
+# step for why a hard QPS gate on shared runners would do more harm than good.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  recall-gate:
+    name: Recall Gate (sift10k)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "bench"
+
+      # sift10k is fetched from ftp.irisa.fr, which we don't want to hit on
+      # every CI run. The key is a manual version tag, not a content hash,
+      # because the canonical TEXMEX corpus itself never changes — bump it
+      # only if the fetch/build logic below changes in a way that could
+      # produce a different sift10k/ directory.
+      - name: Cache sift10k dataset
+        id: cache-sift10k
+        uses: actions/cache@v4
+        with:
+          path: benchmarks/data/sift10k
+          key: sift10k-data-v1
+
+      # Deliberately narrower than benchmarks/fetch-data.sh: that script also
+      # pulls the 168 MB ANN_SIFT1M archive to build sift100k/sift1m, which
+      # are explicitly out of scope for CI (see workflow header). This step
+      # fetches only the small siftsmall archive that sift10k is built from.
+      - name: Fetch sift10k dataset
+        if: steps.cache-sift10k.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/data
+          cd benchmarks/data
+
+          echo "==> downloading ANN_SIFT10K"
+          curl -sS -o siftsmall.tar.gz "ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz"
+          tar xzf siftsmall.tar.gz
+          rm -f siftsmall.tar.gz
+
+          pip install --quiet numpy
+
+          python3 - <<'PY'
+          import numpy as np, os
+
+          def read_vecs(path, dtype=np.float32):
+              """TEXMEX .fvecs/.ivecs: each row is <int32 dim><dim values>."""
+              a = np.fromfile(path, dtype=np.int32)
+              d = int(a[0])
+              return a.reshape(-1, d + 1)[:, 1:].view(dtype).copy()
+
+          b = read_vecs("siftsmall/siftsmall_base.fvecs")
+          q = read_vecs("siftsmall/siftsmall_query.fvecs")
+          g = read_vecs("siftsmall/siftsmall_groundtruth.ivecs", np.int32)
+
+          os.makedirs("sift10k", exist_ok=True)
+          np.save("sift10k/base.npy", b.astype(np.float32))
+          np.save("sift10k/query.npy", q.astype(np.float32))
+          np.save("sift10k/groundtruth.npy", g.astype(np.int32))
+          print(f"    sift10k: {b.shape[0]} base x {b.shape[1]}d, {q.shape[0]} queries")
+          PY
+
+          rm -rf siftsmall
+
+      # Runs unconditionally — cached or freshly fetched — because a cache
+      # entry can go stale or get corrupted just as easily as a download can.
+      # This mirrors the check benchmarks/fetch-data.sh runs after building a
+      # corpus. `pareto` also refuses to print a table without a passing
+      # control (it asserts), but failing here first gives a clearer message
+      # than a Rust panic and avoids paying for a release build first.
+      - name: Verify sift10k dataset integrity
+        run: |
+          pip install --quiet numpy
+          python3 - <<'PY'
+          import numpy as np, sys
+
+          b = np.load("benchmarks/data/sift10k/base.npy", mmap_mode="r")
+          q = np.load("benchmarks/data/sift10k/query.npy", mmap_mode="r")
+          g = np.load("benchmarks/data/sift10k/groundtruth.npy", mmap_mode="r")
+
+          if (b.shape[0], q.shape[0]) != (10_000, 1_000):
+              sys.exit(
+                  f"sift10k: FAIL — expected 10000 base / 1000 queries, "
+                  f"got {b.shape[0]} / {q.shape[0]}"
+              )
+          if g.max() >= b.shape[0]:
+              sys.exit(
+                  f"sift10k: FAIL — ground truth indexes vector {g.max()} of a "
+                  f"{b.shape[0]}-vector base"
+              )
+
+          n = 300
+          B = np.asarray(b, dtype=np.float32)
+          Q = np.asarray(q[:n], dtype=np.float32)
+          d = (B * B).sum(1)[None, :] - 2.0 * (Q @ B.T) + (Q * Q).sum(1)[:, None]
+          top = np.argsort(d, axis=1)[:, :10]
+          hit = np.mean([len(set(top[i]) & set(g[i][:10])) / 10 for i in range(n)])
+          if hit <= 0.999:
+              sys.exit(
+                  f"sift10k: FAIL — exact-L2 control recall@10 = {hit * 100:.2f}% "
+                  f"(corpus/ground-truth mismatch)"
+              )
+          print(f"sift10k: PASS — exact-L2 control recall@10 = {hit * 100:.2f}%")
+          PY
+
+      - name: Run pareto (recall/QPS curve on sift10k)
+        run: |
+          cargo run --release -q -p foxstash-benches --example pareto -- sift10k | tee pareto-output.txt
+
+      - name: Evaluate gate
+        run: |
+          set -euo pipefail
+          # shellcheck source=benchmarks/ci-thresholds.env
+          source benchmarks/ci-thresholds.env
+
+          # pareto prints one fixed-width row per ef: "<ef> <recall>% <qps>".
+          # Pull the row for the ef this gate checks.
+          row=$(awk -v ef="$SIFT10K_EF" '$1 == ef { print; found=1 } END { exit !found }' pareto-output.txt) \
+            || { echo "::error::pareto did not print a row for ef=$SIFT10K_EF — output format changed or the run failed silently"; exit 1; }
+
+          recall=$(echo "$row" | awk '{ gsub("%","",$2); print $2 }')
+          qps=$(echo "$row" | awk '{ print $3 }')
+
+          echo "sift10k @ ef=$SIFT10K_EF: recall@10=${recall}%  qps=${qps}"
+
+          # HARD GATE. Recall regression is the failure mode that actually
+          # ships bugs here — a broken graph is fast and wrong, so timing
+          # alone never catches it. Recall on a fixed dataset/ef also depends
+          # on graph structure and search logic, not wall-clock timing, so
+          # it's comparatively insensitive to shared-runner load — unlike QPS.
+          below_recall=$(awk -v r="$recall" -v t="$SIFT10K_MIN_RECALL" 'BEGIN { print (r < t) }')
+          if [ "$below_recall" = "1" ]; then
+            echo "::error::recall@10 at ef=$SIFT10K_EF is ${recall}%, below the ${SIFT10K_MIN_RECALL}% floor (benchmarks/ci-thresholds.env)"
+            exit 1
+          fi
+
+          # ADVISORY ONLY — reported, never fails the build. GitHub-hosted
+          # runners are shared, noisy hardware: CPU steal from co-scheduled
+          # VMs and turbo-clock variance alone can move QPS 20-30% run to run
+          # on identical code. A hard QPS gate here would flap on
+          # infrastructure noise, teach contributors to ignore red CI, and
+          # eventually get disabled — worse than not having it. The QPS
+          # regressions that actually matter (the documented 0.78x-0.82x
+          # hnswlib gap at scale, see benchmarks/RESULTS.md) are only visible
+          # on sift100k/sift1m under load-controlled conditions, which is
+          # exactly what benchmarks/run-scoreboard.sh on dedicated, idle-gated
+          # hardware is for. This floor exists only to flag a catastrophic,
+          # unmistakable slowdown (e.g. an accidental O(n) scan) in the
+          # meantime.
+          below_qps=$(awk -v q="$qps" -v t="$SIFT10K_QPS_ADVISORY_FLOOR" 'BEGIN { print (q < t) }')
+          if [ "$below_qps" = "1" ]; then
+            echo "::warning::QPS at ef=$SIFT10K_EF is ${qps}, below the ${SIFT10K_QPS_ADVISORY_FLOOR} advisory floor (benchmarks/ci-thresholds.env). Not failing the build — see workflow comments."
+          fi
+
+          {
+            echo "### sift10k recall gate"
+            echo ""
+            echo "| ef | recall@10 | floor | QPS | advisory floor |"
+            echo "|---|---|---|---|---|"
+            echo "| $SIFT10K_EF | ${recall}% | ${SIFT10K_MIN_RECALL}% | $qps | $SIFT10K_QPS_ADVISORY_FLOOR |"
+            echo ""
+            echo "<details><summary>full pareto output</summary>"
+            echo ""
+            echo '```'
+            cat pareto-output.txt
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

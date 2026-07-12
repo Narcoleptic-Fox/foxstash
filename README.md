@@ -11,7 +11,7 @@ Foxstash is a local-first Retrieval-Augmented Generation (RAG) library featuring
 
 ## Features
 
-- **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with 3-4x speedup
+- **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with runtime CPU detection
 - **HNSW Indexing** - Hierarchical Navigable Small World graphs for fast similarity search
 - **Vector Quantization** - Int8 (4x), Binary (32x), and Product Quantization (192x)
 - **Hybrid Search** - Combine BM25 keyword search with vector similarity for best-of-both recall
@@ -65,7 +65,7 @@ For large datasets, use quantized indexes to reduce memory by 4-192x:
 use foxstash_core::index::{SQ8HNSWIndex, BinaryHNSWIndex, QuantizedHNSWConfig};
 use foxstash_core::Document;
 
-// Scalar Quantization (4x compression, ~95% recall)
+// Scalar Quantization (4x compression, 71.4% recall on SIFT10K)
 let mut sq8_index = SQ8HNSWIndex::for_normalized(384, QuantizedHNSWConfig::default());
 
 // Binary Quantization (32x compression, use with reranking)
@@ -428,43 +428,53 @@ foxstash/
 
 ## Benchmarks
 
-### HNSW Performance @ 100,000 Vectors
+Measured on **real SIFT**, against **hnswlib** and **faiss**, at **matched recall**,
+single-threaded. Full methodology and the 10K/100K tables:
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
-*128 dimensions, 10,000 queries, Recall@10*
+**Where Foxstash actually stands: it does not beat hnswlib.** At 1M vectors it serves
+~0.85–0.91x hnswlib's QPS at equal recall, and sits at parity with faiss. It does build 2.1x
+faster than hnswlib, and it reaches any given recall at a lower `ef` than either of them.
 
-| Library | Build Time | Search QPS | Recall |
-|---------|-----------|------------|--------|
-| **Foxstash** (batch) | **7.6s** | **13,366** | **61.0%** |
-| **Foxstash** (single-threaded) | **7.6s** | **1,322** | **61.0%** |
-| hnswlib (C++, ef=64) | 5.7s | 4,004 | 39.5% |
-| faiss-hnsw (C++, ef=64) | 8.6s | 3,139 | 44.9% |
-| instant-distance (Rust) | 73.9s | 575 | 60.2% |
+### SIFT1M — 1,000,000 x 128d, k=10, M=32, single-threaded
 
-**Key takeaways:**
-- **2.3x faster** single-threaded search than instant-distance with equivalent recall
-- **23x faster** batch search than instant-distance via rayon
-- **9.7x faster build** than instant-distance
-- hnswlib/faiss use lower `ef_search` (64 vs 100), inflating their QPS relative to Foxstash
+QPS at **matched recall** (competitor QPS interpolated along its own curve to Foxstash's recall):
 
-### Build Strategies @ 100,000 Vectors
+| recall@10 | Foxstash | hnswlib | vs hnswlib | faiss | vs faiss |
+|-----------|----------|---------|------------|-------|----------|
+| 93.0% | 10,044 | 11,787 | 0.85x | 10,961 | 0.91x |
+| 98.2% | 5,455 | 6,352 | 0.88x | 5,749 | 0.97x |
+| 99.5% | 3,267 | 3,636 | 0.91x | 3,384 | 0.98x |
 
-| Strategy | Build Time | Search QPS | Recall | Use Case |
-|----------|-----------|------------|--------|----------|
-| Sequential | 541s | 1,274 | 58.8% | Maximum quality |
-| **Parallel** | **7.6s** | **1,322** | **61.0%** | Production (71x faster) |
+| | Foxstash | hnswlib | faiss |
+|---|---|---|---|
+| build, all cores | **167 s** | 342 s | 78 s |
+| index size | 947 MB | ~776 MB | ~776 MB |
 
-### Running Benchmarks
+### Reproduce
 
 ```bash
-# Full benchmark suite (sets up Python venv automatically)
-./scripts/bench.sh
-
-# Or run individually:
-cargo run -p foxstash-benches --example quick_comparison --release
-cargo run -p foxstash-benches --example compare_strategies --release
+benchmarks/fetch-data.sh        # canonical TEXMEX SIFT; verifies an exact-L2 control per corpus
+benchmarks/run-scoreboard.sh    # Foxstash vs hnswlib vs faiss, serialized behind an idle gate
 ```
 
-See `crates/benches/` for benchmark implementations.
+### Four ways to get this wrong — every one of which this project got wrong
+
+1. **Compare at matched recall, not matched `ef`.** `ef` is a knob, and implementations reach
+   a given recall at different settings of it. A fixed-`ef` table measures nothing.
+2. **Count the threads.** hnswlib's `knn_query` defaults to `num_threads=-1` — *every core*.
+   Timing that against a single-threaded loop produced an "11x slower" claim here that was
+   pure artifact.
+3. **Never run two benchmarks at once.** A concurrent build halved hnswlib's apparent QPS on
+   this machine.
+4. **Never benchmark on synthetic vectors.** Random vectors have no cluster structure, so
+   *every* ANN collapses to ~60% recall on them regardless of quality. The table that used to
+   sit here reported hnswlib at **39.5% recall** — on real SIFT it scores ~99%. That table
+   flattered Foxstash, and it hid a quantizer bug (1.2% real recall) for an entire release.
+
+And do not compare recall across datasets: on SIFT10K the 100th neighbour is only 4.7%
+further from the query than the 10th, so the true top-10 hides in a near-tie shell. Every
+index scores far better on SIFT100K because the task is easier, not because it improved.
 
 ## Roadmap
 

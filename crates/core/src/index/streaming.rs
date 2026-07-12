@@ -872,4 +872,134 @@ mod tests {
             .apply(results);
         assert_eq!(filtered.len(), 1);
     }
+
+    #[test]
+    fn test_pagination_config_builder() {
+        // Test that PaginationConfig builder methods actually set values
+        // (this verifies the builder is not a no-op)
+        let config = PaginationConfig::default().with_page_size(25);
+
+        assert_eq!(config.page_size, 25);
+        assert_eq!(config.oversample, 2.0); // Default should remain
+
+        let config2 = PaginationConfig {
+            page_size: 50,
+            oversample: 1.5,
+        };
+        assert_eq!(config2.page_size, 50);
+        assert_eq!(config2.oversample, 1.5);
+    }
+
+    #[test]
+    fn test_pagination_custom_page_size_affects_boundaries() {
+        // Test that non-default page_size actually affects pagination boundaries.
+        // This is critical: if page_size is ignored, this test fails.
+        let total_results: Vec<SearchResult> = (0..50)
+            .map(|i| SearchResult {
+                id: format!("doc{}", i),
+                content: format!("Content {}", i),
+                score: 1.0 - (i as f32 * 0.01),
+                metadata: None,
+            })
+            .collect();
+
+        // Test with page_size=10 (default-ish)
+        let page0_size10 = SearchPage::from_results(total_results.clone(), 0, 10);
+        assert_eq!(page0_size10.results.len(), 10);
+        assert_eq!(page0_size10.total_pages, 5); // 50 / 10 = 5
+
+        // Test with page_size=25
+        let page0_size25 = SearchPage::from_results(total_results.clone(), 0, 25);
+        assert_eq!(page0_size25.results.len(), 25);
+        assert_eq!(page0_size25.total_pages, 2); // 50 / 25 = 2
+
+        // Test with page_size=7
+        let page0_size7 = SearchPage::from_results(total_results.clone(), 0, 7);
+        assert_eq!(page0_size7.results.len(), 7);
+        assert_eq!(page0_size7.total_pages, 8); // ceil(50 / 7) = 8
+
+        // Verify page boundaries for size=25
+        let page1_size25 = SearchPage::from_results(total_results.clone(), 1, 25);
+        assert_eq!(page1_size25.results.len(), 25);
+        assert_eq!(page1_size25.results[0].id, "doc25"); // Should start at index 25
+        assert_eq!(page1_size25.results[24].id, "doc49"); // Should end at index 49
+
+        // Verify has_next/has_prev flags with different page sizes
+        assert!(page0_size25.has_next);
+        assert!(!page0_size25.has_prev);
+        assert!(!page1_size25.has_next);
+        assert!(page1_size25.has_prev);
+    }
+
+    #[test]
+    fn test_pagination_with_different_page_sizes_no_gaps() {
+        // Test that pagination with different page sizes yields no duplicate
+        // or dropped results when reassembling all pages.
+        let results: Vec<SearchResult> = (0..33)
+            .map(|i| SearchResult {
+                id: format!("item_{}", i),
+                content: format!("Item {}", i),
+                score: 1.0 - (i as f32 * 0.01),
+                metadata: None,
+            })
+            .collect();
+
+        // Collect all items via page_size=10
+        let mut all_via_10 = Vec::new();
+        let page0_10 = SearchPage::from_results(results.clone(), 0, 10);
+        let page1_10 = SearchPage::from_results(results.clone(), 1, 10);
+        let page2_10 = SearchPage::from_results(results.clone(), 2, 10);
+        let page3_10 = SearchPage::from_results(results.clone(), 3, 10);
+
+        all_via_10.extend(page0_10.results.iter().map(|r| r.id.clone()));
+        all_via_10.extend(page1_10.results.iter().map(|r| r.id.clone()));
+        all_via_10.extend(page2_10.results.iter().map(|r| r.id.clone()));
+        all_via_10.extend(page3_10.results.iter().map(|r| r.id.clone()));
+
+        // Collect all items via page_size=15
+        let mut all_via_15 = Vec::new();
+        let page0_15 = SearchPage::from_results(results.clone(), 0, 15);
+        let page1_15 = SearchPage::from_results(results.clone(), 1, 15);
+        let page2_15 = SearchPage::from_results(results.clone(), 2, 15);
+
+        all_via_15.extend(page0_15.results.iter().map(|r| r.id.clone()));
+        all_via_15.extend(page1_15.results.iter().map(|r| r.id.clone()));
+        all_via_15.extend(page2_15.results.iter().map(|r| r.id.clone()));
+
+        // Both should contain the same 33 items in the same order
+        assert_eq!(all_via_10.len(), 33);
+        assert_eq!(all_via_15.len(), 33);
+        assert_eq!(
+            all_via_10, all_via_15,
+            "Pagination with different page sizes should yield identical results"
+        );
+    }
+
+    #[test]
+    fn test_pagination_config_oversample_field_exists() {
+        // Test that the oversample field can be set and retrieved.
+        // This ensures the field is not dead code and participates in the struct.
+        let config = PaginationConfig {
+            page_size: 10,
+            oversample: 3.5,
+        };
+
+        assert_eq!(config.oversample, 3.5);
+
+        // Test default oversample value
+        let default_config = PaginationConfig::default();
+        assert_eq!(default_config.oversample, 2.0);
+
+        // Verify oversample can be different for different instances
+        let config_low = PaginationConfig {
+            page_size: 10,
+            oversample: 1.0,
+        };
+        let config_high = PaginationConfig {
+            page_size: 10,
+            oversample: 5.0,
+        };
+
+        assert_ne!(config_low.oversample, config_high.oversample);
+    }
 }

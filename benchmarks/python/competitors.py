@@ -21,10 +21,18 @@ import hnswlib
 import numpy as np
 
 K = 10
-M = 32
+M_SWEEP = [16, 32]
 EF_CONSTRUCTION = 200
 EF_SWEEP = [10, 20, 50, 100, 200, 500]
 CONTROL_N = 200
+
+# Sweep M on EVERY library, not just ours.
+#
+# Lowering the graph degree improves foxstash's recall-per-distance-computation. It very
+# likely does the same for hnswlib and faiss. Tuning our own M while pinning theirs at a
+# default would manufacture a win — which is precisely the class of error that produced this
+# repo's earlier false headlines. The honest comparison is each library's own Pareto
+# frontier: for every library, the best QPS it can reach at a given recall, over all M.
 
 
 def load(name):
@@ -50,10 +58,10 @@ def control(base, query, truth):
     return recall_at(got, truth[:CONTROL_N])
 
 
-def bench_hnswlib(base, query, truth):
+def bench_hnswlib(base, query, truth, m):
     n, dim = base.shape
     idx = hnswlib.Index(space="l2", dim=dim)
-    idx.init_index(max_elements=n, ef_construction=EF_CONSTRUCTION, M=M)
+    idx.init_index(max_elements=n, ef_construction=EF_CONSTRUCTION, M=m)
     idx.set_num_threads(-1)                       # build: use every core, like foxstash
     t = time.perf_counter()
     idx.add_items(base, np.arange(n))
@@ -71,10 +79,10 @@ def bench_hnswlib(base, query, truth):
     return build, rows
 
 
-def bench_faiss_hnsw(base, query, truth):
+def bench_faiss_hnsw(base, query, truth, m):
     n, dim = base.shape
     faiss.omp_set_num_threads(8)
-    idx = faiss.IndexHNSWFlat(dim, M)
+    idx = faiss.IndexHNSWFlat(dim, m)
     idx.hnsw.efConstruction = EF_CONSTRUCTION
     t = time.perf_counter()
     idx.add(base)
@@ -96,7 +104,7 @@ def main():
     name = sys.argv[1] if len(sys.argv) > 1 else "sift10k"
     base, query, truth = load(name)
     print(f"{name} — {base.shape[0]} base x {base.shape[1]}d, {len(query)} queries")
-    print(f"single-threaded search, k={K}, M={M}, ef_construction={EF_CONSTRUCTION}\n")
+    print(f"single-threaded search, k={K}, ef_construction={EF_CONSTRUCTION}, M swept over {M_SWEEP}\n")
 
     c = control(base, query, truth)
     print(f"exact control (brute force, {CONTROL_N} queries): {c*100:.2f}%  "
@@ -105,12 +113,13 @@ def main():
         sys.exit(1)
 
     for label, fn in [("hnswlib", bench_hnswlib), ("faiss-HNSW", bench_faiss_hnsw)]:
-        build, rows = fn(base, query, truth)
-        print(f"\n=== {label} ===  build: {build:.1f}s")
-        print(f"{'ef':>6} {'recall@10':>11} {'QPS':>10}")
-        print("-" * 30)
-        for ef, r, qps in rows:
-            print(f"{ef:>6} {r:>10.2f}% {qps:>10.0f}")
+        for m in M_SWEEP:
+            build, rows = fn(base, query, truth, m)
+            print(f"\n=== {label}  M={m} ===  build: {build:.1f}s")
+            print(f"{'ef':>6} {'recall@10':>11} {'QPS':>10}")
+            print("-" * 30)
+            for ef, r, qps in rows:
+                print(f"{ef:>6} {r:>10.2f}% {qps:>10.0f}")
 
 
 if __name__ == "__main__":

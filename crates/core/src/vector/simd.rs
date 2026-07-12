@@ -6,8 +6,8 @@
 //!
 //! # Performance
 //!
-//! SIMD implementations provide 3-4x speedup over scalar operations for typical
-//! embedding dimensions (384, 768, 1024). The exact speedup depends on:
+//! SIMD implementations use AVX2, SSE, or NEON vector instructions depending on
+//! platform and runtime CPU detection. Performance depends on:
 //! - Vector length (longer vectors benefit more)
 //! - CPU architecture and SIMD support
 //! - Memory alignment and cache behavior

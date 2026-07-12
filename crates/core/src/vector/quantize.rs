@@ -3,8 +3,12 @@
 //! This module provides quantization methods to reduce memory footprint while
 //! maintaining acceptable search quality:
 //!
-//! - **Scalar Quantization (SQ8)**: f32 → i8 (4x compression, ~95% recall)
-//! - **Binary Quantization (BQ)**: f32 → bit (32x compression, ~85% recall)
+//! - **Scalar Quantization (SQ8)**: f32 → i8 (4x compression, 71.4% recall)
+//! - **Binary Quantization (BQ)**: f32 → bit (32x compression, 1.2% recall — deprecated)
+//!
+//! Note: SQ8 recall measured on SIFT10K (benchmarks/RESULTS.md). Binary's zero threshold
+//! collapses all codes to all-ones on non-negative embeddings (SIFT, ReLU activations),
+//! resulting in degenerate 1.2% recall; use RaBitQHNSWIndex instead for 32x compression.
 //!
 //! # Memory Comparison (1M vectors × 384 dims)
 //!
