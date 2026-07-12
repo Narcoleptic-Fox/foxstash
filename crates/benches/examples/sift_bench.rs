@@ -13,7 +13,7 @@
 //! wrong and every other row is void.
 
 use foxstash_benches::sift::{l2_sq, Dataset};
-use foxstash_core::index::hnsw::{BuildStrategy, HNSWConfig, HNSWIndex};
+use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex};
 use foxstash_core::index::hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
 use foxstash_core::Document;
 use serde_json::json;
@@ -126,13 +126,50 @@ fn main() {
         "Brute force control (must be 100% recall)",
     ));
 
-    // ---- HNSW, full precision ----
+    // ---- HNSW L2: the row that is actually comparable to faiss/hnswlib ----
     //
-    // HNSWIndex ranks by `1 - cosine_similarity`, but SIFT's ground truth is exact L2 and
-    // its vector magnitudes vary by 1.4x, so the two metrics genuinely disagree. Scoring
-    // this index against the L2 key measures the metric gap, not the graph. We report
-    // both: recall vs cosine truth (does the graph work?) and vs L2 truth (is it usable
-    // on a standard L2 benchmark?).
+    // SIFT's ground truth is exact L2. Until DistanceMetric existed, HNSWIndex was
+    // cosine-only and could not be scored against it at all (it read ~55%, measuring the
+    // metric gap rather than the graph). This row is the apples-to-apples comparison.
+    // Swept over ef_search so the recall/QPS tradeoff is visible, and so the comparison
+    // against hnswlib (whose best row uses ef=500) is at matching effort rather than
+    // matching only in name.
+    for ef in [100usize, 200, 500] {
+        eprintln!("[2/7] hnsw-l2 (ef_search={ef})");
+        let l2_config = HNSWConfig {
+            metric: DistanceMetric::L2,
+            m: 32,
+            m0: 64,
+            ef_construction: 200,
+            ef_search: ef,
+            build_strategy: BuildStrategy::Parallel,
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let l2_index = HNSWIndex::build_parallel(ds.base.clone(), l2_config);
+        let l2_build = t.elapsed().as_secs_f64();
+        let l2_r10 = ds.recall_at(10, |q| ids(l2_index.search(q, 10).unwrap()));
+        let l2_r100 = ds.recall_at(100, |q| ids(l2_index.search(q, 100).unwrap()));
+        let l2_qps = measure_qps(&ds, 10, |q| ids(l2_index.search(q, 10).unwrap()));
+        out.push(record(
+            &format!("hnsw-l2 (ef={ef})"),
+            &ds,
+            l2_build,
+            (ds.base.len() * dim * 4) as f64 / 1e6,
+            l2_r10,
+            l2_r100,
+            l2_qps,
+            json!({ "m": 32, "ef_construction": 200, "ef_search": ef,
+                    "metric": "L2", "build": "parallel" }),
+            "Full precision, L2 metric. Directly comparable to faiss/hnswlib on SIFT's L2 \
+             ground truth.",
+        ));
+    }
+
+    // ---- HNSW cosine, for reference ----
+    //
+    // Scored against a brute-forced COSINE ground truth, which is the fair question for a
+    // cosine index. Not comparable to the L2 rows above — different question entirely.
     eprintln!("      computing cosine ground truth (brute force)...");
     let cos_truth = ds.cosine_truth(100);
 
@@ -265,7 +302,7 @@ fn main() {
     println!("{:-<64}", "");
     for r in &out {
         println!(
-            "{:<16} {:>9.1}% {:>9.1}% {:>11.2} {:>10.0}",
+            "{:<20} {:>9.1}% {:>9.1}% {:>11.2} {:>10.0}",
             r["algorithm"].as_str().unwrap(),
             r["recall_at_10"].as_f64().unwrap() * 100.0,
             r["recall_at_100"].as_f64().unwrap() * 100.0,

@@ -175,6 +175,14 @@ pub enum BuildStrategy {
 /// Configuration for HNSW index
 #[derive(Debug, Clone)]
 pub struct HNSWConfig {
+    /// Distance metric used for both construction and search.
+    ///
+    /// Defaults to [`DistanceMetric::Cosine`] for backward compatibility. Set
+    /// [`DistanceMetric::L2`] to run against Euclidean benchmarks and datasets —
+    /// SIFT, GIST and Deep1B are all L2, and a cosine index scores ~55% against
+    /// their ground truth purely because it is answering a different question.
+    pub metric: DistanceMetric,
+
     /// Number of bidirectional links created for each element (except layer 0)
     /// Typical value: 16-32. Higher values increase recall but use more memory.
     pub m: usize,
@@ -215,10 +223,26 @@ pub struct HNSWConfig {
     pub seed: Option<u64>,
 }
 
+/// Distance metric for [`HNSWIndex`].
+///
+/// The quantized indexes (`SQ8HNSWIndex`, `RaBitQHNSWIndex`) are L2-only. Before this
+/// enum existed `HNSWIndex` was cosine-only, so swapping index type to save memory
+/// silently changed the metric. Set this explicitly to keep them consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DistanceMetric {
+    /// `1 - cosine_similarity`. Magnitude-invariant; the historical default.
+    #[default]
+    Cosine,
+    /// Euclidean. Ranked by *squared* L2 internally (monotonic, so ordering is
+    /// identical) — what SIFT/GIST/Deep1B ground truth is computed with.
+    L2,
+}
+
 impl Default for HNSWConfig {
     fn default() -> Self {
         let m = 32; // Match instant-distance for good recall
         Self {
+            metric: DistanceMetric::default(),
             m,
             m0: m * 2,
             ef_construction: 100,
@@ -775,7 +799,7 @@ impl HNSWIndex {
             .map(|&node_id| {
                 // Use fused distance for final scoring too
                 let dist = self.distance_to_node(query, node_id, query_norm);
-                let score = 1.0 - dist;
+                let score = self.score_from_distance(dist);
                 SearchResult {
                     id: self.ids[node_id].clone(),
                     content: self.contents[node_id].clone(),
@@ -1277,25 +1301,52 @@ impl HNSWIndex {
         scored.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Computes distance between two vectors
-    /// Uses 1 - cosine_similarity for distance metric (SIMD accelerated)
+    /// Computes distance between two vectors under the configured metric (SIMD accelerated).
     #[inline]
     fn distance(&self, a: &[f32], b: &[f32]) -> f32 {
-        1.0 - crate::vector::simd::cosine_similarity_simd(a, b)
+        Self::metric_distance(self.config.metric, a, b)
     }
 
-    /// Fused distance from query to a stored node using precomputed norms.
-    /// Single SIMD dispatch, single pass over data.
+    /// Distance under an explicit metric. Shared by the sequential and parallel paths.
+    #[inline]
+    fn metric_distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+        match metric {
+            DistanceMetric::Cosine => 1.0 - crate::vector::simd::cosine_similarity_simd(a, b),
+            DistanceMetric::L2 => crate::vector::simd::l2_distance_simd(a, b),
+        }
+    }
+
+    /// Fused distance from query to a stored node.
+    ///
+    /// Cosine uses the precomputed norms for a single SIMD dispatch and a single pass.
+    /// L2 needs no norms, so `query_norm` is ignored there.
     #[inline]
     fn distance_to_node(&self, query: &[f32], node_id: usize, query_norm: f32) -> f32 {
         let embedding = self.get_embedding(node_id);
-        let norm_b = self.norms[node_id];
-        // Reuse the fused path but with query_norm precomputed too
-        // We compute: 1 - dot(q, e) / (||q|| * ||e||)
-        if query_norm == 0.0 || norm_b == 0.0 {
-            return 1.0;
+        match self.config.metric {
+            DistanceMetric::Cosine => {
+                let norm_b = self.norms[node_id];
+                // We compute: 1 - dot(q, e) / (||q|| * ||e||)
+                if query_norm == 0.0 || norm_b == 0.0 {
+                    return 1.0;
+                }
+                crate::vector::simd::cosine_distance_prenorm(query, embedding, norm_b)
+            }
+            DistanceMetric::L2 => crate::vector::simd::l2_distance_simd(query, embedding),
         }
-        crate::vector::simd::cosine_distance_prenorm(query, embedding, norm_b)
+    }
+
+    /// Map a distance to a similarity score (higher is better), per metric.
+    ///
+    /// Cosine distance is bounded in [0, 2], so `1 - d` recovers the cosine similarity.
+    /// L2 is unbounded, where `1 - d` would emit large negative scores; `1/(1+d)` keeps
+    /// the score in (0, 1] and is monotonically decreasing in `d`, so ranking is identical.
+    #[inline]
+    fn score_from_distance(&self, dist: f32) -> f32 {
+        match self.config.metric {
+            DistanceMetric::Cosine => 1.0 - dist,
+            DistanceMetric::L2 => 1.0 / (1.0 + dist.max(0.0)),
+        }
     }
 
     /// Build an HNSW index from embeddings using parallel construction
@@ -1370,7 +1421,7 @@ impl HNSWIndex {
         let mut layers: Vec<Vec<UpperNode>> = vec![Vec::new(); top.0];
 
         // Search pool for thread-local state reuse
-        let pool = SearchPool::new(n);
+        let pool = SearchPool::new(n, config.metric);
 
         // Process batches from top to bottom
         for (batch, range) in ranges {
@@ -1433,6 +1484,7 @@ impl HNSWIndex {
         ef_construction: usize,
         top: LayerId,
     ) {
+        let metric = pool.metric;
         let mut search = pool.pop();
         search.visited.reserve(points.len());
 
@@ -1472,7 +1524,7 @@ impl HNSWIndex {
         // poorly bridged and tanks recall on structured data. The heuristic keeps
         // a diverse neighbor set so search can cross cluster boundaries — matching
         // the sequential build path.
-        let found = Self::par_select_heuristic(search.select_simple(), points, M0_MAX);
+        let found = Self::par_select_heuristic(metric, search.select_simple(), points, M0_MAX);
 
         // Add connections: new node → neighbors (in zero layer)
         {
@@ -1484,7 +1536,7 @@ impl HNSWIndex {
 
         // Add reverse connections: neighbors → new node (bidirectional)
         for candidate in found.iter().take(M0_MAX) {
-            Self::add_reverse_connection(zero, points, new, candidate.pid);
+            Self::add_reverse_connection(metric, zero, points, new, candidate.pid);
         }
 
         pool.push(search);
@@ -1497,7 +1549,12 @@ impl HNSWIndex {
     /// with `keep_pruned_connections = true`: keep a candidate only if it is
     /// closer to the new point than to any already-selected neighbor, then
     /// backfill from the pruned candidates (closest first) to reach `m`.
-    fn par_select_heuristic(sorted: &[Candidate], points: &[Vec<f32>], m: usize) -> Vec<Candidate> {
+    fn par_select_heuristic(
+        metric: DistanceMetric,
+        sorted: &[Candidate],
+        points: &[Vec<f32>],
+        m: usize,
+    ) -> Vec<Candidate> {
         let mut selected: Vec<Candidate> = Vec::with_capacity(m);
         for &cand in sorted {
             if selected.len() >= m {
@@ -1507,7 +1564,8 @@ impl HNSWIndex {
             // than to the query point (i.e. it sits "behind" a selected node).
             let cand_point = &points[cand.pid.as_usize()];
             let diverse = selected.iter().all(|s| {
-                Self::parallel_distance(cand_point, &points[s.pid.as_usize()]) >= cand.distance
+                Self::parallel_distance(metric, cand_point, &points[s.pid.as_usize()])
+                    >= cand.distance
             });
             if diverse {
                 selected.push(cand);
@@ -1532,6 +1590,7 @@ impl HNSWIndex {
     /// Add reverse connection from neighbor to new node, maintaining SORTED order by distance
     /// This is critical: UpperNode::from_zero takes the first M entries, so they must be the M closest
     fn add_reverse_connection(
+        metric: DistanceMetric,
         zero: &[RwLock<ZeroNode>],
         points: &[Vec<f32>],
         new: PointId,
@@ -1548,13 +1607,14 @@ impl HNSWIndex {
 
         if count < M0_MAX {
             // Room available: insert maintaining ascending-distance order.
-            let new_dist = Self::parallel_distance(neighbor_point, &points[new.as_usize()]);
+            let new_dist = Self::parallel_distance(metric, neighbor_point, &points[new.as_usize()]);
             let pos = {
                 let mut left = 0;
                 let mut right = count;
                 while left < right {
                     let mid = (left + right) / 2;
                     let mid_dist = Self::parallel_distance(
+                        metric,
                         neighbor_point,
                         &points[node.nearest[mid].as_usize()],
                     );
@@ -1581,12 +1641,12 @@ impl HNSWIndex {
             .iter()
             .chain(std::iter::once(new))
             .map(|pid| Candidate {
-                distance: Self::parallel_distance(neighbor_point, &points[pid.as_usize()]),
+                distance: Self::parallel_distance(metric, neighbor_point, &points[pid.as_usize()]),
                 pid,
             })
             .collect();
         cands.sort_unstable();
-        let selected = Self::par_select_heuristic(&cands, points, M0_MAX);
+        let selected = Self::par_select_heuristic(metric, &cands, points, M0_MAX);
 
         // |cands| = M0_MAX + 1 > M0_MAX, so the heuristic returns exactly M0_MAX
         // (diverse picks + backfill) and every slot is overwritten.
@@ -1688,8 +1748,8 @@ impl HNSWIndex {
 
     /// Distance function for parallel construction (SIMD accelerated)
     #[inline]
-    fn parallel_distance(a: &[f32], b: &[f32]) -> f32 {
-        1.0 - crate::vector::simd::cosine_similarity_simd(a, b)
+    fn parallel_distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+        Self::metric_distance(metric, a, b)
     }
 }
 
@@ -1869,6 +1929,8 @@ impl Ord for Candidate {
 
 /// Search state for parallel construction
 struct Search {
+    /// Metric used for every distance computed during this search.
+    metric: DistanceMetric,
     /// Candidates to explore (min-heap by distance)
     candidates: BinaryHeap<Reverse<Candidate>>,
     /// Best results found (sorted by distance)
@@ -1880,8 +1942,9 @@ struct Search {
 }
 
 impl Search {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, metric: DistanceMetric) -> Self {
         Self {
+            metric,
             candidates: BinaryHeap::new(),
             nearest: Vec::new(),
             visited: Visited::new(capacity),
@@ -1896,7 +1959,7 @@ impl Search {
     }
 
     fn push(&mut self, pid: PointId, point: &[f32], points: &[Vec<f32>]) {
-        let distance = HNSWIndex::parallel_distance(point, &points[pid.as_usize()]);
+        let distance = HNSWIndex::parallel_distance(self.metric, point, &points[pid.as_usize()]);
         let candidate = Candidate { distance, pid };
         self.candidates.push(Reverse(candidate));
         self.nearest.push(candidate);
@@ -1934,8 +1997,11 @@ impl Search {
             let node = layer[candidate.pid.as_usize()].read();
             for neighbor_pid in node.iter() {
                 if self.visited.insert(neighbor_pid) {
-                    let distance =
-                        HNSWIndex::parallel_distance(point, &points[neighbor_pid.as_usize()]);
+                    let distance = HNSWIndex::parallel_distance(
+                        self.metric,
+                        point,
+                        &points[neighbor_pid.as_usize()],
+                    );
                     let new_candidate = Candidate {
                         distance,
                         pid: neighbor_pid,
@@ -1996,8 +2062,11 @@ impl Search {
             let node = &layer[candidate.pid.as_usize()];
             for neighbor_pid in node.iter() {
                 if self.visited.insert(neighbor_pid) {
-                    let distance =
-                        HNSWIndex::parallel_distance(point, &points[neighbor_pid.as_usize()]);
+                    let distance = HNSWIndex::parallel_distance(
+                        self.metric,
+                        point,
+                        &points[neighbor_pid.as_usize()],
+                    );
                     let new_candidate = Candidate {
                         distance,
                         pid: neighbor_pid,
@@ -2039,13 +2108,15 @@ impl Search {
 struct SearchPool {
     pool: Mutex<Vec<Search>>,
     capacity: usize,
+    metric: DistanceMetric,
 }
 
 impl SearchPool {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, metric: DistanceMetric) -> Self {
         Self {
             pool: Mutex::new(Vec::new()),
             capacity,
+            metric,
         }
     }
 
@@ -2053,7 +2124,7 @@ impl SearchPool {
         self.pool
             .lock()
             .pop()
-            .unwrap_or_else(|| Search::new(self.capacity))
+            .unwrap_or_else(|| Search::new(self.capacity, self.metric))
     }
 
     fn push(&self, mut search: Search) {
@@ -2546,5 +2617,99 @@ mod tests {
         for _ in 0..10_000 {
             let _level = index.random_level();
         }
+    }
+
+    // ========================================================================
+    // Distance metric
+    // ========================================================================
+
+    /// Cosine and L2 must genuinely disagree, and each must pick its own winner.
+    ///
+    /// q = [10, 0]:
+    ///   far_same_direction = [100, 0] — cosine distance 0 (identical direction),
+    ///                                   but L2 distance 90 (way off in magnitude)
+    ///   near_off_axis      = [9, 3]   — cosine distance ~0.051 (direction differs),
+    ///                                   but L2 distance ~3.16 (much closer in space)
+    ///
+    /// A cosine index must return `far_same_direction`; an L2 index must return
+    /// `near_off_axis`. This is exactly why scoring foxstash's cosine HNSW against
+    /// SIFT's L2 ground truth read 55% for a graph that is actually 97.7% correct.
+    #[test]
+    fn cosine_and_l2_pick_different_neighbors() {
+        let query = vec![10.0, 0.0];
+        let docs = [
+            ("far_same_direction", vec![100.0, 0.0]),
+            ("near_off_axis", vec![9.0, 3.0]),
+        ];
+
+        let winner = |metric: DistanceMetric| {
+            let mut index = HNSWIndex::new(
+                2,
+                HNSWConfig {
+                    metric,
+                    ..Default::default()
+                },
+            );
+            for (id, v) in &docs {
+                index
+                    .add(Document {
+                        id: (*id).to_string(),
+                        content: String::new(),
+                        embedding: v.clone(),
+                        metadata: None,
+                    })
+                    .unwrap();
+            }
+            index.search(&query, 1).unwrap()[0].id.clone()
+        };
+
+        assert_eq!(winner(DistanceMetric::Cosine), "far_same_direction");
+        assert_eq!(winner(DistanceMetric::L2), "near_off_axis");
+    }
+
+    /// L2 scores must stay in (0, 1] and decrease with distance. Cosine's `1 - d`
+    /// convention would emit large negative scores for unbounded L2 distances.
+    #[test]
+    fn l2_scores_are_bounded_and_monotonic() {
+        let mut index = HNSWIndex::new(
+            2,
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+        for (i, v) in [vec![0.0, 0.0], vec![50.0, 0.0], vec![500.0, 0.0]]
+            .into_iter()
+            .enumerate()
+        {
+            index
+                .add(Document {
+                    id: i.to_string(),
+                    content: String::new(),
+                    embedding: v,
+                    metadata: None,
+                })
+                .unwrap();
+        }
+
+        let results = index.search(&[0.0, 0.0], 3).unwrap();
+        assert_eq!(results[0].id, "0", "nearest must come first");
+        for r in &results {
+            assert!(
+                r.score > 0.0 && r.score <= 1.0,
+                "L2 score {} outside (0, 1]",
+                r.score
+            );
+        }
+        for w in results.windows(2) {
+            assert!(w[0].score >= w[1].score, "scores must be descending");
+        }
+    }
+
+    /// Cosine remains the default, so existing code and persisted indexes are unaffected.
+    #[test]
+    fn cosine_is_still_the_default() {
+        assert_eq!(HNSWConfig::default().metric, DistanceMetric::Cosine);
+        assert_eq!(DistanceMetric::default(), DistanceMetric::Cosine);
     }
 }

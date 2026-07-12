@@ -975,6 +975,10 @@ pub struct HNSWIndexWrapper {
 /// Serializable wrapper for HNSWConfig
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HNSWConfigWrapper {
+    /// Absent in indexes written before the metric was configurable; those were all
+    /// cosine, which is what `DistanceMetric::default()` yields — so they load correctly.
+    #[serde(default)]
+    pub metric: crate::index::hnsw::DistanceMetric,
     pub m: usize,
     pub m0: usize,
     pub ef_construction: usize,
@@ -1006,6 +1010,7 @@ impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
             use_heuristic: config.use_heuristic,
             extend_candidates: config.extend_candidates,
             keep_pruned_connections: config.keep_pruned_connections,
+            metric: config.metric,
         }
     }
 }
@@ -1013,6 +1018,7 @@ impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
 impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
     fn from(wrapper: HNSWConfigWrapper) -> Self {
         Self {
+            metric: wrapper.metric,
             m: wrapper.m,
             m0: wrapper.m0,
             ef_construction: wrapper.ef_construction,

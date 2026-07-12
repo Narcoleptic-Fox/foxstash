@@ -57,7 +57,7 @@ pub mod hnsw_quantized;
 pub mod streaming;
 
 pub use flat::FlatIndex;
-pub use hnsw::{BuildStrategy, HNSWConfig, HNSWIndex};
+pub use hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex};
 pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
 #[allow(deprecated)]
 pub use hnsw_quantized::{BinaryHNSWIndex, QuantizedHNSWConfig, RaBitQHNSWIndex, SQ8HNSWIndex};
