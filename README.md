@@ -93,7 +93,11 @@ Speed crown or memory crown — not both, yet.
 
 ### Product Quantization (Extreme Compression)
 
-For massive datasets, use Product Quantization for up to 192x compression:
+PQ compresses the **vector payload** 192x — 8 bytes of codes in place of a 384-dim f32
+(1,536 bytes). It does not compress the graph, so end-to-end index memory falls by far
+less than 192x. And it costs a lot of recall: with the default 8x8 config, `PQHNSWIndex`
+measured **~55% recall@10** on clustered data. It is for the case where the corpus does
+not fit in RAM at all, not for a routine memory saving — reach for `Storage::SQ8` first.
 
 ```rust
 use foxstash_core::index::{PQHNSWIndex, PQHNSWConfig};
@@ -488,7 +492,7 @@ index scores far better on SIFT100K because the task is easier, not because it i
 - [x] SQ8 8-bit traversal (`Storage::SQ8`) — beats hnswlib 1.20x at 99.5% recall on SIFT1M
 - [x] Streaming add/search for large datasets
 - [x] Incremental persistence (WAL + checkpointing)
-- [x] Product quantization (PQ) - up to 192x compression
+- [x] Product quantization (PQ) — 192x on the vector payload, at ~55% recall@10
 - [x] Diversity-aware neighbor selection (Algorithm 4)
 - [x] Hybrid search (BM25 + vector, RRF and WeightedSum)
 - [x] VectorIndex / TextIndex trait abstractions

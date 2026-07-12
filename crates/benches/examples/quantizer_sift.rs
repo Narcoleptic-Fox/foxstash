@@ -1,4 +1,9 @@
-//! Quantizer recall comparison on **real** SIFT10K — RaBitQ vs Binary vs SQ8.
+//! Quantizer recall comparison on **real** SIFT10K — RaBitQ vs binary vs SQ8.
+//!
+//! `BinaryHNSWIndex` was deleted (1.1% recall on any non-negative embedding). The binary
+//! *quantizer* rows below survive because they demonstrate exactly why: a zero threshold sets
+//! every bit on non-negative data, so all codes collapse to all-ones and stage 1 ranks at
+//! random. Centering the threshold recovers it. That is the lesson worth keeping.
 //!
 //! Run: cargo run -p foxstash-benches --example quantizer_sift --release
 //!
@@ -14,7 +19,6 @@
 //! wrong and every other row is meaningless.
 
 #[allow(deprecated)]
-use foxstash_core::index::hnsw_quantized::BinaryHNSWIndex;
 use foxstash_core::index::hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex};
 use foxstash_core::vector::quantize::{BinaryQuantizer, Quantizer, ScalarQuantizer};
 use foxstash_core::vector::rabitq::RaBitQuantizer;
@@ -249,29 +253,6 @@ fn main() {
     });
     let rb_qps = queries.len() as f64 / t0.elapsed().as_secs_f64();
 
-    #[allow(deprecated)]
-    let (bin_hnsw, bin_build, bin_qps) = {
-        let t0 = Instant::now();
-        let mut idx = BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
-        for (i, v) in base.iter().enumerate() {
-            idx.add_with_full_precision(docs(v, i)).unwrap();
-        }
-        let build = t0.elapsed();
-
-        let t0 = Instant::now();
-        let recall = index_recall(&queries, &truth, |q| {
-            idx.search_and_rerank(q, POOL, K)
-                .unwrap()
-                .into_iter()
-                .filter_map(|r| r.id.parse::<usize>().ok())
-                .collect()
-        });
-        (
-            recall,
-            build,
-            queries.len() as f64 / t0.elapsed().as_secs_f64(),
-        )
-    };
 
     println!("{:<22} {:>10} {:>14}", "Quantizer", "Compress", "Recall@10");
     println!("{:-<48}", "");
@@ -319,14 +300,6 @@ fn main() {
         rb_hnsw * 100.0,
         rb_build.as_secs_f64(),
         rb_qps
-    );
-    println!(
-        "{:<22} {:>10} {:>13.1}% {:>9.1}s {:>10.0}",
-        "BinaryHNSWIndex (dep.)",
-        "32x",
-        bin_hnsw * 100.0,
-        bin_build.as_secs_f64(),
-        bin_qps
     );
 
     if exact < 0.99 {

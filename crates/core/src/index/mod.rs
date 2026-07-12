@@ -14,11 +14,14 @@
 //! | HNSW (f32) | 1.5 GB | 100% | Default choice |
 //! | SQ8 HNSW | 384 MB | 100.0% | Memory constrained |
 //! | RaBitQ HNSW | 48 MB | 73.2% | Massive datasets |
-//! | Binary HNSW | 48 MB | 1.2% | Deprecated — use RaBitQ |
 //!
 //! *Measured on SIFT10K with a two-phase search (1-bit filter, pool=100, exact rerank):
-//! `cargo run --release -p foxstash-benches --example quantizer_sift`. Binary's zero
-//! threshold collapses on non-negative data; RaBitQ centers and does not.
+//! `cargo run --release -p foxstash-benches --example quantizer_sift`.
+//!
+//! A plain zero-threshold binary quantizer is not offered: on non-negative data (SIFT,
+//! and most embedding models) every bit is set and the code carries no information — it
+//! measured 1.2% recall@10. RaBitQ centers each vector before thresholding, which is the
+//! whole difference. See `crate::vector::quantize` for the comparison.
 //!
 //! # Streaming Operations
 //!
@@ -69,7 +72,7 @@ use crate::{Document, Result, SearchResult};
 /// Trait for vector similarity indexes.
 ///
 /// Provides a common interface across all index implementations (HNSW, Flat,
-/// SQ8, Binary, PQ). Object-safe — works with `Box<dyn VectorIndex>`.
+/// SQ8, RaBitQ, PQ). Object-safe — works with `Box<dyn VectorIndex>`.
 ///
 /// Construction is excluded because each index type has different configuration
 /// requirements.

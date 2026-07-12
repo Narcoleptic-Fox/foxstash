@@ -2,11 +2,17 @@
 //!
 //! Combines HNSW's fast approximate search with PQ's extreme compression.
 //!
-//! # Compression
+//! # Compression, and what it costs
 //!
-//! For 384-dim vectors with M=8, K=256:
-//! - Original: 1.5 GB per million vectors
-//! - PQ compressed: 8 MB per million vectors (192x compression!)
+//! PQ compresses the **vector payload** 192x: a 384-dim f32 (1,536 bytes) becomes 8 bytes
+//! of codes at M=8, K=256. It does **not** compress the graph — adjacency dominates a PQ
+//! index, so total index memory falls by far less than 192x. Do not quote 192x as an
+//! index-level number.
+//!
+//! It also costs a lot of recall. With the default 8x8 config this index measures
+//! **~55% recall@10** on clustered data (see `pq_use_distance_cache_false_retrieves_correctly_on_clustered_data`).
+//! Prefer [`Storage::SQ8`](crate::index::hnsw::Storage) unless the corpus genuinely does
+//! not fit in RAM: SQ8 holds 99.5% recall@10 on SIFT1M and is *faster* than full f32.
 //!
 //! # Usage
 //!

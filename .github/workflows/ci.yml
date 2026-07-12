@@ -28,6 +28,16 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Compile EVERY target, not just the library crates.
+      #
+      # `cargo test -p foxstash-core` passes while the workspace does not build: examples and
+      # benches are never compiled by the per-crate steps below. Deleting the public
+      # `BinaryHNSWIndex` left `crates/benches/examples/quantizer_sift.rs` referencing a type
+      # that no longer exists, with a fully green test run. This step is the only thing in CI
+      # that would have caught it.
+      - name: Check every target compiles (examples and benches included)
+        run: cargo check --workspace --all-targets --verbose
+
       - name: Build foxstash-core
         run: cargo build -p foxstash-core --verbose
 
