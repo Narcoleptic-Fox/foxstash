@@ -299,7 +299,8 @@ impl HNSWConfig {
 
     /// Set M parameter (connections per node)
     pub fn with_m(mut self, m: usize) -> Self {
-        assert!(m <= 127, "m must be <= 127 (m0 = 2*m must fit in u8)");
+        // The old `m <= 127` cap existed only because the layer-0 neighbour count was
+        // stored as a `u8`. It lives in the node arena as a `u32` now, so the cap is gone.
         self.m = m;
         self.m0 = m * 2;
         self.ml = 1.0 / (m as f32).ln();
@@ -329,33 +330,76 @@ impl MemoryBreakdown {
     }
 }
 
-/// HNSW index for efficient similarity search
+/// Header size, in 4-byte units, of one node block. See [`HNSWIndex::nodes`].
 ///
-/// Uses Struct-of-Arrays (SoA) layout for better cache locality:
-/// - Hot path: embeddings stored contiguously for SIMD-friendly access
-/// - Cold path: document metadata stored separately
+/// `count | norm | m0 + 1 neighbour slots`, rounded up to a 16-byte boundary so the
+/// vector that follows stays SIMD-aligned. The spare neighbour slot lets insertion
+/// push-then-prune in place rather than spilling to a `Vec`.
+#[inline(always)]
+const fn node_hdr_len(m0: usize) -> usize {
+    (2 + m0 + 1).div_ceil(4) * 4
+}
+
+/// Size, in 4-byte units, of one node block.
+#[inline(always)]
+const fn node_stride(m0: usize, dim: usize) -> usize {
+    node_hdr_len(m0) + dim
+}
+
+/// HNSW index for efficient similarity search.
+///
+/// # Memory layout
+///
+/// Everything touched while traversing the graph lives in one interleaved arena,
+/// [`Self::nodes`], with a node's neighbours and its vector in the *same* contiguous
+/// block. Visiting a node is therefore a single random memory read.
+///
+/// This used to be Struct-of-Arrays — the vector in `embeddings`, the neighbours in
+/// `connections_l0`, the norm in `norms`, three separate allocations — on the theory that
+/// SoA gives "better cache locality". It does, for a linear scan. Graph traversal never
+/// scans linearly: it jumps to an arbitrary node, reads its neighbour list, then jumps to
+/// each neighbour's vector. Under that access pattern SoA costs *three* independent random
+/// DRAM reads per visit where an interleaved block costs one.
+///
+/// The difference is invisible while the index fits in L3 and decisive once it does not,
+/// which is exactly what the benchmarks showed: foxstash beat hnswlib on SIFT10K (9 MB
+/// index, cache-resident) and lost to it by ~20% on SIFT1M (940 MB). hnswlib and faiss have
+/// always interleaved. See `benchmarks/RESULTS.md`.
 pub struct HNSWIndex {
     /// Dimensionality of embeddings
     embedding_dim: usize,
     /// Configuration parameters
     config: HNSWConfig,
 
-    // === HOT PATH (accessed during every distance computation) ===
-    /// All embeddings stored contiguously: embeddings[i * dim .. (i+1) * dim]
-    embeddings: Vec<f32>,
-    /// Precomputed L2 norms for each vector (avoids recomputing per distance call)
-    norms: Vec<f32>,
+    // === HOT PATH ===
+    /// Interleaved node arena. Node `i` occupies `nodes[i * stride .. (i + 1) * stride]`,
+    /// where `stride = node_stride(m0, dim)`, laid out as:
+    ///
+    /// ```text
+    ///   [0]                  layer-0 neighbour count
+    ///   [1]                  L2 norm of the vector (f32 bits; cosine reads it per distance)
+    ///   [2 ..= 2 + m0]       layer-0 neighbour ids (m0 + 1 slots, one spare for pruning)
+    ///   [.. hdr]             padding to a 16-byte boundary
+    ///   [hdr .. hdr + dim]   the vector (f32 bits)
+    /// ```
+    ///
+    /// Stored as `u32` because the block mixes ids, a count and floats; the float regions
+    /// are read back with `bytemuck` casts, which are free and require no `unsafe` here.
+    nodes: Vec<u32>,
 
-    // === GRAPH STRUCTURE ===
-    /// Connections for each node at each layer: connections[node_id][layer] -> neighbors
-    /// Uses `Vec<u32>` instead of HashSet for cache-friendly traversal (4-5x faster search)
+    /// `node_stride(m0, dim)`, cached. Derived from config, but `get_embedding` and
+    /// `get_neighbors_l0` run millions of times per query and should not recompute it.
+    stride: usize,
+    /// `node_hdr_len(m0)`, cached. Same reason.
+    hdr: usize,
+
+    // === GRAPH STRUCTURE (layers >= 1 only) ===
+    /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
+    ///
+    /// Layer 0 is **not** here — it lives in [`Self::nodes`], which is its sole owner.
+    /// Upper layers hold ~1/M of the links and are touched a handful of times per query,
+    /// so the pointer chasing costs nothing measurable.
     connections: Vec<Vec<Vec<u32>>>,
-
-    /// Flat layer 0 connection cache: `node_id * m0 + i` → neighbor_id.
-    /// Eliminates triple-indirection for the hot search path (layer 0 = 99% of search time).
-    connections_l0: Vec<u32>,
-    /// Actual neighbor count per node at layer 0
-    connections_l0_count: Vec<u8>,
 
     // === COLD PATH (only accessed when returning results) ===
     /// Document IDs
@@ -378,19 +422,13 @@ impl HNSWIndex {
     /// * `embedding_dim` - Dimensionality of embedding vectors
     /// * `config` - HNSW configuration parameters
     pub fn new(embedding_dim: usize, config: HNSWConfig) -> Self {
-        assert!(
-            config.m <= 127,
-            "m must be <= 127 (m0 = 2*m must fit in u8), got m={}",
-            config.m
-        );
         Self {
             embedding_dim,
+            stride: node_stride(config.m0, embedding_dim),
+            hdr: node_hdr_len(config.m0),
             config,
-            embeddings: Vec::new(),
-            norms: Vec::new(),
+            nodes: Vec::new(),
             connections: Vec::new(),
-            connections_l0: Vec::new(),
-            connections_l0_count: Vec::new(),
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -531,8 +569,9 @@ impl HNSWIndex {
         let mut index = Self::new(embedding_dim, config);
 
         // Pre-allocate
-        index.embeddings.reserve(n * embedding_dim);
-        index.norms.reserve(n);
+        index
+            .nodes
+            .reserve(n * node_stride(index.config.m0, embedding_dim));
         index.connections.reserve(n);
         index.ids.reserve(n);
         index.contents.reserve(n);
@@ -549,18 +588,13 @@ impl HNSWIndex {
                 node_connections.push(Vec::new());
             }
 
-            // Add to storage
-            let norm = crate::vector::simd::norm_simd(&embeddings[i]);
-            index.embeddings.extend_from_slice(&embeddings[i]);
-            index.norms.push(norm);
+            // Add to storage. `push_node` appends the whole block — vector, norm and an
+            // empty layer-0 neighbour list — so `insert_node` below has somewhere to write.
+            index.push_node(&embeddings[i]);
             index.connections.push(node_connections);
             index.ids.push(i.to_string());
             index.contents.push(String::new());
             index.metadata.push(None);
-            // `insert_node` writes layer-0 links straight into the flat array, so the slot
-            // must exist before it runs. (The parallel builder does not need this: it fills
-            // the nested structure first and migrates via `build_l0_cache`.)
-            index.extend_l0_cache_for_new_node();
 
             if index.entry_point.is_none() {
                 index.entry_point = Some(node_id);
@@ -596,34 +630,30 @@ impl HNSWIndex {
         self.ids.is_empty()
     }
 
-    /// Get embedding slice for a node (hot path - inline for performance)
-    #[inline]
-    fn get_embedding(&self, node_id: usize) -> &[f32] {
-        let start = node_id * self.embedding_dim;
-        let end = start + self.embedding_dim;
-        &self.embeddings[start..end]
-    }
-
-    /// Stride of the flat layer-0 array: `m0` neighbours plus one spare slot.
+    /// Get embedding slice for a node (hot path).
     ///
-    /// Insertion pushes a link and *then* prunes, so a node transiently holds `m0 + 1`
-    /// neighbours. The spare slot lets that happen in place instead of spilling to a Vec.
+    /// Bounds-checked, deliberately. Replacing these with `get_unchecked` was measured at
+    /// +1.3% on SIFT1M — inside run-to-run noise, and not worth `unsafe` in the hottest
+    /// accessor in the library. The bounds check is not what separates us from hnswlib.
     #[inline(always)]
-    fn l0_stride(&self) -> usize {
-        self.config.m0 + 1
+    fn get_embedding(&self, node_id: usize) -> &[f32] {
+        let start = node_id * self.stride + self.hdr;
+        bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
     }
 
-    /// Get layer 0 neighbors from the flat array (single indirection).
-    ///
-    /// This array is the *sole* owner of layer-0 connections; the nested `connections`
-    /// structure holds layers >= 1 only. Storing both cost ~26% of index memory for a
-    /// duplicate of the hottest data in the index.
+    /// Precomputed L2 norm of a node's vector. Lives in the node's own block, so cosine
+    /// reads it from a cache line it has already pulled in for the vector.
+    #[inline(always)]
+    fn get_norm(&self, node_id: usize) -> f32 {
+        f32::from_bits(self.nodes[node_id * self.stride + 1])
+    }
+
+    /// Get layer 0 neighbours. Same cache lines as the node's vector.
     #[inline(always)]
     fn get_neighbors_l0(&self, node_id: usize) -> &[u32] {
-        let stride = self.l0_stride();
-        let start = node_id * stride;
-        let count = self.connections_l0_count[node_id] as usize;
-        &self.connections_l0[start..start + count]
+        let base = node_id * self.stride;
+        let count = self.nodes[base] as usize;
+        &self.nodes[base + 2..base + 2 + count]
     }
 
     /// True if `node_id` already links to `neighbor` at layer 0.
@@ -635,56 +665,53 @@ impl HNSWIndex {
     /// Append a layer-0 link. Capacity is `m0 + 1`; the caller prunes back to `m0`.
     #[inline]
     fn l0_push(&mut self, node_id: usize, neighbor: u32) {
-        let stride = self.l0_stride();
-        let count = self.connections_l0_count[node_id] as usize;
+        let base = node_id * self.stride;
+        let count = self.nodes[base] as usize;
         debug_assert!(
-            count < stride,
+            count < self.config.m0 + 1,
             "layer-0 overflow: prune before pushing again"
         );
-        self.connections_l0[node_id * stride + count] = neighbor;
-        self.connections_l0_count[node_id] = (count + 1) as u8;
+        self.nodes[base + 2 + count] = neighbor;
+        self.nodes[base] = (count + 1) as u32;
     }
 
     /// Replace a node's entire layer-0 neighbour list (used after pruning).
     #[inline]
     fn l0_replace(&mut self, node_id: usize, neighbors: &[u32]) {
-        let stride = self.l0_stride();
+        let base = node_id * self.stride;
         let count = neighbors.len().min(self.config.m0);
-        let start = node_id * stride;
-        self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
-        self.connections_l0_count[node_id] = count as u8;
+        self.nodes[base + 2..base + 2 + count].copy_from_slice(&neighbors[..count]);
+        self.nodes[base] = count as u32;
     }
 
-    /// Build flat layer 0 cache from the nested `connections` structure.
-    /// Called once after index construction for fast search-time access.
-    fn build_l0_cache(&mut self) {
-        let n = self.len();
-        let m0 = self.config.m0;
-        let stride = m0 + 1;
-        debug_assert!(
-            stride <= 255,
-            "m0 + 1 exceeds u8 capacity for connections_l0_count"
-        );
-        self.connections_l0 = vec![0u32; n * stride];
-        self.connections_l0_count = vec![0u8; n];
+    /// Append a node block: zero neighbours, norm and vector filled in.
+    ///
+    /// Every construction path must go through this. The sequential builder previously
+    /// pushed the vector and forgot to grow the layer-0 storage, which panicked on every
+    /// input; a single append keeps the arena's invariant impossible to half-satisfy.
+    fn push_node(&mut self, embedding: &[f32]) {
+        debug_assert_eq!(embedding.len(), self.embedding_dim);
+        let base = self.nodes.len();
+        self.nodes.resize(base + self.stride, 0);
+        self.nodes[base + 1] = crate::vector::simd::norm_simd(embedding).to_bits();
+        let v = base + self.hdr;
+        self.nodes[v..v + self.embedding_dim].copy_from_slice(bytemuck::cast_slice(embedding));
+    }
 
-        for i in 0..n {
+    /// Move layer-0 links out of the nested `connections` and into the arena.
+    ///
+    /// Only the parallel builder needs this: it materialises the whole nested structure
+    /// first, then hands layer 0 over to its real owner. The sequential builder writes
+    /// layer-0 links straight into the arena via `insert_node` and must **not** call this —
+    /// doing so would copy an empty nested layer 0 over the real graph and silently erase
+    /// every layer-0 link.
+    fn migrate_l0_into_arena(&mut self) {
+        for i in 0..self.len() {
             if !self.connections[i].is_empty() {
                 let neighbors = std::mem::take(&mut self.connections[i][0]);
-                let count = neighbors.len().min(m0);
-                let start = i * stride;
-                self.connections_l0[start..start + count].copy_from_slice(&neighbors[..count]);
-                self.connections_l0_count[i] = count as u8;
+                self.l0_replace(i, &neighbors);
             }
         }
-    }
-
-    /// Extend flat L0 cache to accommodate a new node (for incremental add).
-    fn extend_l0_cache_for_new_node(&mut self) {
-        let stride = self.l0_stride();
-        self.connections_l0
-            .resize(self.connections_l0.len() + stride, 0);
-        self.connections_l0_count.push(0);
     }
 
     /// Adds a document to the index
@@ -717,17 +744,11 @@ impl HNSWIndex {
             node_connections.push(Vec::new());
         }
 
-        // Add to SoA storage
-        let norm = crate::vector::simd::norm_simd(&document.embedding);
-        self.embeddings.extend_from_slice(&document.embedding);
-        self.norms.push(norm);
+        self.push_node(&document.embedding);
         self.connections.push(node_connections);
         self.ids.push(document.id);
         self.contents.push(document.content);
         self.metadata.push(document.metadata);
-
-        // Extend flat L0 cache for the new node
-        self.extend_l0_cache_for_new_node();
 
         // If this is the first node, make it the entry point
         if self.entry_point.is_none() {
@@ -781,17 +802,11 @@ impl HNSWIndex {
             node_connections.push(Vec::new());
         }
 
-        // Add to SoA storage
-        let norm = crate::vector::simd::norm_simd(&embedding);
-        self.embeddings.extend_from_slice(&embedding);
-        self.norms.push(norm);
+        self.push_node(&embedding);
         self.connections.push(node_connections);
         self.ids.push(id);
         self.contents.push(String::new());
         self.metadata.push(None);
-
-        // Extend flat L0 cache for the new node
-        self.extend_l0_cache_for_new_node();
 
         // If this is the first node, make it the entry point
         if self.entry_point.is_none() {
@@ -946,11 +961,8 @@ impl HNSWIndex {
 
     /// Clears all documents from the index
     pub fn clear(&mut self) {
-        self.embeddings.clear();
-        self.norms.clear();
+        self.nodes.clear();
         self.connections.clear();
-        self.connections_l0.clear();
-        self.connections_l0_count.clear();
         self.ids.clear();
         self.contents.clear();
         self.metadata.clear();
@@ -1010,14 +1022,11 @@ impl HNSWIndex {
 
     /// Release surplus allocation capacity.
     ///
-    /// `Vec` growth doubles, so after a build the embedding array can hold ~2x the bytes it
-    /// needs (8.4 MB of capacity for 5.1 MB of vectors on SIFT10K). The build paths call
-    /// this for you; call it yourself after a run of `add()` if the index is now static.
+    /// `Vec` growth doubles, so after a build the node arena can hold ~2x the bytes it
+    /// needs. The build paths call this for you; call it yourself after a run of `add()` if
+    /// the index is now static.
     pub fn shrink_to_fit(&mut self) {
-        self.embeddings.shrink_to_fit();
-        self.norms.shrink_to_fit();
-        self.connections_l0.shrink_to_fit();
-        self.connections_l0_count.shrink_to_fit();
+        self.nodes.shrink_to_fit();
         self.ids.shrink_to_fit();
         self.contents.shrink_to_fit();
         self.metadata.shrink_to_fit();
@@ -1053,11 +1062,19 @@ impl HNSWIndex {
             })
             .sum();
 
+        // Vectors, norms and layer-0 links share one arena, so the split below is logical
+        // rather than physical. `layer0_links` carries the block headers (count + norm +
+        // neighbour slots + padding) plus any surplus arena capacity.
+        let n = self.len();
+        let arena = self.nodes.capacity() * std::mem::size_of::<u32>();
+        let vectors = n * self.embedding_dim * std::mem::size_of::<f32>();
+
         MemoryBreakdown {
-            embeddings: self.embeddings.capacity() * std::mem::size_of::<f32>(),
-            norms: self.norms.capacity() * std::mem::size_of::<f32>(),
-            layer0_links: self.connections_l0.capacity() * std::mem::size_of::<u32>()
-                + self.connections_l0_count.capacity(),
+            embeddings: vectors,
+            norms: n * std::mem::size_of::<f32>(),
+            layer0_links: arena
+                .saturating_sub(vectors)
+                .saturating_sub(n * std::mem::size_of::<f32>()),
             upper_layer_links: nested,
             payload: self
                 .ids
@@ -1155,7 +1172,7 @@ impl HNSWIndex {
                     }
 
                     let m0 = self.config.m0;
-                    if self.connections_l0_count[neighbor_id] as usize > m0 {
+                    if self.get_neighbors_l0(neighbor_id).len() > m0 {
                         let neighbor_embedding = self.get_embedding(neighbor_id).to_vec();
                         let current: Vec<usize> = self
                             .get_neighbors_l0(neighbor_id)
@@ -1235,9 +1252,9 @@ impl HNSWIndex {
                 }
             }
 
-            // Get neighbors: use flat L0 cache for layer 0, nested structure for upper layers
+            // Layer 0 lives in the node arena; upper layers in the nested structure.
             let neighbors_l0_slice;
-            let neighbors: &[u32] = if layer == 0 && !self.connections_l0.is_empty() {
+            let neighbors: &[u32] = if layer == 0 && !self.nodes.is_empty() {
                 neighbors_l0_slice = self.get_neighbors_l0(current_id);
                 neighbors_l0_slice
             } else if layer < self.connections[current_id].len() {
@@ -1251,7 +1268,18 @@ impl HNSWIndex {
 
                 // 128d * 4 bytes = 512 bytes = 8 cache lines; prefetch first 3 (192 bytes)
                 const PREFETCH_AHEAD: usize = 2;
-                const CACHE_LINES_PER_EMBEDDING: usize = 3;
+
+                // A node's links, norm and vector are one contiguous block, so these
+                // prefetches land in a single allocation — one DRAM row, one TLB entry —
+                // where the old Struct-of-Arrays layout touched three separate arrays.
+                //
+                // Prefetch the lines we actually need, not the whole block: the header
+                // (count + norm + the first links) and the head of the vector. Issuing a
+                // prefetch for all 13 lines of a 784-byte block costs more in instructions
+                // than it saves, and measurably slowed the cache-resident case.
+                const VECTOR_LINES: usize = 3;
+                let stride = self.stride;
+                let vec_byte_offset = self.hdr * std::mem::size_of::<u32>();
 
                 // Phase 1: Compute distances for all unvisited neighbors into stack buffer.
                 // This separates compute from heap ops for better ILP and fewer branch
@@ -1263,26 +1291,19 @@ impl HNSWIndex {
                 for (i, &neighbor_u32) in neighbors.iter().enumerate() {
                     let neighbor_id = neighbor_u32 as usize;
 
-                    // Prefetch embeddings 2 neighbors ahead (multiple cache lines)
                     unsafe {
                         let lookahead = i + PREFETCH_AHEAD;
                         if lookahead < n_neighbors {
                             let ahead_id = neighbors[lookahead] as usize;
-                            let ahead_ptr = self
-                                .embeddings
-                                .as_ptr()
-                                .wrapping_add(ahead_id * self.embedding_dim)
-                                as *const u8;
-                            prefetch_embedding(ahead_ptr, CACHE_LINES_PER_EMBEDDING);
+                            let block =
+                                self.nodes.as_ptr().wrapping_add(ahead_id * stride) as *const u8;
+                            prefetch_read(block);
+                            prefetch_embedding(block.wrapping_add(vec_byte_offset), VECTOR_LINES);
 
                             // Prefetch the visited bitset word for the lookahead neighbor
                             let bitset_ptr =
                                 ctx.visited.bits.as_ptr().wrapping_add(ahead_id >> 6) as *const u8;
                             prefetch_read(bitset_ptr);
-
-                            // Prefetch the norm for the lookahead neighbor
-                            let norm_ptr = self.norms.as_ptr().wrapping_add(ahead_id) as *const u8;
-                            prefetch_read(norm_ptr);
                         }
                     }
 
@@ -1486,7 +1507,7 @@ impl HNSWIndex {
         let embedding = self.get_embedding(node_id);
         match self.config.metric {
             DistanceMetric::Cosine => {
-                let norm_b = self.norms[node_id];
+                let norm_b = self.get_norm(node_id);
                 // We compute: 1 - dot(q, e) / (||q|| * ||e||)
                 if query_norm == 0.0 || norm_b == 0.0 {
                     return 1.0;
@@ -1858,33 +1879,34 @@ impl HNSWIndex {
             connections.push(node_connections);
         }
 
-        // Compute norms for all points
-        let norms: Vec<f32> = points
-            .iter()
-            .map(|p| crate::vector::simd::norm_simd(p))
-            .collect();
-
-        // Flatten embeddings to SoA
-        let flat_embeddings: Vec<f32> = points.into_iter().flatten().collect();
+        // Lay the vectors and norms into the interleaved arena. Layer-0 links are still in
+        // `connections` at this point; `migrate_l0_into_arena` moves them to their owner.
+        let stride = node_stride(config.m0, embedding_dim);
+        let hdr = node_hdr_len(config.m0);
+        let mut arena = vec![0u32; n * stride];
+        for (i, p) in points.iter().enumerate() {
+            let base = i * stride;
+            arena[base + 1] = crate::vector::simd::norm_simd(p).to_bits();
+            arena[base + hdr..base + hdr + embedding_dim].copy_from_slice(bytemuck::cast_slice(p));
+        }
 
         // Create ID mapping (shuffled index → original index)
         let ids: Vec<String> = shuffled.iter().map(|&(_, orig)| orig.to_string()).collect();
 
         let mut index = Self {
             embedding_dim,
+            stride,
+            hdr,
             config,
-            embeddings: flat_embeddings,
-            norms,
+            nodes: arena,
             connections,
-            connections_l0: Vec::new(),
-            connections_l0_count: Vec::new(),
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
             entry_point: Some(0),
             max_layer: top.0,
         };
-        index.build_l0_cache();
+        index.migrate_l0_into_arena();
         index.shrink_to_fit();
         index
     }
@@ -1892,22 +1914,14 @@ impl HNSWIndex {
     /// Build single-node index (trivial case)
     fn build_single(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         let embedding_dim = embeddings[0].len();
-        let norms = vec![crate::vector::simd::norm_simd(&embeddings[0])];
-        let m0 = config.m0;
-        Self {
-            embedding_dim,
-            config,
-            embeddings: embeddings.into_iter().flatten().collect(),
-            norms,
-            connections: vec![vec![Vec::new()]],
-            connections_l0: vec![0u32; m0],
-            connections_l0_count: vec![0u8],
-            ids: vec!["0".to_string()],
-            contents: vec![String::new()],
-            metadata: vec![None],
-            entry_point: Some(0),
-            max_layer: 0,
-        }
+        let mut index = Self::new(embedding_dim, config);
+        index.push_node(&embeddings[0]);
+        index.connections.push(vec![Vec::new()]);
+        index.ids.push("0".to_string());
+        index.contents.push(String::new());
+        index.metadata.push(None);
+        index.entry_point = Some(0);
+        index
     }
 
     /// Distance function for parallel construction (SIMD accelerated)
@@ -2376,29 +2390,23 @@ mod tests {
 
         let mut index = HNSWIndex::new(2, config);
         let total_nodes = 66usize; // node 0 + 65 neighbors
-        index.embeddings = Vec::with_capacity(total_nodes * 2);
-        index.norms = Vec::with_capacity(total_nodes);
         index.connections = vec![vec![Vec::new()]; total_nodes];
-        index.ids = Vec::with_capacity(total_nodes);
-        index.contents = Vec::with_capacity(total_nodes);
         index.metadata = vec![None; total_nodes];
         index.entry_point = Some(0);
         index.max_layer = 0;
 
         for node in 0..total_nodes {
-            if node == 65 {
-                // Best possible match for query [1, 0].
-                index.embeddings.extend_from_slice(&[1.0, 0.0]);
-            } else {
-                // Orthogonal to query, distance is worse.
-                index.embeddings.extend_from_slice(&[0.0, 1.0]);
-            }
-            index.norms.push(1.0);
+            // Node 65 is the best match for query [1, 0]; the rest are orthogonal to it.
+            let v: [f32; 2] = if node == 65 { [1.0, 0.0] } else { [0.0, 1.0] };
+            index.push_node(&v);
             index.ids.push(format!("doc-{node}"));
             index.contents.push(String::new());
         }
 
-        index.connections[0][0] = (1..=65).map(|n| n as u32).collect();
+        // Give node 0 all 65 others as layer-0 neighbours, via the arena's owner.
+        let neighbors: Vec<u32> = (1..=65).map(|n| n as u32).collect();
+        index.l0_replace(0, &neighbors);
+
         let mut ctx = index.create_search_context();
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, 1.0);
         assert!(
