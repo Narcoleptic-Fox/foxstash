@@ -12,6 +12,25 @@ full-precision vectors, so you can have the speed crown at 1.39x memory, or the 
 In full precision (`Storage::F32`) foxstash is still ~0.88x hnswlib. The win comes entirely
 from moving fewer bytes per node visit, not from a better graph or a faster kernel.
 
+> ### ⚠️ Everything below is a 128-dimensional result. Pick your storage mode by dimension.
+>
+> **The right quantizer depends on the dimension, and the two swap places:**
+>
+> | | SIFT1M (128-d) | GIST1M (960-d) |
+> |---|---|---|
+> | `Storage::SQ8` | **1.20x hnswlib** — the win below | **worthless** (1.03x F32) |
+> | `Storage::RaBitQ` | ~12x slower than SQ8 | **1.4–1.6x faster** than SQ8 or F32 |
+>
+> Every quantized traversal trades ALU work for memory traffic. SQ8 must widen `u8`→`f32`
+> (~3x the ALU of plain f32) to save a roughly *fixed* number of DRAM round-trips — fixed
+> benefit, cost linear in `dim`, so it dies as `dim` grows. RaBitQ compares sign bits and is
+> *cheaper per dimension than f32*, paying instead with a coarser estimate that costs extra
+> graph hops — a penalty roughly independent of `dim`, so it improves as `dim` grows.
+>
+> Real embeddings are 384-d (MiniLM) to 1536-d (OpenAI). **Nobody runs RAG on 128-d vectors.**
+> Do not quote the SIFT numbers below at your dimension without checking. See
+> **"The right quantizer depends on the dimension"**.
+
 ## SIFT1M — QPS at matched recall, single-threaded
 
 | recall@10 | foxstash SQ8 | vs hnswlib | vs faiss | foxstash F32 | vs hnswlib |
@@ -302,7 +321,115 @@ result about the underlying idea. Neither was about the idea.
    slower than the arena. Its distance math is sound — verified, no unit-mismatch analog of the
    SQ8 scale bug — but the vehicle is the one already proven not to hold the experiment.
 
-## `Storage::RaBitQ`: a negative result, and where the bottleneck actually went
+## SQ8 at 960-d: the thesis has a dimension limit
+
+The whole case for `Storage::SQ8` is that HNSW search is **memory-latency bound**, so moving
+fewer bytes per node visit buys throughput. On SIFT (128-d) that is true and worth 1.20x against
+hnswlib. **On GIST1M (960-d) it is worth nothing.** Same machine, same builder, matched recall,
+single-threaded:
+
+| | node block | ns/dist @ ef=500 | QPS @ ~99.4% recall | index size |
+|---|---|---|---|---|
+| `Storage::F32` | 4,112 B | 277.1 | 209 | 4,276 MB |
+| `Storage::SQ8` + rerank | **1,232 B** | **268.8** | **215** | **5,236 MB** |
+
+The block shrank **3.3x** and the cost per distance fell **3%**. SQ8 is also *larger* here — the
+rerank pool still needs the f32 vectors, and at 960-d those dominate.
+
+`dist/query` is the control that proves this is a cost-per-distance story and not a graph story:
+F32 issues 17,245 distance computations and SQ8 issues 17,266 — identical, as they must be, since
+**both graphs are built with exact f32 distances**. Same graph, same work. Only the price of each
+distance changed, and it didn't.
+
+### Why it flips — the two sides of SQ8 scale differently
+
+| | benefit of SQ8 | cost of SQ8 |
+|---|---|---|
+| what it is | DRAM round-trips skipped per node visit | ~3x extra ALU uops to widen `u8` → `i32` → `f32` |
+| scaling in `dim` | roughly **fixed** — one block fetch per visit | **linear in `dim`** |
+
+At 128-d a distance is ~16 AVX2 ops — nothing — so the entire cost is one DRAM round-trip, and
+skipping ~6 cache lines takes 87 → 67 ns/dist. At 960-d the vector is a **65-cache-line
+sequential stream**, which the hardware prefetcher hides almost completely, while the dequant tax
+has grown 7.5x (≈120 → ≈480 uops). A fixed benefit against a linearly growing cost: they cross.
+
+**This is not "quantization doesn't work at high dim."** It is "*this* quantizer's dequant cost
+outgrows the latency it saves." A code whose kernel is *cheaper* per dimension than f32 — rather
+than 3x more expensive — would not have this problem. That is exactly what RaBitQ is, and at
+960-d it wins by 1.4–1.6x. See the next section.
+
+### What this costs us in honesty
+
+The headline "1.20x hnswlib" is a **128-dimensional** claim. Nobody runs RAG on 128-d vectors:
+MiniLM is 384-d, OpenAI's embeddings are 1536-d. We have **not** benchmarked hnswlib or faiss on
+GIST, so we cannot yet say where foxstash stands against them at 960-d. **That measurement is the
+top open item.**
+
+I predicted the opposite. Before running this I wrote in the README that SQ8 "should widen its
+lead at higher dim, since there are more bytes per hop to save" — reasoning from the block
+arithmetic alone and forgetting that the dequant cost scales with those same bytes. A clean,
+plausible, wrong story that would have shipped as fact. The experiment cost 40 minutes.
+
+## The right quantizer depends on the dimension
+
+This is the headline finding of the GIST run, and it inverts the SIFT conclusion.
+
+**GIST1M (960-d), QPS at matched recall, single-threaded:**
+
+| recall@10 | F32 | SQ8 | **RaBitQ** | RaBitQ vs F32 | RaBitQ vs SQ8 |
+|---|---|---|---|---|---|
+| 93.79% | 789 | 758 | **1,136** | **1.44x** | **1.50x** |
+| 96.42% | 555 | 544 | **842** | **1.52x** | **1.55x** |
+| 97.65% | 446 | 445 | **638** | **1.43x** | **1.43x** |
+| 99.02% | 252 | 270 | **410** | **1.63x** | **1.52x** |
+
+| | ns/dist | index size |
+|---|---|---|
+| F32 | 258–277 | 4,276 MB |
+| SQ8 | 250–269 (block 3.3x smaller — bought **nothing**) | 5,236 MB |
+| **RaBitQ** | **138–157** (**1.9x cheaper** than either) | 4,404 MB |
+
+**The two storage modes trade places at opposite ends of the dimension range:**
+
+| | SIFT1M (128-d) | GIST1M (960-d) |
+|---|---|---|
+| `Storage::SQ8` | **1.20x hnswlib** — the win | worthless (1.03x F32) |
+| `Storage::RaBitQ` | **~12x slower** than SQ8 | **1.4–1.6x faster** than SQ8 or F32 |
+
+### Why, mechanically
+
+Every quantized traversal trades **ALU work** for **memory traffic**. The two codes sit on
+opposite sides of that trade:
+
+- **SQ8** must widen `u8` → `i32` → `f32` before it can do arithmetic: roughly **3x more ALU
+  uops per dimension than plain f32**. Its saving is skipped DRAM round-trips, which is roughly
+  *fixed* per node visit. Fixed benefit, cost linear in `dim` — so it wins at low `dim` and dies
+  at high `dim`.
+- **RaBitQ** compares sign bits against a pre-rotated query: **cheaper per dimension than f32**,
+  no widening at all. Its cost is a *coarser* distance estimate, which makes the graph walk take
+  more hops. That penalty is roughly independent of `dim`, while the per-dimension saving grows
+  with it — so it loses at low `dim` and wins at high `dim`.
+
+Read it off `dist/query`, which is the control: at 960-d, RaBitQ issues 17,583 distance
+computations to F32's 17,245 — only **2% more work** — but each one costs 138 ns instead of 277.
+At 128-d that same coarseness cost it **10x more** distance computations, which no per-distance
+saving could repay.
+
+### The near-miss
+
+On SIFT, `Storage::RaBitQ` loses ~12x and every measurement said delete it. The senior engineer
+who implemented it recommended deleting it. The only thing that saved it was noticing that
+**SIFT is 128-d and nobody runs RAG on 128-d vectors** — and that the node-block arithmetic makes
+every quantization conclusion a function of the dimension.
+
+Deleting it would have been defensible, well-measured, and **wrong**. Reproduce with:
+
+```
+benchmarks/fetch-data.sh --with-gist
+cargo run --release -p foxstash-benches --example storage_pareto gist1m
+```
+
+## `Storage::RaBitQ` at 128-d: the negative result, and where the bottleneck went
 
 1-bit-per-dimension traversal was the obvious next step after SQ8's win. It does not pay off,
 and *why* it doesn't is the most useful thing in this file.
@@ -394,6 +521,10 @@ them were *able* to fail.
 | `keep_pruned_connections` | silently ignored in the parallel builder — degree saturated at 64.0/64 vs faiss's 25.4 | the config flag was named in a comment and never read; no test asserted graph density |
 | `ScalarQuantizer::distance_quantized` | ignored per-dimension scale → **7% recall, indistinguishable from chance**; the graph was *built* under the distorted metric | `search_symmetric` had zero tests — and self-retrieval **cannot** catch it (see below) |
 | `Storage::SQ8` + `add()` | **panicked on the first document** — codebook never fitted outside `build*()`. Reachable from `foxstash-db`, so every `insert` on an SQ8 collection crashed | every SQ8 test went through `build_parallel` |
+| quantized save/load | an SQ8 index could be **saved but never loaded** — reload rebuilds via `new()` + `add()`, i.e. untrained | the roundtrip test used the default F32 storage, and asserted only `len()` and "returns 2 results" — which a reload that reinterpreted 8-bit codes as f32 would also satisfy |
+| `HNSWConfigWrapper` | **`seed` silently dropped on deserialize** → a reloaded index assigned nodes to *different layers*, so save/load quietly destroyed reproducibility for anyone who had asked for it | nothing round-tripped a seeded config and compared the graphs |
+| `distance_to_node` | **quantized traversal ignored `config.metric`** — hardcoded L2 under SQ8/RaBitQ, while `score_from_distance` still branched on the metric and **Cosine is the default**. So `HNSWConfig { storage: SQ8, ..Default::default() }` searched under L2 and scored it `1.0 - squared_L2` (unbounded, negative) | **no test anywhere built a quantized index with the default metric** — every caller passed `metric: L2` by hand, avoiding the bug by coincidence |
+| `PQHNSWConfig::rerank_candidates` | **a silent no-op alone** — `search()` gated reranking on `store_original && rerank_candidates > 0`, and `store_original` defaulted to `false`. `PQHNSWConfig { rerank_candidates: 100, ..Default::default() }` reranked **nothing** | the un-reranked path returns k results too, just worse ones — so "no panic" and "returns k" both pass. Only recall-vs-exact catches it (measured: 0.840 with and without the pool) |
 | `benchmarks/data/sift1m/` | held a **10,000**-vector base | nothing validated the corpus against its label |
 | `BinaryHNSWIndex` | 1.2% recall while the rustdoc advertised 90% | benchmarked only on synthetic vectors, where every ANN scores ~60% |
 
@@ -405,8 +536,26 @@ test has proven *nothing*. Only held-out queries scored against real brute-force
 expose it.
 
 The pattern to take from this: a test that exercises a code path is not the same as a test that
-can fail on it. Assert against an independent oracle (brute force), on held-out data, with a
-number that would move if the thing broke.
+can fail on it. Every bug above had code that *ran* under test. What the tests lacked was the
+ability to **discriminate** — the fixture didn't have the property that would make a wrong
+answer look wrong:
+
+- **self-retrieval** cannot catch a broken *quantized* metric (the query re-quantizes to its own code)
+- **uniform-norm vectors** cannot catch a **cosine-vs-L2 swap** — on equal norms the two rank *identically*
+- **an F32 fixture** cannot catch anything about quantized storage
+- **counting results** cannot catch wrong results — "returns 10 items" is satisfied by 10 wrong items
+- **uniform-random vectors** cannot catch a broken ANN — everything scores ~60%
+
+So, two rules, both cheap:
+
+1. **Prove the fixture discriminates before trusting the assertion.** For a metric test, first
+   assert that `Cosine` and `L2` actually *disagree* on your fixture. If they agree, the fixture
+   is inert and your real assertion is vacuous no matter how it reads.
+2. **Sabotage the code and watch the test fail.** This is definitive and takes a minute. It
+   caught a would-be-vacuous RaBitQ recall test (sabotaged kernel → recall fell 100% → 7%),
+   confirmed the SQ8 save/load test (fix disabled → `NotTrained`), and confirmed the PQ rerank
+   test (bug reinstated → recall identical, 0.840 vs 0.840, exactly the silent no-op).
+   **If you cannot make a test fail on purpose, it will never fail by accident either.**
 
 > ### Historical note
 >

@@ -868,6 +868,82 @@ fn sq8_asymmetric_l2_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[f
     acc
 }
 
+/// Asymmetric dot product between an `f32` query and a node's 8-bit SQ8 codes.
+///
+/// Same shape as [`sq8_asymmetric_l2_simd`] — the query stays `f32`, each database value is
+/// dequantized on the fly (`min[d] + code * scale[d]`) — but accumulates a product instead of
+/// a squared difference. This is the building block for SQ8's cosine distance: the codes are
+/// a metric-agnostic reconstruction of the original values (unlike RaBitQ's estimator, which
+/// is folded specifically around squared L2 — see [`rabitq_asymmetric_l2_simd`]), so cosine
+/// under SQ8 is just this dot product composed with the query's and the stored vector's norms
+/// — both already available for free at the call site (the query's once per search, the
+/// stored vector's from the node's own block, already read this visit) — rather than a new
+/// per-vector encoding.
+#[inline]
+pub fn sq8_asymmetric_dot_simd(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    debug_assert_eq!(query.len(), codes.len());
+    debug_assert_eq!(query.len(), min.len());
+    debug_assert_eq!(query.len(), scale.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection; all four slices are the same
+            // length (checked above) and the loop never reads past `n - n % 8`.
+            return unsafe { sq8_asymmetric_dot_avx2(query, codes, min, scale) };
+        }
+    }
+    sq8_asymmetric_dot_scalar(query, codes, min, scale)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sq8_asymmetric_dot_avx2(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = codes.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+
+    while i + 8 <= n {
+        let c8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+        let c32 = _mm256_cvtepu8_epi32(c8);
+        let cf = _mm256_cvtepi32_ps(c32);
+
+        let s = _mm256_loadu_ps(scale.as_ptr().add(i));
+        let m = _mm256_loadu_ps(min.as_ptr().add(i));
+        let q = _mm256_loadu_ps(query.as_ptr().add(i));
+
+        // deq = min + code * scale;  acc += q * deq
+        let deq = _mm256_fmadd_ps(cf, s, m);
+        acc = _mm256_fmadd_ps(q, deq, acc);
+
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let deq = min[j] + codes[j] as f32 * scale[j];
+        total += query[j] * deq;
+    }
+    total
+}
+
+fn sq8_asymmetric_dot_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..codes.len() {
+        let deq = min[i] + codes[i] as f32 * scale[i];
+        acc += query[i] * deq;
+    }
+    acc
+}
+
 /// Asymmetric RaBitQ estimate of squared L2 between a prepared query and a node's 1-bit code.
 ///
 /// "Asymmetric" in the same sense as [`sq8_asymmetric_l2_simd`]: the query stays `f32`
@@ -1055,6 +1131,26 @@ mod sq8_asymmetric_tests {
         assert!(
             rel < 1e-5,
             "AVX2 kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
+        );
+    }
+
+    /// Same check for the dot-product kernel (SQ8's cosine building block), at a dim that is
+    /// NOT a multiple of the 8-lane width.
+    #[test]
+    fn dot_avx2_matches_scalar() {
+        let dim = 131;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 12.0).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let min: Vec<f32> = (0..dim).map(|i| -(i as f32) * 0.11).collect();
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i % 5) as f32 * 0.03).collect();
+
+        let dispatched = sq8_asymmetric_dot_simd(&query, &codes, &min, &scale);
+        let scalar = sq8_asymmetric_dot_scalar(&query, &codes, &min, &scale);
+
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "AVX2 dot kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
         );
     }
 }

@@ -79,6 +79,29 @@ let results = index.search(&query, 10)?;
 Set `rerank_candidates: 0` to drop the full-precision vectors entirely — the smallest index
 foxstash can build, at the cost of a recall ceiling. Measure that trade on your own data.
 
+> ### ⚠️ Pick your storage mode by dimension — the two swap places
+>
+> Every speed number in this README is measured on SIFT, which is **128-dimensional**. That is
+> the best case for `Storage::SQ8` and *not* a typical one:
+>
+> | | SIFT1M (128-d) | GIST1M (960-d) |
+> |---|---|---|
+> | `Storage::SQ8` | **1.20x hnswlib** — the numbers below | **worthless** (1.03x F32) |
+> | `Storage::RaBitQ` | ~12x slower than SQ8 | **1.4–1.6x faster** than SQ8 *or* F32 |
+>
+> Every quantized traversal trades ALU work for memory traffic, and the two codes sit on
+> opposite sides of it. **SQ8** must widen `u8`→`f32` (~3x the ALU of plain f32) to save a
+> roughly *fixed* number of DRAM round-trips — fixed benefit, cost linear in `dim`, so it dies
+> as `dim` grows. **RaBitQ** compares sign bits and is *cheaper per dimension than f32*, paying
+> instead with a coarser estimate that costs extra graph hops — a penalty roughly independent of
+> `dim`, so it improves as `dim` grows.
+>
+> **Rule of thumb: `SQ8` at 128-d, `RaBitQ` at 768-d and above, measure in between.** MiniLM is
+> 384-d and OpenAI's embeddings are 1536-d — nobody runs RAG on 128-d vectors, so do not assume
+> the numbers below are the ones you'll get. Reproduce with
+> `cargo run --release -p foxstash-benches --example storage_pareto gist1m`. Full analysis and
+> the mechanism in `benchmarks/RESULTS.md`.
+
 ### Memory (SIFT1M, 1M x 128d)
 
 | configuration | index size | vs hnswlib |

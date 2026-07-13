@@ -1493,16 +1493,42 @@ mod tests {
         //
         // Asserting `len()` and "search returns 2 results" is NOT enough here: a reload that
         // silently reinterpreted 8-bit codes as f32 would still return the right *count* of
-        // results, all of them wrong. So assert the restored index returns the SAME top-k as
-        // the original.
+        // results, all of them wrong.
+        //
+        // This used to assert the restored index returns the exact SAME top-5 IDs, in the same
+        // order, as the original. That is the wrong property: `to_index()` rebuilds the graph
+        // via `train()` + a loop of `add()` (`insert_node`, quantized distances mid-construction),
+        // while the original was built via `build()` (exact-f32 construction). Those are two
+        // legitimately different HNSW graphs, and near-tie candidates can — and did, observed
+        // directly — swap order between them with no bug involved. The property that actually
+        // matters, and that a genuinely broken round-trip (wrong codebook, reinterpreted bytes)
+        // cannot pass, is recall against brute-force ground truth on HELD-OUT queries.
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
         let dim = 16;
-        let docs: Vec<Document> = (0..40)
-            .map(|i| Document {
-                id: format!("doc-{i}"),
+        let mut rng = StdRng::seed_from_u64(77);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..200)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..30)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+        let docs: Vec<Document> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Document {
+                id: i.to_string(),
                 content: String::new(),
-                embedding: (0..dim)
-                    .map(|d| ((i * 7 + d * 3) % 23) as f32 / 23.0)
-                    .collect(),
+                embedding: v.clone(),
                 metadata: None,
             })
             .collect();
@@ -1530,23 +1556,42 @@ mod tests {
              as f32 and return garbage"
         );
 
-        let query: Vec<f32> = (0..dim).map(|d| ((d * 3) % 23) as f32 / 23.0).collect();
-        let before: Vec<String> = index
-            .search(&query, 5)
-            .unwrap()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
-        let after: Vec<String> = restored
-            .search(&query, 5)
-            .unwrap()
-            .iter()
-            .map(|r| r.id.clone())
-            .collect();
+        let k = 10;
+        let mut total_recall = 0.0f32;
+        for q in &queries {
+            let mut exact: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (d, i)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: std::collections::HashSet<usize> =
+                exact.iter().take(k).map(|(_, i)| *i).collect();
 
-        assert_eq!(
-            after, before,
-            "restored SQ8 index returned different neighbours than the original"
+            let got: std::collections::HashSet<usize> = restored
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+
+            total_recall += truth.intersection(&got).count() as f32 / k as f32;
+        }
+        let recall = total_recall / queries.len() as f32;
+
+        // Measured on this exact seed/config: comfortably high. A codebook refit from the
+        // wrong data, or 8-bit codes silently reinterpreted as f32, does not degrade this
+        // number gently — it craters it. See the discriminating-power check in this function's
+        // sibling verification (temporarily disabling `train()` in `to_index()` during
+        // development made this assertion fail outright, not just dip).
+        assert!(
+            recall > 0.7,
+            "restored SQ8 index recall@{k} against brute-force ground truth = {:.1}% — \
+             the save/load roundtrip corrupted the codebook or the codes",
+            recall * 100.0
         );
     }
 

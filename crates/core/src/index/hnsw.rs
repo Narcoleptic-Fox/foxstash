@@ -389,29 +389,51 @@ pub enum Storage {
     /// and every node visit thereafter is O(dim) with no further matrix work. As with `SQ8`,
     /// the full-precision vectors live in a cold side array and are read only during rerank.
     ///
-    /// # Do not reach for this at low dimension
+    /// # Use this at high dimension. Use [`Storage::SQ8`] at low dimension.
     ///
-    /// On SIFT1M (**128-d**) it is **~12x slower than [`Storage::SQ8`] at matched recall**: it
-    /// buys a 7% cheaper distance (66.6 → 61.9 ns) and pays **10x more distance computations**
-    /// (13,085 vs ~1,250 for ~93% recall@10), because the coarse metric misleads the graph walk.
-    /// Without rerank it collapses to **26% recall**. Use `SQ8`.
+    /// The two modes **swap places** across the dimension range, and the crossover is not
+    /// subtle:
     ///
-    /// The reason is dimensional, and it is why this variant still exists. A node block is
-    /// `header(m0) + vector`, and the header is 272 B at m0=64 regardless of `dim`. At 128-d the
-    /// SQ8 vector is already only 128 B, so 1-bit codes fight for 104 B out of a 400 B block and
-    /// wreck the metric to get it. At 1536-d the SQ8 vector is 1,536 B of an 1,808 B block, and
-    /// RaBitQ would cut that block to **472 B — 3.8x below SQ8** — with the adjacency as noise.
-    ///
-    /// | dim | SQ8 block | RaBitQ block |
+    /// | | SIFT1M (128-d) | GIST1M (960-d) |
     /// |---|---|---|
-    /// | 128 | 400 B | 296 B |
-    /// | 384 | 656 B | 320 B |
-    /// | 1536 | 1,808 B | **472 B** |
+    /// | [`Storage::SQ8`] | **1.20x hnswlib** — the win | worthless (1.03x F32) |
+    /// | `Storage::RaBitQ` | **~12x slower** than SQ8 | **1.4–1.6x faster** than SQ8 *or* F32 |
     ///
-    /// So the SIFT result is a *low-dimension* result and must not be generalized. It is
-    /// **unverified** at the dimensionality real embeddings actually use (384–1536). Until
-    /// someone runs GIST1M (960-d) or a real 768/1536-d corpus, treat this as: loses badly at
-    /// low dim, untested where it should win. See `benchmarks/RESULTS.md`.
+    /// At 960-d, matched recall, single-threaded: RaBitQ serves 1,136 QPS to F32's 789 at 93.8%
+    /// recall@10, and 410 to F32's 252 at 99.0% — while costing **138 ns per distance against
+    /// F32's 277 and SQ8's 269**.
+    ///
+    /// # Why they trade places
+    ///
+    /// Every quantized traversal trades ALU work for memory traffic, and these two sit on
+    /// opposite sides of that trade:
+    ///
+    /// * **SQ8** must widen `u8` → `i32` → `f32` before it can compute — roughly **3x the ALU
+    ///   uops per dimension of plain f32**. What it buys is skipped DRAM round-trips, which is
+    ///   roughly *fixed* per node visit. Fixed benefit, cost linear in `dim`: it wins at low
+    ///   `dim` and dies at high `dim`.
+    /// * **RaBitQ** compares sign bits against a query rotated once per search — **cheaper per
+    ///   dimension than f32**, with no widening at all. What it pays is a *coarser* estimate,
+    ///   which makes the graph walk take more hops. That penalty is roughly independent of
+    ///   `dim`, while the per-dimension saving grows with it: it loses at low `dim` and wins at
+    ///   high `dim`.
+    ///
+    /// `dist/query` is the control that shows this. At 960-d RaBitQ issues 17,583 distance
+    /// computations against F32's 17,245 — only 2% more work — and each costs half as much. At
+    /// 128-d the same coarseness cost it **10x more** distance computations, which no
+    /// per-distance saving could repay, and it lost ~12x.
+    ///
+    /// # Rule of thumb
+    ///
+    /// Real embeddings are 384-d (MiniLM) to 1536-d (OpenAI); nobody runs RAG on 128-d vectors.
+    /// **Reach for `RaBitQ` first at 768-d and above, `SQ8` at 128-d, and measure in between** —
+    /// the crossover has not been located, only bracketed. Reproduce with
+    /// `cargo run --release -p foxstash-benches --example storage_pareto gist1m`.
+    ///
+    /// One caveat carried from 128-d: with a coarse metric, a **too-small rerank pool** makes
+    /// recall *fall* as `ef` rises, because distractors crowd the fixed pool and evict true
+    /// neighbours before the exact rescore sees them. If recall goes down when you search
+    /// harder, raise [`HNSWConfig::rerank_candidates`] before suspecting the quantizer.
     RaBitQ,
 }
 
@@ -699,8 +721,48 @@ impl HNSWIndex {
                 self.q_min = lo;
             }
             Storage::RaBitQ => {
-                self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(embeddings));
+                if self.config.metric == DistanceMetric::Cosine {
+                    // See `rabitq_cosine_input`: fit the quantizer on unit-normalized
+                    // vectors so its L2 estimator becomes an exact affine function of
+                    // cosine distance. A one-time O(n) copy at fit time, not a hot path.
+                    let normalized: Vec<Vec<f32>> = embeddings
+                        .iter()
+                        .map(|v| {
+                            let mut n = v.clone();
+                            crate::vector::ops::normalize(&mut n);
+                            n
+                        })
+                        .collect();
+                    self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(&normalized));
+                } else {
+                    self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(embeddings));
+                }
             }
+        }
+    }
+
+    /// Normalize `v` to unit length when this index is `Storage::RaBitQ` + `DistanceMetric::
+    /// Cosine`; return it unchanged otherwise (borrowed — no allocation on the `L2` hot path).
+    ///
+    /// RaBitQ's estimator (`crates/core/src/vector/rabitq.rs`) computes squared L2. On unit
+    /// vectors, squared L2 is an *exact* affine function of cosine distance:
+    /// `‖â−b̂‖² = ‖â‖² + ‖b̂‖² − 2â·b̂ = 2 − 2cosθ = 2·(1 − cosθ) = 2·cosine_distance`.
+    /// So fitting/encoding/querying on unit-normalized vectors repurposes the *same*
+    /// estimator for cosine with no new estimation error — the approximation quality is
+    /// identical to the already-measured L2 case, just applied to different (normalized)
+    /// input. [`Self::distance_to_node`] divides the kernel's output by 2 on the way out to
+    /// recover the exact cosine distance.
+    ///
+    /// This is why `Storage::RaBitQ` needed no new kernel for cosine, unlike `Storage::SQ8`
+    /// (whose codes are metric-agnostic reconstructions of the original values, so cosine
+    /// there is a new *dot-product* kernel over the existing codes, not a change to encoding).
+    fn rabitq_cosine_input<'a>(&self, v: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
+        if self.config.metric == DistanceMetric::Cosine {
+            let mut owned = v.to_vec();
+            crate::vector::ops::normalize(&mut owned);
+            std::borrow::Cow::Owned(owned)
+        } else {
+            std::borrow::Cow::Borrowed(v)
         }
     }
 
@@ -1097,7 +1159,13 @@ impl HNSWIndex {
                     .rabitq
                     .as_ref()
                     .expect("RaBitQ storage requires fit_codebook to run before push_node");
-                let code = rq.encode(embedding);
+                // See `rabitq_cosine_input`: under cosine, encode a unit-normalized copy so
+                // the estimator's squared-L2 output is an exact affine function of cosine
+                // distance. `self.full` (below) always keeps the ORIGINAL embedding — cosine
+                // is scale-invariant, so the exact rerank stage needs no normalization, and
+                // the original is also what an `L2` index needs for exact rerank.
+                let encode_input = self.rabitq_cosine_input(embedding);
+                let code = rq.encode(&encode_input);
                 self.nodes[v] = code.dtc_sq.to_bits();
                 self.nodes[v + 1] = code.est_factor.to_bits();
                 let bit_words = rabitq_bit_words(self.embedding_dim);
@@ -1970,7 +2038,11 @@ impl HNSWIndex {
             .rabitq
             .as_ref()
             .expect("RaBitQ storage requires fit_codebook to run before any query");
-        Some(rq.prepare_query(query))
+        // See `rabitq_cosine_input`: under cosine, prepare against a unit-normalized query
+        // to match how the codes were encoded — both sides of the estimator must agree on
+        // which geometry (raw or normalized) they're operating in.
+        let query = self.rabitq_cosine_input(query);
+        Some(rq.prepare_query(&query))
     }
 
     /// Fused distance from query to a stored node.
@@ -1978,18 +2050,46 @@ impl HNSWIndex {
     /// Cosine uses the precomputed norms for a single SIMD dispatch and a single pass.
     /// L2 needs no norms, so `qprep.norm` is ignored there. `qprep.rabitq` must be `Some`
     /// whenever storage is [`Storage::RaBitQ`] — see [`Self::prepare_rabitq_query`].
+    ///
+    /// Both quantized storages honor `self.config.metric` — they used to silently ignore it
+    /// and always compute L2, which under the (default!) `DistanceMetric::Cosine` meant the
+    /// entire walk ran under the wrong metric, and `score_from_distance` then treated the
+    /// resulting squared-L2 value as a cosine distance, emitting unbounded/negative scores.
+    /// No test ever constructed a quantized index with the default metric, so nothing caught
+    /// it — classic could-not-fail.
     #[inline]
     fn distance_to_node(&self, query: &[f32], node_id: usize, qprep: &QueryPrep) -> f32 {
         // Under SQ8 the walk reads 8-bit codes straight out of the node's own block and
         // never touches `full`. This is the whole point of the storage mode: the block
         // shrinks from 784 bytes to 400, and the search is bound by exactly these reads.
         if self.config.storage == Storage::SQ8 {
-            return crate::vector::simd::sq8_asymmetric_l2_simd(
-                query,
-                self.get_codes(node_id),
-                &self.q_min,
-                &self.q_scale,
-            );
+            return match self.config.metric {
+                DistanceMetric::L2 => crate::vector::simd::sq8_asymmetric_l2_simd(
+                    query,
+                    self.get_codes(node_id),
+                    &self.q_min,
+                    &self.q_scale,
+                ),
+                DistanceMetric::Cosine => {
+                    let norm_b = self.get_norm(node_id);
+                    if qprep.norm == 0.0 || norm_b == 0.0 {
+                        return 1.0;
+                    }
+                    // The codes are a metric-agnostic reconstruction of the original values
+                    // (unlike RaBitQ's estimator below), so cosine here is a genuine
+                    // dot-product kernel over the same codes, composed with the norms
+                    // already available for free: `qprep.norm` (once per query) and
+                    // `get_norm` (in the node's own block, already read this visit).
+                    let dot = crate::vector::simd::sq8_asymmetric_dot_simd(
+                        query,
+                        self.get_codes(node_id),
+                        &self.q_min,
+                        &self.q_scale,
+                    );
+                    let similarity = (dot / (qprep.norm * norm_b)).clamp(-1.0, 1.0);
+                    1.0 - similarity
+                }
+            };
         }
 
         // Under RaBitQ the walk reads one packed sign-bit code plus two scalars, straight out
@@ -2000,13 +2100,22 @@ impl HNSWIndex {
                 "Storage::RaBitQ traversal requires a query prepared via prepare_rabitq_query",
             );
             let (dtc_sq, est_factor, bits) = self.get_rabitq_code(node_id);
-            return crate::vector::simd::rabitq_asymmetric_l2_simd(
+            let raw = crate::vector::simd::rabitq_asymmetric_l2_simd(
                 prepared.rq(),
                 bits,
                 dtc_sq,
                 est_factor,
                 prepared.qn_sq(),
             );
+            return match self.config.metric {
+                DistanceMetric::L2 => raw,
+                // See `rabitq_cosine_input`: both sides were unit-normalized before
+                // encoding, so `raw` is `‖â-b̂‖² = 2·cosine_distance` exactly (not an
+                // additional approximation on top of the estimator's own error). Clamped
+                // defensively — cosine distance is bounded to [0, 2] by definition, and the
+                // estimator's own `.max(0.0)` only guards the lower bound.
+                DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
+            };
         }
 
         let embedding = self.get_embedding(node_id);
@@ -2023,10 +2132,24 @@ impl HNSWIndex {
         }
     }
 
-    /// Exact squared-L2 against the full-precision vector, for the rerank stage.
+    /// Exact distance against the full-precision vector, for the rerank stage. Honors
+    /// `self.config.metric` — a rerank stage that rescores under a different metric than the
+    /// walk used would silently corrupt the final ranking regardless of how good the walk was.
     #[inline]
     fn exact_distance(&self, query: &[f32], node_id: usize) -> f32 {
-        crate::vector::simd::l2_squared_distance_simd(query, self.get_embedding(node_id))
+        let embedding = self.get_embedding(node_id);
+        match self.config.metric {
+            DistanceMetric::L2 => crate::vector::simd::l2_squared_distance_simd(query, embedding),
+            DistanceMetric::Cosine => {
+                // `cosine_distance_prenorm` guards both zero-norm cases (query and stored)
+                // internally and returns 1.0 — no need to duplicate that check here.
+                crate::vector::simd::cosine_distance_prenorm(
+                    query,
+                    embedding,
+                    self.get_norm(node_id),
+                )
+            }
+        }
     }
 
     /// Map a distance to a similarity score (higher is better), per metric.
@@ -3891,5 +4014,294 @@ mod tests {
             let results = index.search(q, 5).expect("search must not panic");
             assert_eq!(results.len(), 5);
         }
+    }
+
+    // ========================================================================
+    // Quantized storage must honor `config.metric` (it silently ignored it and always
+    // computed L2, which under the DEFAULT metric — Cosine — meant the whole walk ran under
+    // the wrong metric and `score_from_distance` scored a squared-L2 value as if it were a
+    // bounded cosine distance).
+    // ========================================================================
+
+    /// Directions with per-point norms scaled 0.5x-50x apart. Without varying norms, every
+    /// point in a cluster has roughly the same magnitude and cosine/L2 rank near-identically
+    /// — this fixture exists specifically so a metric mix-up *must* change the answer. See
+    /// `cosine_and_l2_pick_different_neighbors` for the two-point version of the same idea;
+    /// this is its recall-scale generalisation.
+    fn nonuniform_norm_clusters(
+        seed: u64,
+        dim: usize,
+        n_clusters: usize,
+        per_cluster: usize,
+        n_queries: usize,
+    ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let directions: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+                crate::vector::ops::normalize(&mut v);
+                v
+            })
+            .collect();
+
+        let make = |n: usize, rng: &mut StdRng| -> Vec<Vec<f32>> {
+            (0..n)
+                .map(|i| {
+                    let dir = &directions[i % n_clusters];
+                    // Small angular jitter so points sharing a direction aren't identical.
+                    let jittered: Vec<f32> =
+                        dir.iter().map(|x| x + rng.random::<f32>() * 0.05).collect();
+                    // Wildly different magnitude per point — the part that makes cosine and
+                    // L2 disagree.
+                    let scale = 0.5 + rng.random::<f32>() * 49.5;
+                    jittered.into_iter().map(|x| x * scale).collect()
+                })
+                .collect()
+        };
+
+        let base = make(n_clusters * per_cluster, &mut rng);
+        let queries = make(n_queries, &mut rng);
+        (base, queries)
+    }
+
+    /// Prove the fixture above is discriminating *before* trusting any test built on it — an
+    /// assertion that can't fail proves nothing (the self-retrieval trap, generalized).
+    #[test]
+    fn nonuniform_norm_fixture_discriminates_cosine_from_l2() {
+        let (base, queries) = nonuniform_norm_clusters(11, 16, 10, 30, 20);
+
+        let build = |metric: DistanceMetric| {
+            HNSWIndex::build_parallel(
+                base.clone(),
+                HNSWConfig {
+                    metric,
+                    ef_construction: 150,
+                    ef_search: 150,
+                    seed: Some(1),
+                    ..Default::default()
+                },
+            )
+        };
+        let cosine_idx = build(DistanceMetric::Cosine);
+        let l2_idx = build(DistanceMetric::L2);
+
+        let disagreements = queries
+            .iter()
+            .filter(|q| {
+                let c = cosine_idx.search(q, 1).unwrap()[0].id.clone();
+                let l = l2_idx.search(q, 1).unwrap()[0].id.clone();
+                c != l
+            })
+            .count();
+
+        assert!(
+            disagreements * 2 >= queries.len(),
+            "fixture is not discriminating: cosine and L2 only disagreed on {disagreements}/{} \
+             queries — a metric mix-up test built on this fixture could pass by accident",
+            queries.len()
+        );
+    }
+
+    /// The regression test for the actual bug: `Storage::SQ8` with `..Default::default()` —
+    /// metric deliberately NOT spelled out, so this exercises the default (Cosine) path the
+    /// way a real caller who forgets to set `metric` would. Recall is measured against
+    /// brute-force COSINE ground truth on held-out queries; the old, broken code would have
+    /// silently run the walk under L2 instead, which — on this fixture, where cosine and L2
+    /// disagree on most queries — would collapse recall against the cosine ground truth.
+    #[test]
+    fn sq8_default_metric_is_cosine_not_l2() {
+        let (base, queries) = nonuniform_norm_clusters(23, 24, 12, 30, 40);
+
+        let config = HNSWConfig {
+            storage: Storage::SQ8,
+            rerank_candidates: 50,
+            ef_construction: 150,
+            ef_search: 150,
+            seed: Some(2),
+            ..Default::default() // metric: Cosine, the default — not spelled out on purpose
+        };
+        assert_eq!(
+            config.metric,
+            DistanceMetric::Cosine,
+            "test setup sanity check"
+        );
+        let index = HNSWIndex::build_parallel(base.clone(), config);
+
+        let k = 10;
+        let mut cosine_recall = 0.0f32;
+        let mut l2_recall = 0.0f32;
+        for q in &queries {
+            let mut by_cosine: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (1.0 - crate::vector::simd::cosine_similarity_simd(v, q), i))
+                .collect();
+            by_cosine.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let cosine_truth: HashSet<usize> = by_cosine.iter().take(k).map(|(_, i)| *i).collect();
+
+            let mut by_l2: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (crate::vector::simd::l2_squared_distance_simd(v, q), i))
+                .collect();
+            by_l2.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let l2_truth: HashSet<usize> = by_l2.iter().take(k).map(|(_, i)| *i).collect();
+
+            let got: HashSet<usize> = index
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+
+            cosine_recall += cosine_truth.intersection(&got).count() as f32 / k as f32;
+            l2_recall += l2_truth.intersection(&got).count() as f32 / k as f32;
+        }
+        cosine_recall /= queries.len() as f32;
+        l2_recall /= queries.len() as f32;
+
+        assert!(
+            cosine_recall > 0.6,
+            "Storage::SQ8 with default metric: recall@{k} against COSINE ground truth = \
+             {:.1}% — the default metric is meant to be cosine",
+            cosine_recall * 100.0
+        );
+        assert!(
+            cosine_recall > l2_recall + 0.2,
+            "Storage::SQ8 with default metric answers cosine ({:.1}% recall) no better than \
+             L2 ({:.1}% recall) — this is the exact shape of the metric-ignoring bug",
+            cosine_recall * 100.0,
+            l2_recall * 100.0
+        );
+    }
+
+    /// Same regression test, `Storage::RaBitQ`.
+    #[test]
+    fn rabitq_default_metric_is_cosine_not_l2() {
+        let (base, queries) = nonuniform_norm_clusters(29, 24, 12, 30, 40);
+
+        let config = HNSWConfig {
+            storage: Storage::RaBitQ,
+            rerank_candidates: 50,
+            ef_construction: 150,
+            ef_search: 150,
+            seed: Some(4),
+            ..Default::default() // metric: Cosine, the default — not spelled out on purpose
+        };
+        assert_eq!(
+            config.metric,
+            DistanceMetric::Cosine,
+            "test setup sanity check"
+        );
+        let index = HNSWIndex::build_parallel(base.clone(), config);
+
+        let k = 10;
+        let mut cosine_recall = 0.0f32;
+        let mut l2_recall = 0.0f32;
+        for q in &queries {
+            let mut by_cosine: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (1.0 - crate::vector::simd::cosine_similarity_simd(v, q), i))
+                .collect();
+            by_cosine.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let cosine_truth: HashSet<usize> = by_cosine.iter().take(k).map(|(_, i)| *i).collect();
+
+            let mut by_l2: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (crate::vector::simd::l2_squared_distance_simd(v, q), i))
+                .collect();
+            by_l2.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let l2_truth: HashSet<usize> = by_l2.iter().take(k).map(|(_, i)| *i).collect();
+
+            let got: HashSet<usize> = index
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+
+            cosine_recall += cosine_truth.intersection(&got).count() as f32 / k as f32;
+            l2_recall += l2_truth.intersection(&got).count() as f32 / k as f32;
+        }
+        cosine_recall /= queries.len() as f32;
+        l2_recall /= queries.len() as f32;
+
+        assert!(
+            cosine_recall > 0.5,
+            "Storage::RaBitQ with default metric: recall@{k} against COSINE ground truth = \
+             {:.1}%",
+            cosine_recall * 100.0
+        );
+        assert!(
+            cosine_recall > l2_recall + 0.2,
+            "Storage::RaBitQ with default metric answers cosine ({:.1}% recall) no better \
+             than L2 ({:.1}% recall) — this is the exact shape of the metric-ignoring bug",
+            cosine_recall * 100.0,
+            l2_recall * 100.0
+        );
+    }
+
+    /// The old code fed a squared-L2 value (unbounded, frequently large) into
+    /// `score_from_distance`'s `1.0 - dist` cosine formula, producing large negative scores.
+    /// Under a correctly metric-aware SQ8, distances are true (rescored, exact) cosine
+    /// distances in `[0, 2]`, so scores (`1 - dist`) must land in `[-1, 1]` and decrease
+    /// monotonically as the true angle widens.
+    #[test]
+    fn sq8_cosine_scores_are_bounded_and_monotonic() {
+        // Same axis, increasingly different directions; magnitudes deliberately unequal so
+        // an L2-in-disguise bug (which cares about magnitude) would rank these differently
+        // than a genuine cosine metric (which does not).
+        let query = vec![10.0, 0.0, 0.0, 0.0];
+        let vectors = [
+            ("same_dir", vec![500.0, 0.0, 0.0, 0.0]), // identical direction, huge magnitude
+            ("close_dir", vec![8.0, 2.0, 0.0, 0.0]),
+            ("far_dir", vec![2.0, 8.0, 0.0, 0.0]),
+            ("opposite_dir", vec![-30.0, 0.0, 0.0, 0.0]),
+        ];
+
+        let mut index = HNSWIndex::new(
+            4,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                ..Default::default() // metric: Cosine
+            },
+        );
+        index
+            .train(&vectors.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>())
+            .unwrap();
+        for (id, v) in &vectors {
+            index.add_embedding((*id).to_string(), v.clone()).unwrap();
+        }
+
+        let results = index.search(&query, vectors.len()).unwrap();
+        assert_eq!(results.len(), vectors.len());
+        for r in &results {
+            assert!(
+                (-1.0..=1.0).contains(&r.score),
+                "SQ8 cosine score {} for {} outside [-1, 1] — the metric-ignoring bug fed a \
+                 squared-L2 value into the cosine score formula",
+                r.score,
+                r.id
+            );
+        }
+        for w in results.windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "scores must be descending: {:?}",
+                results
+            );
+        }
+        assert_eq!(
+            results[0].id, "same_dir",
+            "identical direction must rank first under cosine"
+        );
+        assert_eq!(
+            results.last().unwrap().id,
+            "opposite_dir",
+            "opposite direction must rank last under cosine"
+        );
     }
 }

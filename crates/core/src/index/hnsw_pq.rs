@@ -78,9 +78,19 @@ pub struct PQHNSWConfig {
     pub ml: f32,
     /// Whether to use distance cache for faster symmetric search
     pub use_distance_cache: bool,
-    /// Store original vectors for reranking
-    pub store_original: bool,
-    /// Number of candidates to rerank with original vectors
+    /// Size of the candidate pool rescored with exact full-precision distances.
+    ///
+    /// `0` disables reranking, and the original vectors are then not retained at all — the
+    /// only reason to keep them is to rescore with them.
+    ///
+    /// This used to be two fields: `rerank_candidates` AND a separate `store_original` bool,
+    /// and `search()` required BOTH (`store_original && rerank_candidates > 0`). Since
+    /// `store_original` defaulted to `false`, the obvious thing to write —
+    /// `PQHNSWConfig { rerank_candidates: 100, ..Default::default() }` — silently reranked
+    /// **nothing**. You asked for a rerank pool and got none, with no error. The two fields
+    /// could not express a meaningful state that this one cannot, so there is now one field,
+    /// and it means what the identically-named field on [`HNSWConfig`](super::hnsw::HNSWConfig)
+    /// means.
     pub rerank_candidates: usize,
 }
 
@@ -94,7 +104,6 @@ impl Default for PQHNSWConfig {
             ef_search: 50,
             ml: 1.0 / (m as f32).ln(),
             use_distance_cache: true,
-            store_original: false,
             rerank_candidates: 0,
         }
     }
@@ -106,7 +115,6 @@ impl PQHNSWConfig {
     /// Trades memory for accuracy: stores original vectors and reranks
     /// top candidates using exact distance.
     pub fn with_reranking(mut self, candidates: usize) -> Self {
-        self.store_original = true;
         self.rerank_candidates = candidates;
         self
     }
@@ -131,7 +139,7 @@ struct PQNode {
     content: String,
     /// PQ-encoded embedding
     code: PQCode,
-    /// Original embedding (if store_original is true)
+    /// Original embedding, retained only when `rerank_candidates > 0`
     original: Option<Vec<f32>>,
     /// Metadata
     metadata: Option<serde_json::Value>,
@@ -237,7 +245,7 @@ impl PQHNSWIndex {
         }
 
         let code = self.pq.encode(&document.embedding);
-        let original = if self.config.store_original {
+        let original = if self.config.rerank_candidates > 0 {
             Some(document.embedding)
         } else {
             None
@@ -308,7 +316,7 @@ impl PQHNSWIndex {
         current_nearest = self.search_layer_adc(&distance_table, &current_nearest, candidates, 0);
 
         // Optionally rerank with original vectors
-        let results = if self.config.store_original && self.config.rerank_candidates > 0 {
+        let results = if self.config.rerank_candidates > 0 {
             self.rerank_with_original(query, &current_nearest, k)
         } else {
             self.to_search_results_adc(query, &current_nearest, &distance_table, k)
@@ -383,7 +391,7 @@ impl PQHNSWIndex {
         }
 
         let code_size = self.pq.config().num_subvectors;
-        let original_size = if self.config.store_original {
+        let original_size = if self.config.rerank_candidates > 0 {
             self.pq.config().dim * 4
         } else {
             0
@@ -784,7 +792,7 @@ mod tests {
         let config = PQHNSWConfig::default();
         assert_eq!(config.m, 16);
         assert_eq!(config.ef_construction, 200);
-        assert!(!config.store_original);
+        assert_eq!(config.rerank_candidates, 0);
     }
 
     #[test]
@@ -1046,6 +1054,86 @@ mod tests {
     /// `ProductQuantizer::symmetric_distance` computes directly, so a correct
     /// implementation should place both indices at comparable recall on the same
     /// fixture and queries.
+    #[test]
+    fn asking_for_reranking_actually_reranks() {
+        // `rerank_candidates` used to be a no-op on its own: `search()` gated reranking on
+        // `store_original && rerank_candidates > 0`, and `store_original` defaulted to false.
+        // So `PQHNSWConfig { rerank_candidates: 100, ..Default::default() }` — the obvious
+        // thing to write — silently reranked nothing and returned the raw ADC ranking.
+        //
+        // Testing "it doesn't panic" or "it returns k results" would NOT have caught that:
+        // the un-reranked path returns k results too, just worse ones. So the assertion has
+        // to be that reranking makes the answer measurably BETTER against exact ground truth.
+        let dim = 32;
+        let k = 10;
+        let pq_config = PQConfig::new(dim, 8, 6)
+            .with_seed(42)
+            .with_kmeans_iterations(15);
+
+        let all = clustered_vectors(180, dim, 0x51ED_2701);
+        let (queries, corpus) = all.split_at(20);
+
+        let build = |rerank: usize| {
+            let pq = ProductQuantizer::train(corpus, pq_config.clone()).unwrap();
+            let mut idx = PQHNSWIndex::from_quantizer(
+                pq,
+                PQHNSWConfig {
+                    rerank_candidates: rerank,
+                    ..Default::default()
+                },
+            );
+            for (i, v) in corpus.iter().enumerate() {
+                idx.add(Document {
+                    id: i.to_string(),
+                    content: String::new(),
+                    embedding: v.clone(),
+                    metadata: None,
+                })
+                .unwrap();
+            }
+            idx
+        };
+
+        // Exact top-k, by brute force. The oracle.
+        let exact = |q: &[f32]| -> Vec<usize> {
+            let mut d: Vec<(f32, usize)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    (
+                        v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum::<f32>(),
+                        i,
+                    )
+                })
+                .collect();
+            d.sort_by(|a, b| a.0.total_cmp(&b.0));
+            d.into_iter().take(k).map(|(_, i)| i).collect()
+        };
+
+        let recall = |idx: &PQHNSWIndex| -> f64 {
+            let mut hits = 0usize;
+            for q in queries {
+                let truth: std::collections::HashSet<usize> = exact(q).into_iter().collect();
+                for r in idx.search(q, k).unwrap() {
+                    if truth.contains(&r.id.parse::<usize>().unwrap()) {
+                        hits += 1;
+                    }
+                }
+            }
+            hits as f64 / (queries.len() * k) as f64
+        };
+
+        let plain = recall(&build(0));
+        let reranked = recall(&build(100));
+
+        assert!(
+            reranked > plain,
+            "rerank_candidates=100 must beat rerank_candidates=0 — got {reranked:.3} vs \
+             {plain:.3}. Equal recall means the rerank pool is being silently ignored, which \
+             is exactly the bug this test exists to catch."
+        );
+    }
+
     #[test]
     fn pq_use_distance_cache_false_retrieves_correctly_on_clustered_data() {
         let dim = 32;

@@ -1284,7 +1284,10 @@ mod concurrent_access {
             let serial = index.search(query, 5).unwrap();
             let ids: Vec<&str> = batch[i].iter().map(|r| r.id.as_str()).collect();
             let expected: Vec<&str> = serial.iter().map(|r| r.id.as_str()).collect();
-            assert_eq!(ids, expected, "search_batch disagrees with search on query {i}");
+            assert_eq!(
+                ids, expected,
+                "search_batch disagrees with search on query {i}"
+            );
         }
     }
 
@@ -1297,7 +1300,9 @@ mod concurrent_access {
             index.add(make_doc(&format!("doc_{}", i), dim, i)).unwrap();
         }
 
-        let queries: Vec<Vec<f32>> = (0..20).map(|i| deterministic_embedding(dim, i + 999)).collect();
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|i| deterministic_embedding(dim, i + 999))
+            .collect();
         let k = 5;
 
         // The point of a Searcher is that it carries scratch (a visited bitset and two heaps)
@@ -1309,7 +1314,14 @@ mod concurrent_access {
         // `overlap >= 3` of 5, which a fully broken bitset would still have passed.
         let fresh: Vec<Vec<String>> = queries
             .iter()
-            .map(|q| index.search(q, k).unwrap().iter().map(|r| r.id.clone()).collect())
+            .map(|q| {
+                index
+                    .search(q, k)
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect()
+            })
             .collect();
 
         let mut searcher = index.searcher();
