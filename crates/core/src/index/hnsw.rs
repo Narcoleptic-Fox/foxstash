@@ -348,7 +348,22 @@ pub struct HNSWConfig {
     /// a recall cost of 0.02-0.31 points. See [`BuildStrategy`] for the measurements.
     pub build_strategy: BuildStrategy,
 
-    /// Random seed for reproducible builds (None = random)
+    /// Random seed for the level assignments (`None` = drawn from entropy).
+    ///
+    /// # A seed alone does not make a build reproducible
+    ///
+    /// It does under [`BuildStrategy::Sequential`], which is bit-identical across runs at a fixed
+    /// seed. It does **not** under [`BuildStrategy::Parallel`] — the default. The seed fixes which
+    /// level each vector lands on and the order they are inserted in, but not the order in which
+    /// threads win the lock on a neighbour list. Two parallel builds at the same seed produce
+    /// graphs that differ on a large fraction of nodes (measured: ~78% of nodes at m0=16, n=600).
+    ///
+    /// Recall is unaffected — every such graph is a valid HNSW, and they are equivalent to within
+    /// run-to-run noise. What you lose is byte-identical indexes and exactly-reproducible search
+    /// results. If you need either — golden-file tests, debugging a specific graph, regulated
+    /// reproducibility — set `build_strategy: BuildStrategy::Sequential` as well as `seed`.
+    ///
+    /// Pinned by `seed_gives_reproducible_builds_only_on_the_sequential_builder`.
     pub seed: Option<u64>,
 
     /// What the traversal reads for each node's vector. See [`Storage`].
@@ -2390,7 +2405,19 @@ impl HNSWIndex {
         let mut layers: Vec<Vec<UpperNode>> = vec![Vec::new(); top.0];
 
         // Search pool for thread-local state reuse
+        // The parallel builder used to see NEITHER `use_heuristic` NOR `extend_candidates`:
+        // `par_select_heuristic` took only (metric, sorted, points, m, keep_pruned), and the whole
+        // parallel path mentioned those two options ZERO times. So setting `use_heuristic: false`
+        // or `extend_candidates: true` was silently ignored on the DEFAULT builder — the same bug
+        // as `m`/`m0`, on the same path, found the same way (asking "which options reach which
+        // code path?" rather than "is this option read anywhere?").
+        //
+        // The tests for those two options did not catch it because they call `select_neighbors`
+        // directly — the SEQUENTIAL path. An option tested against one implementation of a
+        // strategy is not a tested option.
         let pool = SearchPool::new(n, config.metric, config.keep_pruned_connections);
+        let use_heuristic = config.use_heuristic;
+        let extend_candidates = config.extend_candidates;
 
         // Process batches from top to bottom
         for (batch, range) in ranges {
@@ -2410,6 +2437,8 @@ impl HNSWIndex {
                         top,
                         m,
                         m0,
+                        use_heuristic,
+                        extend_candidates,
                     );
                 }
             } else {
@@ -2426,6 +2455,8 @@ impl HNSWIndex {
                         top,
                         m,
                         m0,
+                        use_heuristic,
+                        extend_candidates,
                     );
                 });
             }
@@ -2458,6 +2489,8 @@ impl HNSWIndex {
         top: LayerId,
         m: usize,
         m0: usize,
+        use_heuristic: bool,
+        extend_candidates: bool,
     ) {
         let metric = pool.metric;
         let keep_pruned = pool.keep_pruned;
@@ -2500,8 +2533,16 @@ impl HNSWIndex {
         // poorly bridged and tanks recall on structured data. The heuristic keeps
         // a diverse neighbor set so search can cross cluster boundaries — matching
         // the sequential build path.
-        let found =
-            Self::par_select_heuristic(metric, search.select_simple(), points, m0, keep_pruned);
+        let found = Self::par_select_heuristic(
+            metric,
+            search.select_simple(),
+            points,
+            m0,
+            keep_pruned,
+            use_heuristic,
+            extend_candidates,
+            zero,
+        );
 
         // Add connections: new node → neighbors (in zero layer)
         {
@@ -2513,7 +2554,16 @@ impl HNSWIndex {
 
         // Add reverse connections: neighbors → new node (bidirectional)
         for candidate in found.iter().take(m0) {
-            Self::add_reverse_connection(metric, zero, points, new, candidate.pid, keep_pruned, m0);
+            Self::add_reverse_connection(
+                metric,
+                zero,
+                points,
+                new,
+                candidate.pid,
+                keep_pruned,
+                m0,
+                use_heuristic,
+            );
         }
 
         pool.push(search);
@@ -2533,13 +2583,50 @@ impl HNSWIndex {
     /// and never read — so the parallel builder (the default) saturated every node to `m0=64`
     /// while faiss, at the same `M`, averages 25. Every hop then scans 2.5x more neighbours,
     /// which is where foxstash's extra ~32% of distance computations per query came from.
+    #[allow(clippy::too_many_arguments)]
     fn par_select_heuristic(
         metric: DistanceMetric,
         sorted: &[Candidate],
         points: &[Vec<f32>],
         m: usize,
         keep_pruned: bool,
+        use_heuristic: bool,
+        extend_candidates: bool,
+        zero: &[RwLock<ZeroNode>],
     ) -> Vec<Candidate> {
+        // `use_heuristic: false` = plain "keep the m nearest", no diversity filter. The sequential
+        // builder has always honoured this (`select_neighbors` early-returns to
+        // `select_neighbors_simple`); the parallel builder used to ignore it entirely.
+        if !use_heuristic {
+            return sorted.iter().take(m).copied().collect();
+        }
+
+        // `extend_candidates: true` = also consider the neighbours OF the candidates, widening the
+        // pool before the diversity filter runs. Algorithm 4's `extendCandidates` flag.
+        let mut pool: Vec<Candidate> = sorted.to_vec();
+        if extend_candidates {
+            let mut seen: HashSet<u32> = sorted.iter().map(|c| c.pid.0).collect();
+            let mut extra: Vec<Candidate> = Vec::new();
+            for &cand in sorted {
+                let node = zero[cand.pid.as_usize()].read();
+                for pid in node.iter() {
+                    if seen.insert(pid.0) {
+                        extra.push(Candidate {
+                            distance: Self::parallel_distance(
+                                metric,
+                                &points[cand.pid.as_usize()],
+                                &points[pid.as_usize()],
+                            ),
+                            pid,
+                        });
+                    }
+                }
+            }
+            pool.extend(extra);
+            pool.sort_unstable();
+        }
+        let sorted: &[Candidate] = &pool;
+
         let mut selected: Vec<Candidate> = Vec::with_capacity(m);
         for &cand in sorted {
             if selected.len() >= m {
@@ -2581,6 +2668,7 @@ impl HNSWIndex {
         neighbor: PointId,
         keep_pruned: bool,
         m0: usize,
+        use_heuristic: bool,
     ) {
         let mut node = zero[neighbor.as_usize()].write();
         let neighbor_point = &points[neighbor.as_usize()];
@@ -2632,7 +2720,19 @@ impl HNSWIndex {
             })
             .collect();
         cands.sort_unstable();
-        let selected = Self::par_select_heuristic(metric, &cands, points, m0, keep_pruned);
+        // `extend_candidates: false` here deliberately: this is the reverse-prune of an existing
+        // neighbour's list, where the candidate set IS the neighbour's neighbourhood already.
+        // Extending it again would re-walk the same graph. Algorithm 4 extends only at insertion.
+        let selected = Self::par_select_heuristic(
+            metric,
+            &cands,
+            points,
+            m0,
+            keep_pruned,
+            use_heuristic,
+            false,
+            zero,
+        );
 
         // Without the backfill the heuristic may return fewer than M0_MAX, so the tail must
         // be padded: `ZeroNode::iter` stops at the first INVALID, and leaving stale ids there
@@ -4890,6 +4990,178 @@ mod tests {
     /// node genuinely reaches `m` neighbours). If nothing ever reaches the cap, "no node exceeds
     /// the cap" is trivially true and proves nothing — that is exactly how the `ml: 0.8` fixture
     /// hid this, by promoting too few nodes for any degree limit to matter.
+    /// `use_heuristic` and `extend_candidates` must be honoured by **both** builders.
+    ///
+    /// They were not. `par_select_heuristic` took only `(metric, sorted, points, m, keep_pruned)`
+    /// and the entire parallel build path mentioned these two options **zero times** — so
+    /// `use_heuristic: false` / `extend_candidates: true` were silently ignored on the DEFAULT
+    /// builder. The pre-existing tests missed it because they call `select_neighbors` directly:
+    /// the *sequential* path. **An option tested against one implementation of a strategy is not a
+    /// tested option.**
+    ///
+    /// # This test needs a NOISE FLOOR, and the first version of it did not have one
+    ///
+    /// My first attempt compared "graph with the option on" against "graph with it off" and
+    /// asserted they differed on >5% of nodes. It passed under sabotage. The reason is its own
+    /// bug (see `seed`): **the parallel builder is not reproducible even at a fixed seed** —
+    /// threads race to write neighbour lists, and two builds of the *identical* config differ on
+    /// ~15% of nodes. The test was measuring the race, not the option.
+    ///
+    /// So the control comes first and it is not optional: build the SAME config twice, measure how
+    /// much it varies from thread scheduling alone, and only then require the option's effect to
+    /// exceed that floor by a clear margin. A difference smaller than the noise is not evidence.
+    #[test]
+    fn use_heuristic_and_extend_candidates_are_honoured_by_both_builders() {
+        let mut rng = StdRng::seed_from_u64(31337);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..16).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..600)
+            .map(|i| {
+                let c: &Vec<f32> = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.4).collect()
+            })
+            .collect();
+
+        const M0: usize = 16;
+        // Averaged over builds, so that thread scheduling shows up as a small wobble in the mean
+        // rather than as a signal. `keep_pruned_connections: false` is essential: the backfill
+        // exists precisely to refill the slots the heuristic emptied, and would erase the effect.
+        let avg_degree = |heuristic: bool, extend: bool, strategy: BuildStrategy| -> f64 {
+            let reps = 3;
+            (0..reps)
+                .map(|r| {
+                    let ix = HNSWIndex::build(
+                        base.clone(),
+                        HNSWConfig {
+                            metric: DistanceMetric::L2,
+                            m: 8,
+                            m0: M0,
+                            ef_construction: 16,
+                            seed: Some(21 + r),
+                            use_heuristic: heuristic,
+                            extend_candidates: extend,
+                            keep_pruned_connections: false,
+                            build_strategy: strategy,
+                            ..Default::default()
+                        },
+                    );
+                    let total: usize = (0..ix.len()).map(|i| ix.get_neighbors_l0(i).len()).sum();
+                    total as f64 / ix.len() as f64
+                })
+                .sum::<f64>()
+                / reps as f64
+        };
+
+        for strategy in [BuildStrategy::Parallel, BuildStrategy::Sequential] {
+            let greedy = avg_degree(false, false, strategy);
+            let heuristic = avg_degree(true, false, strategy);
+            let extended = avg_degree(true, true, strategy);
+
+            // The noise floor, measured on the same statistic the assertions use. The parallel
+            // builder is not reproducible (see `seed_gives_reproducible_builds_only_on_the_...`),
+            // so an effect must be shown to exceed the wobble, not merely to exist.
+            let noise = (avg_degree(true, false, strategy) - heuristic).abs();
+
+            // Greedy selection takes the m0 nearest candidates and fills every slot.
+            assert!(
+                (greedy - M0 as f64).abs() < 0.01,
+                "{strategy:?}: use_heuristic=false must keep the m0 nearest candidates, filling \
+                 every slot, but average degree was {greedy:.2} of a possible {M0}"
+            );
+            // The heuristic rejects any candidate that lies closer to an already-accepted
+            // neighbour than to the query, which empties slots that greedy would have filled.
+            // Measured ~8/16; require a margin far above `noise` (~0.05).
+            assert!(
+                heuristic < 0.75 * M0 as f64 && (greedy - heuristic) > noise * 10.0,
+                "{strategy:?}: use_heuristic=true must prune candidates that hide behind an \
+                 accepted neighbour, dropping degree below m0={M0}, but degree was \
+                 {heuristic:.2} vs greedy's {greedy:.2} (build-to-build noise {noise:.3}) — the \
+                 flag is not reaching this builder"
+            );
+            // Extending the candidate set with the neighbours-of-neighbours gives the heuristic
+            // more diverse candidates to accept, so degree climbs back. Measured +12% (sequential)
+            // to +33% (parallel).
+            assert!(
+                extended > heuristic * 1.05 && (extended - heuristic) > noise * 10.0,
+                "{strategy:?}: extend_candidates=true must widen the candidate pool and let the \
+                 heuristic accept more of it, but degree was {extended:.2} vs {heuristic:.2} \
+                 without it (build-to-build noise {noise:.3}) — the flag is not reaching this \
+                 builder"
+            );
+        }
+    }
+
+    /// `seed` promises reproducible builds. **It does not deliver them on the default builder.**
+    ///
+    /// Measured: two `BuildStrategy::Parallel` builds at the same seed differ on ~15% of nodes;
+    /// `Sequential` is bit-identical. Threads race to write neighbour lists through the `RwLock`s,
+    /// and the seed fixes the level assignments and insertion order — not the interleaving.
+    ///
+    /// The pre-existing `seed_makes_builds_reproducible_and_distinguishable` test pinned
+    /// `Sequential` — the path where the promise happens to hold — so it passed. Third instance of
+    /// the same pattern today, after `m`/`m0` and `use_heuristic`/`extend_candidates`.
+    ///
+    /// This test pins the ACTUAL guarantee rather than the one the docs used to imply, so that the
+    /// day someone makes the parallel build deterministic, it fails and tells them to update the
+    /// contract. A test that encodes a lie is worse than no test; a test that encodes the truth,
+    /// including an unwelcome truth, is a spec.
+    #[test]
+    fn seed_gives_reproducible_builds_only_on_the_sequential_builder() {
+        let base: Vec<Vec<f32>> = (0..600)
+            .map(|i| {
+                (0..16)
+                    .map(|d| (((i * 7 + d * 13) % 50) as f32) * 0.1 + (i % 8) as f32)
+                    .collect()
+            })
+            .collect();
+
+        let graph_of = |strategy: BuildStrategy| -> Vec<Vec<u32>> {
+            let ix = HNSWIndex::build(
+                base.clone(),
+                HNSWConfig {
+                    metric: DistanceMetric::L2,
+                    m: 8,
+                    m0: 16,
+                    ef_construction: 100,
+                    seed: Some(21),
+                    build_strategy: strategy,
+                    ..Default::default()
+                },
+            );
+            (0..ix.len())
+                .map(|i| {
+                    let mut n: Vec<u32> = ix.get_neighbors_l0(i).to_vec();
+                    n.sort_unstable();
+                    n
+                })
+                .collect()
+        };
+
+        let seq_a = graph_of(BuildStrategy::Sequential);
+        let seq_b = graph_of(BuildStrategy::Sequential);
+        assert_eq!(
+            seq_a, seq_b,
+            "Sequential + a fixed seed must be bit-reproducible — that is the whole contract of \
+             `seed`, and it is the only builder that honours it"
+        );
+
+        // And the unwelcome half of the truth, pinned so it cannot rot silently.
+        let par_a = graph_of(BuildStrategy::Parallel);
+        let par_b = graph_of(BuildStrategy::Parallel);
+        let differing = par_a
+            .iter()
+            .zip(&par_b)
+            .filter(|(x, y)| x != y)
+            .count();
+        assert!(
+            differing > 0,
+            "the parallel builder has become reproducible under a fixed seed ({differing} nodes \
+             differ). That is GOOD — but `HNSWConfig::seed`'s documentation says it is not, and \
+             this test exists to catch that contract changing. Update the docs and this assertion."
+        );
+    }
+
     /// The sibling of `m_caps_upper_layer_degree_independent_of_m0`, and the test that should
     /// have existed first.
     ///

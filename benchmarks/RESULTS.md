@@ -72,20 +72,34 @@ The tell was a *flat line where a curve was predicted*: build cost sat at ~61,50
 computations per insert at m0 = 24, 32, 48 **and** 64 alike. It was doing the m0=64 build every
 time.
 
-**2. The optimal degree depends on how expensive a distance is — so it INVERTS with storage mode.**
-GIST 960-d, 200k, matched recall:
+**2. The optimal degree depends on `n`, and a 200k measurement DOES NOT generalize to 1M.**
 
-| storage | m0 | build | QPS @ ~99.2% recall |
-|---|---|---|---|
-| `F32` | **32** | **67 s** | **551** ← wins |
-| `F32` | 64 | 167 s | 540 |
-| `RaBitQ` | 32 | 80 s | ~797 |
-| `RaBitQ` | **64** | 180 s | **1,054** ← wins (1.32x) |
+First I measured the degree sweep at 200k, found `m0=32` beat `m0=64` for `F32` (67 s vs 167 s to
+build, and faster at matched recall), wrote "our default degree was wrong" into this file, and
+committed it.
 
-A RaBitQ distance costs 137 ns; an F32 distance costs 259 ns. **When scanning a neighbour is
-cheap, a denser graph pays for itself** — you buy connectivity (fewer hops, better recall) at a
-discount. When distances are expensive, that same density is a tax. So `M` must be swept *per
-storage mode*; there is no single right degree for the library.
+Then I ran it at **1M — the scale we actually ship at — and it reversed.** `M=32/m0=64` wins for
+*every* storage mode:
+
+| storage | M=16/m0=32 | **M=32/m0=64** |
+|---|---|---|
+| F32 @ ~97.7% recall | 356 QPS | **429 QPS** (1.20x) |
+| SQ8 @ ~97.7% recall | 372 QPS | **439 QPS** (1.18x) |
+| RaBitQ @ ~97% recall | 675 QPS | **862 QPS** (1.28x) |
+| build (F32) | **452 s** | 1,138 s |
+
+The sparse graph builds **2.5x faster** and gives up **~20% QPS** at matched recall. That is a real
+trade — `M=16` is the "fast build" option — but it is **not** domination, and `M=32` is the right
+default at 1M. A smaller corpus needs less connectivity to stay navigable; a 1M graph does not.
+
+**This is the same error as reading a 128-d SIFT result and generalizing it to 960-d — committed in
+the same session that documented that error.** Measure at the scale you ship at. A cheaper regime
+is a different regime, not a preview of the real one.
+
+(The degree/storage *interaction* at 200k was real — RaBitQ, whose distances cost 137 ns against
+F32's 259 ns, tolerated the dense graph far better. But at 1M every mode wants the dense graph, so
+the interaction does not change the recommendation. Sweep `M` per storage mode anyway: it is cheap
+insurance and it is what we already demand of the competition.)
 
 **3. Our benchmark harness was rigged — against ourselves.** `benchmarks/python/competitors.py`
 carries this comment:
@@ -96,8 +110,11 @@ carries this comment:
 
 The comment is correct. The code below it swept hnswlib's and faiss's `M ∈ {16, 32}` and **pinned
 ours at 32.** We showed the competition at its best-of-M frontier and ourselves at a single degree
-nobody chose. Every published foxstash F32 number was measured at the wrong degree, in the
-direction that made us look *worse*.
+nobody chose.
+
+The sweep now runs, and it **vindicates the published numbers**: `M=32` was in fact the best choice
+at 1M for every storage mode. We were right by luck rather than by measurement — which is not the
+same as being right, and is exactly why the sweep has to exist.
 
 This is a different failure from the other twelve. They were all *checks that could not fail*. This
 one was a **principle that was stated but not enforced** — written down, correct, sitting in the
@@ -107,11 +124,14 @@ file, with the code directly beneath it doing the opposite. A rule you do not te
 
 ### What it means for the build-time gap
 
-Our *recommended* configuration at 960-d is `Storage::RaBitQ`, and RaBitQ genuinely wants the dense
-graph (m0=64) — so the build cost is real, not an artifact. We build ~1,141 s to faiss's 408 s, and
-we query 1.4–1.8x faster than faiss at matched recall. **That is a trade, and it should be stated
-as one, not filed as a mystery.** (For `Storage::F32` the gap largely closes: m0=32 builds 2.5x
-faster than our old default and queries faster too.)
+The dense graph is what makes our query numbers good, and it is what makes our build slow. At 1M
+every storage mode wants `m0=64`, so **the build cost is real, not an artifact**: ~1,141 s against
+faiss's 408 s, while we query 1.4–1.8x faster than faiss at matched recall.
+
+**That is a trade, and it should be stated as one rather than filed as a mystery.** If you need a
+fast build more than you need QPS, `M=16/m0=32` builds in 452 s (2.5x faster) for about 20% fewer
+queries per second at matched recall. Both points are now on the published frontier instead of one
+being hidden.
 
 > ### ⚠️ Pick your storage mode by dimension. The two quantizers swap places.
 >
