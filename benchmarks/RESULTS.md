@@ -1,33 +1,64 @@
 # Foxstash Benchmark Results
 
-Measured against **hnswlib** and **faiss** on real SIFT, at **matched recall**, at three scales.
+Measured against **hnswlib** and **faiss** on real SIFT (128-d) and real GIST (960-d), at
+**matched recall**, single-threaded, on an idle machine. Competitors are shown at *their own*
+Pareto frontier — the best of their M=16 and M=32 curves at each recall — not at a fixed M that
+happens to flatter us.
 
-**Headline: with `Storage::SQ8`, foxstash serves 1.20x hnswlib's QPS and 1.30x faiss's at
-99.5% recall on SIFT1M** — and 1.33x / 1.34x at 99.85%. It also builds 2.1x faster than hnswlib.
+## Headline: foxstash wins at both dimensions — but with a *different* storage mode at each
 
-**The cost is memory: 1,076 MB against their ~776 MB.** The rerank stage needs the
-full-precision vectors, so you can have the speed crown at 1.39x memory, or the *memory* crown
-(564 MB, 0.73x hnswlib) by dropping them — at a recall ceiling of ~98.9%. Not both, yet.
+| | **SIFT1M (128-d)** | **GIST1M (960-d)** |
+|---|---|---|
+| use this mode | **`Storage::SQ8`** | **`Storage::RaBitQ`** |
+| vs hnswlib | **1.20x** @ 99.5% recall | **1.79x** @ 98.3% recall |
+| vs faiss | **1.30x** @ 99.5% recall | **1.43x** @ 98.3% recall |
+| the *other* mode | RaBitQ: **~12x slower** | SQ8: **worthless** (1.03x F32) |
 
-In full precision (`Storage::F32`) foxstash is still ~0.88x hnswlib. The win comes entirely
-from moving fewer bytes per node visit, not from a better graph or a faster kernel.
+**GIST1M (960-d), QPS at matched recall:**
 
-> ### ⚠️ Everything below is a 128-dimensional result. Pick your storage mode by dimension.
+| recall@10 | hnswlib | faiss | fox F32 | fox SQ8 | **fox RaBitQ** | vs hnswlib | vs faiss |
+|---|---|---|---|---|---|---|---|
+| 90.61% | 986 | 1,197 | 1,054 | 1,012 | **1,487** | **1.51x** | **1.24x** |
+| 93.79% | 719 | 877 | 789 | 758 | **1,136** | **1.58x** | **1.30x** |
+| 96.42% | 477 | 591 | 555 | 544 | **842** | **1.76x** | **1.43x** |
+| 98.26% | 299 | 376 | 359 | 367 | **536** | **1.79x** | **1.43x** |
+
+### The honest costs
+
+**We build slowly at high dimension.** On GIST1M: foxstash ~1,141 s against **faiss's 294–408 s**
+— faiss builds **3–4x faster than us**. Our "2.1x faster builds than hnswlib" is a *128-d* result
+and it inverts at 960-d. This is a real regression and it is not yet explained.
+
+**Full precision is unremarkable.** `Storage::F32` at 960-d is 1.10–1.20x hnswlib but only
+0.90–0.96x faiss — it sits *between* them. At 128-d it is 0.88x hnswlib. Every win foxstash has
+comes from the quantized traversal, not from the graph or the kernel.
+
+**Memory.** At 128-d, SQ8 + rerank costs 1,076 MB against their ~776 MB (`rerank_candidates: 0`
+drops it to 564 MB / 0.73x, at a ~98.9% recall ceiling). At 960-d, SQ8 is the *largest* index of
+the three (5,236 MB vs F32's 4,276) — the rerank pool still keeps the f32 vectors and at 960-d
+those dominate.
+
+> ### ⚠️ Pick your storage mode by dimension. The two quantizers swap places.
 >
-> **The right quantizer depends on the dimension, and the two swap places:**
+> Every quantized traversal trades ALU work for memory traffic, and the two codes sit on opposite
+> sides of that trade:
 >
-> | | SIFT1M (128-d) | GIST1M (960-d) |
-> |---|---|---|
-> | `Storage::SQ8` | **1.20x hnswlib** — the win below | **worthless** (1.03x F32) |
-> | `Storage::RaBitQ` | ~12x slower than SQ8 | **1.4–1.6x faster** than SQ8 or F32 |
+> * **SQ8** must widen `u8` → `i32` → `f32` before it can compute: ~**3x the ALU uops per
+>   dimension** of plain f32. What it buys — skipped DRAM round-trips — is roughly **fixed** per
+>   node visit. Fixed benefit, cost linear in `dim`: **wins small, dies big.**
+> * **RaBitQ** compares sign bits against a once-per-query rotated vector: **cheaper per dimension
+>   than f32**, no widening at all. What it pays is a *coarser* estimate, which makes the graph
+>   walk take more hops — a penalty roughly **independent of `dim`**. **Loses small, wins big.**
 >
-> Every quantized traversal trades ALU work for memory traffic. SQ8 must widen `u8`→`f32`
-> (~3x the ALU of plain f32) to save a roughly *fixed* number of DRAM round-trips — fixed
-> benefit, cost linear in `dim`, so it dies as `dim` grows. RaBitQ compares sign bits and is
-> *cheaper per dimension than f32*, paying instead with a coarser estimate that costs extra
-> graph hops — a penalty roughly independent of `dim`, so it improves as `dim` grows.
+> `dist/query` is the control that proves this rather than merely narrating it: at 960-d RaBitQ
+> issues 17,583 distance computations to F32's 17,245 — **2% more work** — each at half the cost.
+> At 128-d that same coarseness cost it **10x more** distance computations, which no per-distance
+> saving could repay.
 >
-> Real embeddings are 384-d (MiniLM) to 1536-d (OpenAI). **Nobody runs RAG on 128-d vectors.**
+> **Rule of thumb: `SQ8` at 128-d, `RaBitQ` at 768-d and above, measure in between.** Real
+> embeddings are 384-d (MiniLM) to 1536-d (OpenAI) — **nobody runs RAG on 128-d vectors**, so the
+> SIFT numbers below are the *best* case for SQ8, not a typical one. The crossover is bracketed,
+> not located; `--example dim_crossover` exists to find it.
 > Do not quote the SIFT numbers below at your dimension without checking. See
 > **"The right quantizer depends on the dimension"**.
 

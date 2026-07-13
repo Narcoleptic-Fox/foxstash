@@ -13,7 +13,7 @@ Foxstash is a local-first Retrieval-Augmented Generation (RAG) library featuring
 
 - **SIMD-Accelerated** - AVX2/SSE/NEON vector operations with runtime CPU detection
 - **HNSW Indexing** - Hierarchical Navigable Small World graphs for fast similarity search
-- **Vector Quantization** - SQ8 8-bit traversal (beats hnswlib 1.20x at 99.5% recall), RaBitQ 1-bit, Product Quantization
+- **Quantized traversal** - `Storage::SQ8` (8-bit) beats hnswlib **1.20x** at 128-d; `Storage::RaBitQ` (1-bit) beats it **1.79x** at 960-d. They swap places with dimension — [pick by dimension](#-pick-your-storage-mode-by-dimension--the-two-swap-places)
 - **Hybrid Search** - Combine BM25 keyword search with vector similarity for best-of-both recall
 - **ONNX Embeddings** - Generate embeddings locally with MiniLM-L6-v2 or any ONNX model
 - **WASM Support** - Run in the browser with IndexedDB persistence
@@ -57,10 +57,14 @@ for result in results {
 }
 ```
 
-### Faster search with 8-bit traversal (`Storage::SQ8`)
+### Quantized traversal (`Storage::SQ8` / `Storage::RaBitQ`)
 
-This is the configuration that beats hnswlib. The graph is built with **exact** distances;
-only the bytes read during traversal are quantized, so recall is unchanged.
+This is where the wins come from. The graph is built with **exact** distances; only the bytes
+read during traversal are quantized, and a final pool is rescored against the exact vectors — so
+recall barely moves while the hot node block shrinks.
+
+**Which code you want depends on your dimension** (see the note below): `SQ8` at 128-d,
+`RaBitQ` at 768-d and above. Swap the one field.
 
 ```rust
 use foxstash_core::index::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, Storage};
@@ -76,31 +80,54 @@ let index = HNSWIndex::build(embeddings, HNSWConfig {
 let results = index.search(&query, 10)?;
 ```
 
+At 768-d and above, change one field — `Storage::RaBitQ` — and raise the rerank pool, because a
+1-bit code ranks more coarsely and needs a deeper pool to rescore from:
+
+```rust
+let index = HNSWIndex::build(embeddings, HNSWConfig {
+    metric: DistanceMetric::L2,
+    storage: Storage::RaBitQ,  // 1-bit codes; 1.79x hnswlib at 960-d
+    rerank_candidates: 400,    // deeper pool than SQ8 — a coarse code needs it
+    build_strategy: BuildStrategy::Parallel,
+    ..Default::default()
+});
+```
+
+If recall *falls* as you raise `ef_search`, that is the rerank pool, not the quantizer:
+distractors crowd a fixed pool and evict true neighbours before the exact rescore sees them.
+Raise `rerank_candidates`.
+
 Set `rerank_candidates: 0` to drop the full-precision vectors entirely — the smallest index
 foxstash can build, at the cost of a recall ceiling. Measure that trade on your own data.
 
 > ### ⚠️ Pick your storage mode by dimension — the two swap places
 >
-> Every speed number in this README is measured on SIFT, which is **128-dimensional**. That is
-> the best case for `Storage::SQ8` and *not* a typical one:
+> The right code depends on your dimension, and the two **trade places**:
 >
 > | | SIFT1M (128-d) | GIST1M (960-d) |
 > |---|---|---|
-> | `Storage::SQ8` | **1.20x hnswlib** — the numbers below | **worthless** (1.03x F32) |
-> | `Storage::RaBitQ` | ~12x slower than SQ8 | **1.4–1.6x faster** than SQ8 *or* F32 |
+> | `Storage::SQ8` | **1.20x hnswlib**, 1.30x faiss | **worthless** — 1.03x F32, and *more* memory |
+> | `Storage::RaBitQ` | **~12x slower** than SQ8 | **1.79x hnswlib**, 1.43x faiss |
 >
 > Every quantized traversal trades ALU work for memory traffic, and the two codes sit on
-> opposite sides of it. **SQ8** must widen `u8`→`f32` (~3x the ALU of plain f32) to save a
-> roughly *fixed* number of DRAM round-trips — fixed benefit, cost linear in `dim`, so it dies
-> as `dim` grows. **RaBitQ** compares sign bits and is *cheaper per dimension than f32*, paying
-> instead with a coarser estimate that costs extra graph hops — a penalty roughly independent of
-> `dim`, so it improves as `dim` grows.
+> opposite sides of it:
+>
+> * **SQ8** must widen `u8`→`i32`→`f32` before it can compute — ~**3x the ALU per dimension** of
+>   plain f32. What it buys, skipped DRAM round-trips, is roughly **fixed** per node visit. Fixed
+>   benefit, cost linear in `dim`: **wins small, dies big.**
+> * **RaBitQ** compares sign bits against a once-per-query rotated vector — **cheaper per
+>   dimension than f32**, no widening. What it pays is a coarser estimate, costing extra graph
+>   hops, a penalty roughly **independent of `dim`**: **loses small, wins big.**
+>
+> At 960-d RaBitQ issues only 2% more distance computations than F32 (17,583 vs 17,245) and each
+> costs half as much. At 128-d that same coarseness cost it **10x more** distance computations —
+> unrepayable.
 >
 > **Rule of thumb: `SQ8` at 128-d, `RaBitQ` at 768-d and above, measure in between.** MiniLM is
-> 384-d and OpenAI's embeddings are 1536-d — nobody runs RAG on 128-d vectors, so do not assume
-> the numbers below are the ones you'll get. Reproduce with
-> `cargo run --release -p foxstash-benches --example storage_pareto gist1m`. Full analysis and
-> the mechanism in `benchmarks/RESULTS.md`.
+> 384-d and OpenAI's are 1536-d — **nobody runs RAG on 128-d vectors**, so the SIFT numbers below
+> are the best case for SQ8, not the one you'll get. The crossover is bracketed, not located.
+> Reproduce: `cargo run --release -p foxstash-benches --example storage_pareto gist1m`. Mechanism
+> and full tables in `benchmarks/RESULTS.md`.
 
 ### Memory (SIFT1M, 1M x 128d)
 
@@ -430,7 +457,7 @@ foxstash/
 ├── crates/
 │   ├── core/           # Main library
 │   │   ├── embedding/  # ONNX Runtime + caching
-│   │   ├── index/      # HNSW, Flat, SQ8, Binary, PQ indexes
+│   │   ├── index/      # HNSW (F32/SQ8/RaBitQ storage), Flat, PQ
 │   │   ├── storage/    # File persistence, compression, WAL
 │   │   └── vector/     # SIMD ops, quantization
 │   ├── db/             # Database layer
@@ -445,19 +472,35 @@ foxstash/
 
 ## Benchmarks
 
-Measured on **real SIFT**, against **hnswlib** and **faiss**, at **matched recall**,
-single-threaded. Full methodology and the 10K/100K tables:
+Measured on **real SIFT (128-d)** and **real GIST (960-d)**, against **hnswlib** and **faiss**,
+at **matched recall**, single-threaded, on an idle machine. Competitors are shown at *their own*
+Pareto frontier (best of M=16 / M=32), not at a fixed M that flatters us. Full methodology:
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
-**With `Storage::SQ8`, Foxstash serves 1.20x hnswlib's QPS and 1.30x faiss's at 99.5% recall**
-on SIFT1M — rising to 1.33x at 99.85%. It also builds 2.1x faster than hnswlib.
+**Foxstash wins at both dimensions — but with a different storage mode at each:**
 
-**The cost is memory.** The rerank stage needs the full-precision vectors, so the fast
-configuration uses 1,076 MB against their ~776 MB. Drop them (`rerank_candidates = 0`) and the
-index falls to **564 MB — 0.73x hnswlib** — but recall ceilings out around 98.9%. Pick one.
+| | **SIFT1M (128-d)** | **GIST1M (960-d)** |
+|---|---|---|
+| use this mode | **`Storage::SQ8`** | **`Storage::RaBitQ`** |
+| vs hnswlib | **1.20x** @ 99.5% recall | **1.79x** @ 98.3% recall |
+| vs faiss | **1.30x** @ 99.5% recall | **1.43x** @ 98.3% recall |
+| the *other* mode | RaBitQ: ~12x slower | SQ8: worthless (1.03x F32) |
 
-In full precision Foxstash is still ~0.88x hnswlib. The win comes entirely from moving fewer
-bytes per node visit.
+The two quantizers **swap places** with dimension, and the reason is mechanical — see the note
+under [8-bit traversal](#faster-search-with-8-bit-traversal-storagesq8). Real embeddings are
+384-d (MiniLM) to 1536-d (OpenAI), so **reach for `RaBitQ` first**; SIFT's 128-d is the best case
+for `SQ8`, not a typical one.
+
+### The honest costs
+
+- **We build slowly at high dimension.** GIST1M: ~1,141 s against faiss's 294–408 s — **faiss
+  builds 3–4x faster than us**. Our "2.1x faster builds than hnswlib" is a 128-d result and it
+  inverts at 960-d. Not yet explained.
+- **Full precision is unremarkable.** `Storage::F32` is 0.88x hnswlib at 128-d, and at 960-d sits
+  *between* the two (1.10–1.20x hnswlib, 0.90–0.96x faiss). Every win comes from the quantized
+  traversal, not from a better graph or a faster kernel.
+- **Memory.** At 128-d the fast config costs 1,076 MB against their ~776 MB; `rerank_candidates:
+  0` drops it to **564 MB (0.73x hnswlib)** at a ~98.9% recall ceiling. Pick one.
 
 ### SIFT1M — 1,000,000 x 128d, k=10, M=32, single-threaded
 
@@ -475,6 +518,30 @@ QPS at **matched recall** (competitor QPS interpolated along its own curve to Fo
 | build, all cores | 167 s | **167 s** | 342 s | 78 s |
 | index size | 1,076 MB | 948 MB | ~776 MB | ~776 MB |
 | index size, codes only | **564 MB** | — | — | — |
+
+### GIST1M — 1,000,000 x 960d, k=10, single-threaded
+
+The dimension real embeddings actually live at. Competitors at **their own** Pareto frontier
+(best of M=16 / M=32 at each recall). Here `Storage::SQ8` is worthless and **`Storage::RaBitQ`
+is the win**:
+
+| recall@10 | Foxstash RaBitQ | hnswlib | vs hnswlib | faiss | vs faiss |
+|-----------|-----------------|---------|------------|-------|----------|
+| 90.6% | **1,487** | 986 | **1.51x** | 1,197 | **1.24x** |
+| 93.8% | **1,136** | 719 | **1.58x** | 877 | **1.30x** |
+| 96.4% | **842** | 477 | **1.76x** | 591 | **1.43x** |
+| 98.3% | **536** | 299 | **1.79x** | 376 | **1.43x** |
+
+| | Foxstash RaBitQ | Foxstash SQ8 | Foxstash F32 | hnswlib | faiss |
+|---|---|---|---|---|---|
+| ns per distance | **138–157** | 250–269 | 258–277 | — | — |
+| build, all cores | 1,209 s | 1,145 s | 1,141 s | 1,059–1,433 s | **294–408 s** |
+| index size | 4,404 MB | 5,236 MB | 4,276 MB | — | — |
+
+Two things to read off that: **SQ8 costs more memory than F32 here and buys no speed** (its
+block shrank 3.3x and ns/dist did not move — the dequant tax scales with `dim` while the latency
+it saves does not). And **faiss builds 3–4x faster than us at 960-d** — a real weakness, and the
+inverse of the 128-d picture.
 
 Why it works: HNSW search is **memory-latency bound** — one distance computation costs ~85 ns,
 about a DRAM round-trip. Foxstash already computed distances *faster* than faiss and still lost,
