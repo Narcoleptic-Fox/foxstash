@@ -363,8 +363,9 @@ pub struct HNSWConfig {
     /// results. If you need either — golden-file tests, debugging a specific graph, regulated
     /// reproducibility — set `build_strategy: BuildStrategy::Sequential` as well as `seed`.
     ///
-    /// Incremental [`Self::add`] and [`Self::add_embedding`] **are** reproducible at a fixed seed:
-    /// they are sequential by nature, so they have no thread race to lose determinism to. (They
+    /// Incremental [`HNSWIndex::add`] and [`HNSWIndex::add_embedding`] **are** reproducible at a
+    /// fixed seed: they are sequential by nature, so they have no thread race to lose determinism
+    /// to. (They
     /// were not, until 1.0. `random_level` called `rand::rng()` per insert with `config.seed`
     /// sitting unread on `&self`, so an index grown by `add()` was random at every seed.)
     ///
