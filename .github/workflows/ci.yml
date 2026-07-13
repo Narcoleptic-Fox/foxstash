@@ -165,3 +165,14 @@ jobs:
         with:
           files: lcov-core.info,lcov-db.info
           fail_ci_if_error: false
+
+  config-matrix:
+    name: Every config option reaches every path that claims it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Fails if a public HNSWConfig field is read by no entry point (a public option nothing
+      # honours -- the shape of four bugs in the 1.0 audit), or if the matrix embedded in
+      # docs/ARCHITECTURE.md has drifted from the source. A generated diagram that is allowed to
+      # go stale is worse than no diagram: it rots while looking authoritative.
+      - run: python3 xtask/config_matrix.py

@@ -108,13 +108,30 @@ if absent:
 
 reach = {e: subtree(fn) for e, fn in ENTRIES.items()}
 w = max(len(f) for f in FIELDS) + 2
-print(f"{'config field':<{w}}" + "".join(f"{e:>18}" for e in ENTRIES))
-print("-" * (w + 18 * len(ENTRIES)))
-for f in FIELDS:
-    print(f"{f:<{w}}" + "".join(f"{'read' if f in reach[e] else '.':>18}" for e in ENTRIES))
+rows = [f"{'config field':<{w}}" + "".join(f"{e:>18}" for e in ENTRIES), "-" * (w + 18 * len(ENTRIES))]
+rows += [
+    f"{f:<{w}}" + "".join(f"{'read' if f in reach[e] else '.':>18}" for e in ENTRIES) for f in FIELDS
+]
+table = "\n".join(rows)
+print(table)
+
+failed = False
 
 dead = [f for f in FIELDS if not any(f in reach[e] for e in ENTRIES)]
 if dead:
     print("\nDEAD: no entry point reads these -- a public option nothing honours:", ", ".join(dead))
-    sys.exit(1)
-print("\nOK: every public HNSWConfig field is read on at least one entry path.")
+    failed = True
+else:
+    print("\nOK: every public HNSWConfig field is read on at least one entry path.")
+
+# The copy in ARCHITECTURE.md says "Generated. Do not edit." That is only true if something
+# checks it, and a stale generated diagram is worse than none: it rots while looking authoritative.
+doc = pathlib.Path(__file__).parent.parent / "docs/ARCHITECTURE.md"
+if doc.exists():
+    if table.strip() in doc.read_text():
+        print("OK: the matrix embedded in docs/ARCHITECTURE.md is current.")
+    else:
+        print("\nSTALE: docs/ARCHITECTURE.md's matrix no longer matches the source. Paste this one in.")
+        failed = True
+
+sys.exit(1 if failed else 0)
