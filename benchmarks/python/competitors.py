@@ -51,11 +51,24 @@ def recall_at(got, truth, k=K):
 
 
 def control(base, query, truth):
-    """Brute force. Must score ~100% or the ground truth does not match the base."""
+    """Brute force. Must score ~100% or the ground truth does not match the base.
+
+    Chunked, and argpartition rather than argsort. Sorting every row in full is O(n log n)
+    over a million elements just to read off the top 10 — on GIST1M (1M x 960d) that burned
+    ~18 minutes of single-core time and materialised a 1.6 GB distance matrix before the
+    benchmark could even start. argpartition is O(n) and chunking keeps the matrix small.
+    (`fetch-data.sh` already did it this way; this file never got the fix.)
+    """
     q = query[:CONTROL_N]
-    d = (base * base).sum(1)[None, :] - 2.0 * (q @ base.T) + (q * q).sum(1)[:, None]
-    got = np.argsort(d, axis=1)[:, :K]
-    return recall_at(got, truth[:CONTROL_N])
+    bn = (base * base).sum(1)
+    out = np.empty((len(q), K), dtype=np.int64)
+    for i in range(0, len(q), 50):
+        qc = q[i:i + 50]
+        d = bn[None, :] - 2.0 * (qc @ base.T)      # |q|^2 is constant per row; omit it
+        top = np.argpartition(d, K, axis=1)[:, :K]
+        rows = np.arange(top.shape[0])[:, None]
+        out[i:i + 50] = top[rows, np.argsort(d[rows, top], axis=1)]
+    return recall_at(out, truth[:CONTROL_N])
 
 
 def bench_hnswlib(base, query, truth, m):
