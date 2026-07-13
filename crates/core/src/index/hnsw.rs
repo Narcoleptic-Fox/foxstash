@@ -2320,6 +2320,26 @@ impl HNSWIndex {
             return Self::build_single(embeddings, config);
         }
 
+        // `M0_MAX`/`M_MAX` are the ZeroNode/UpperNode ARRAY CAPACITIES, not the degree.
+        //
+        // They used to be the degree too: this builder passed `M0_MAX` everywhere `config.m0`
+        // belonged and never read `config.m`/`config.m0` at all, then truncated the finished
+        // graph down to `config.m0` in `convert_parallel_to_index`. So the two most important
+        // knobs in HNSW were SILENTLY IGNORED by the default builder. Asking for `m0: 24` did
+        // not build a degree-24 graph — it built a degree-64 graph at full cost and then threw
+        // away 40 edges per node, which is both slower AND a worse graph than a real degree-24
+        // build (the heuristic never got to make its choices at 24). Measured: build cost was
+        // FLAT at ~61,500 distance computations per insert across m0 = 24/32/48/64, because it
+        // was doing the m0=64 build every time.
+        let m0 = config.m0.min(M0_MAX);
+        let m = config.m.min(M_MAX);
+        assert!(
+            config.m0 <= M0_MAX && config.m <= M_MAX,
+            "parallel build supports m <= {M_MAX} and m0 <= {M0_MAX} (the node arrays are              fixed-size); got m={} m0={}. Use BuildStrategy::Sequential for a larger degree.",
+            config.m,
+            config.m0
+        );
+
         let ml = config.ml;
         let ef_construction = config.ef_construction;
         let seed = config.seed.unwrap_or_else(rand::random);
@@ -2388,6 +2408,8 @@ impl HNSWIndex {
                         &pool,
                         ef_construction,
                         top,
+                        m,
+                        m0,
                     );
                 }
             } else {
@@ -2402,6 +2424,8 @@ impl HNSWIndex {
                         &pool,
                         ef_construction,
                         top,
+                        m,
+                        m0,
                     );
                 });
             }
@@ -2411,7 +2435,7 @@ impl HNSWIndex {
             if !batch.is_zero() {
                 zero[..end]
                     .par_iter()
-                    .map(|z| UpperNode::from_zero(&z.read()))
+                    .map(|z| UpperNode::from_zero(&z.read(), m))
                     .collect_into_vec(&mut layers[batch.0 - 1]);
             }
         }
@@ -2432,6 +2456,8 @@ impl HNSWIndex {
         pool: &SearchPool,
         ef_construction: usize,
         top: LayerId,
+        m: usize,
+        m0: usize,
     ) {
         let metric = pool.metric;
         let keep_pruned = pool.keep_pruned;
@@ -2457,13 +2483,13 @@ impl HNSWIndex {
             if cur.0 > target_layer.0 {
                 // Above target layer: search upper layer snapshot, then cull
                 if cur.0 <= layers.len() && !layers[cur.0 - 1].is_empty() {
-                    search.search_upper(point, &layers[cur.0 - 1], points, M_MAX);
+                    search.search_upper(point, &layers[cur.0 - 1], points, m);
                     search.cull();
                 }
                 // If snapshot doesn't exist, just continue descent
             } else {
                 // At or below target layer: search zero layer and BREAK
-                search.search_zero(point, zero, points, M0_MAX);
+                search.search_zero(point, zero, points, m0);
                 break; // Key fix: don't keep searching!
             }
         }
@@ -2475,19 +2501,19 @@ impl HNSWIndex {
         // a diverse neighbor set so search can cross cluster boundaries — matching
         // the sequential build path.
         let found =
-            Self::par_select_heuristic(metric, search.select_simple(), points, M0_MAX, keep_pruned);
+            Self::par_select_heuristic(metric, search.select_simple(), points, m0, keep_pruned);
 
         // Add connections: new node → neighbors (in zero layer)
         {
             let mut node = zero[new.as_usize()].write();
-            for (i, candidate) in found.iter().take(M0_MAX).enumerate() {
+            for (i, candidate) in found.iter().take(m0).enumerate() {
                 node.nearest[i] = candidate.pid;
             }
         }
 
         // Add reverse connections: neighbors → new node (bidirectional)
-        for candidate in found.iter().take(M0_MAX) {
-            Self::add_reverse_connection(metric, zero, points, new, candidate.pid, keep_pruned);
+        for candidate in found.iter().take(m0) {
+            Self::add_reverse_connection(metric, zero, points, new, candidate.pid, keep_pruned, m0);
         }
 
         pool.push(search);
@@ -2554,6 +2580,7 @@ impl HNSWIndex {
         new: PointId,
         neighbor: PointId,
         keep_pruned: bool,
+        m0: usize,
     ) {
         let mut node = zero[neighbor.as_usize()].write();
         let neighbor_point = &points[neighbor.as_usize()];
@@ -2564,7 +2591,7 @@ impl HNSWIndex {
             return;
         }
 
-        if count < M0_MAX {
+        if count < m0 {
             // Room available: insert maintaining ascending-distance order.
             let new_dist = Self::parallel_distance(metric, neighbor_point, &points[new.as_usize()]);
             let pos = {
@@ -2605,7 +2632,7 @@ impl HNSWIndex {
             })
             .collect();
         cands.sort_unstable();
-        let selected = Self::par_select_heuristic(metric, &cands, points, M0_MAX, keep_pruned);
+        let selected = Self::par_select_heuristic(metric, &cands, points, m0, keep_pruned);
 
         // Without the backfill the heuristic may return fewer than M0_MAX, so the tail must
         // be padded: `ZeroNode::iter` stops at the first INVALID, and leaving stale ids there
@@ -2814,9 +2841,9 @@ impl Default for UpperNode {
 
 impl UpperNode {
     /// Create from ZeroNode, truncating to M neighbors
-    fn from_zero(zero: &ZeroNode) -> Self {
+    fn from_zero(zero: &ZeroNode, m: usize) -> Self {
         let mut node = Self::default();
-        for (i, &pid) in zero.nearest.iter().take(M_MAX).enumerate() {
+        for (i, &pid) in zero.nearest.iter().take(m.min(M_MAX)).enumerate() {
             node.nearest[i] = pid;
         }
         node
@@ -4863,6 +4890,102 @@ mod tests {
     /// node genuinely reaches `m` neighbours). If nothing ever reaches the cap, "no node exceeds
     /// the cap" is trivially true and proves nothing — that is exactly how the `ml: 0.8` fixture
     /// hid this, by promoting too few nodes for any degree limit to matter.
+    /// The sibling of `m_caps_upper_layer_degree_independent_of_m0`, and the test that should
+    /// have existed first.
+    ///
+    /// That test pinned `BuildStrategy::Sequential`. The PARALLEL builder — now the default —
+    /// ignored `config.m` and `config.m0` **entirely**: it passed the hardcoded `M0_MAX`/`M_MAX`
+    /// constants everywhere the config values belonged, built a degree-64 graph no matter what
+    /// you asked for, and let the conversion clean up afterwards. Build cost was FLAT at ~61,500
+    /// distance computations per insert across m0 = 24/32/48/64 — it was doing the m0=64 build
+    /// every single time.
+    ///
+    /// I wrote the Sequential test and then made the untested builder the default. **Testing an
+    /// option against ONE implementation of a strategy is not testing the option.**
+    ///
+    /// # This test is on LAYER 1, and that is not an accident
+    ///
+    /// The obvious version — assert layer-0 degree respects `m0` — is VACUOUS, and I wrote it
+    /// that way first and watched the sabotage pass. Layer 0 is stored in the flat node block,
+    /// whose stride is `node_stride(config.m0, ..)`: the block physically has room for exactly
+    /// `m0` neighbours, so the surplus is silently dropped at conversion no matter what the
+    /// builder did. The storage layout *launders* the bug. Layer >= 1 lives in `UpperNode`
+    /// (capacity `M_MAX = 32`) and is copied out untruncated — so that is the one place where
+    /// "the builder ignored `config.m`" is actually observable.
+    ///
+    /// Sabotage this catches: revert `UpperNode::from_zero(z, m)` to `take(M_MAX)`, or
+    /// `search_upper(.., m)` to `M_MAX`.
+    #[test]
+    fn m_caps_upper_layer_degree_in_the_parallel_builder_too() {
+        let mut rng = StdRng::seed_from_u64(4242);
+        let centers: Vec<Vec<f32>> = (0..10)
+            .map(|_| (0..16).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..2000)
+            .map(|i| {
+                let c = &centers[i % 10];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        let build = |m: usize| {
+            HNSWIndex::build(
+                embeddings.clone(),
+                HNSWConfig {
+                    m,
+                    m0: 64,
+                    ef_construction: 100,
+                    seed: Some(5),
+                    keep_pruned_connections: true, // saturate, so the cap actually binds
+                    build_strategy: BuildStrategy::Parallel, // THE DEFAULT. The untested path.
+                    ..Default::default()
+                },
+            )
+        };
+
+        // Peak degree over every node present at layer 1.
+        let peak_l1 = |ix: &HNSWIndex| -> (usize, usize) {
+            let mut peak = 0;
+            let mut count = 0;
+            for id in 0..ix.len() {
+                if ix.connections[id].len() > 1 {
+                    peak = peak.max(ix.connections[id][1].len());
+                    count += 1;
+                }
+            }
+            (peak, count)
+        };
+
+        let (narrow_peak, narrow_count) = peak_l1(&build(4));
+        let (wide_peak, _) = peak_l1(&build(32));
+
+        // CONTROL 1: layer 1 is actually populated. A cap cannot bind on an empty layer.
+        assert!(
+            narrow_count > 10,
+            "fixture put only {narrow_count} nodes on layer 1 — the assertions below would be \
+             vacuous"
+        );
+        // CONTROL 2: the cap BINDS. Something must reach m=4, or "nothing exceeds 4" is free.
+        assert_eq!(
+            narrow_peak, 4,
+            "the m=4 cap never bound (peak layer-1 degree {narrow_peak}) — nothing is pressing \
+             against the limit, so the invariant below proves nothing"
+        );
+
+        // THE INVARIANT: m = 4 means no layer-1 node may hold more than 4 edges.
+        assert!(
+            narrow_peak <= 4,
+            "m = 4 but a layer-1 node holds {narrow_peak} neighbours — the parallel builder is \
+             ignoring config.m (it used to hardcode M_MAX = 32)"
+        );
+        // ...and m = 32 must genuinely produce a wider graph.
+        assert!(
+            wide_peak > 4,
+            "m = 32 produced a peak layer-1 degree of only {wide_peak}, no better than m=4 — \
+             config.m is not reaching the parallel builder"
+        );
+    }
+
     #[test]
     fn m_caps_upper_layer_degree_independent_of_m0() {
         let mut rng = StdRng::seed_from_u64(5150);

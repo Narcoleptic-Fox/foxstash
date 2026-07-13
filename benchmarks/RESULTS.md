@@ -25,9 +25,32 @@ happens to flatter us.
 
 ### The honest costs
 
-**We build slowly at high dimension.** On GIST1M: foxstash ~1,141 s against **faiss's 294–408 s**
-— faiss builds **3–4x faster than us**. Our "2.1x faster builds than hnswlib" is a *128-d* result
-and it inverts at 960-d. This is a real regression and it is not yet explained.
+**faiss builds faster than us at high dimension — but hnswlib does not.** GIST1M, M=32:
+
+| | build |
+|---|---|
+| hnswlib | 1,433 s |
+| **foxstash** | **1,141 s** (1.26x faster than hnswlib) |
+| faiss | **408 s** (2.8x faster than us) |
+
+This file used to say our build time was "a real regression and it is not yet explained." That was
+wrong, and wrong in a specific way worth naming: **I read only the faiss column of my own table.**
+Against the reference HNSW implementation we are *faster*. faiss is the outlier.
+
+The cause is now measured, and it is `keep_pruned_connections: true` (the default). It backfills
+every node to the maximum degree `m0`, deliberately restoring the exact neighbours the diversity
+heuristic just rejected:
+
+| | build (200k, 960-d) | distance computations / insert | avg degree |
+|---|---|---|---|
+| `keep_pruned: true` | **197 s** | **61,559** | **64.0** — saturated |
+| `keep_pruned: false` | 42.6 s | 3,167 | 10.5 |
+
+faiss runs at degree **~25**. Our heuristic alone prunes to **10.5** (too sparse) and the backfill
+saturates to **64** (too dense) — we sit at both extremes and neither is the sweet spot. Turning
+the backfill off is not free: at matched recall the dense graph is *slightly faster to query*
+(930 vs ~832 QPS at 97.9% recall). The dense graph buys recall-per-`ef`; it just pays far too much
+for it at build time.
 
 **Full precision is unremarkable.** `Storage::F32` at 960-d is 1.10–1.20x hnswlib but only
 0.90–0.96x faiss — it sits *between* them. At 128-d it is 0.88x hnswlib. Every win foxstash has
@@ -37,6 +60,58 @@ comes from the quantized traversal, not from the graph or the kernel.
 drops it to 564 MB / 0.73x, at a ~98.9% recall ceiling). At 960-d, SQ8 is the *largest* index of
 the three (5,236 MB vs F32's 4,276) — the rerank pool still keeps the f32 vectors and at 960-d
 those dominate.
+
+## The graph degree was wrong, the knob was disconnected, and our own harness hid it
+
+Three findings, one root.
+
+**1. `config.m` and `config.m0` did nothing in the default builder.** The parallel builder — which
+is the default — passed the hardcoded constants `M0_MAX = 64` / `M_MAX = 32` everywhere the config
+values belonged. It built a degree-64 graph no matter what you asked for and truncated afterwards.
+The tell was a *flat line where a curve was predicted*: build cost sat at ~61,500 distance
+computations per insert at m0 = 24, 32, 48 **and** 64 alike. It was doing the m0=64 build every
+time.
+
+**2. The optimal degree depends on how expensive a distance is — so it INVERTS with storage mode.**
+GIST 960-d, 200k, matched recall:
+
+| storage | m0 | build | QPS @ ~99.2% recall |
+|---|---|---|---|
+| `F32` | **32** | **67 s** | **551** ← wins |
+| `F32` | 64 | 167 s | 540 |
+| `RaBitQ` | 32 | 80 s | ~797 |
+| `RaBitQ` | **64** | 180 s | **1,054** ← wins (1.32x) |
+
+A RaBitQ distance costs 137 ns; an F32 distance costs 259 ns. **When scanning a neighbour is
+cheap, a denser graph pays for itself** — you buy connectivity (fewer hops, better recall) at a
+discount. When distances are expensive, that same density is a tax. So `M` must be swept *per
+storage mode*; there is no single right degree for the library.
+
+**3. Our benchmark harness was rigged — against ourselves.** `benchmarks/python/competitors.py`
+carries this comment:
+
+> *"Sweep M on EVERY library, not just ours. Tuning our own M while pinning theirs at a default
+> would manufacture a win — which is precisely the class of error that produced this repo's earlier
+> false headlines."*
+
+The comment is correct. The code below it swept hnswlib's and faiss's `M ∈ {16, 32}` and **pinned
+ours at 32.** We showed the competition at its best-of-M frontier and ourselves at a single degree
+nobody chose. Every published foxstash F32 number was measured at the wrong degree, in the
+direction that made us look *worse*.
+
+This is a different failure from the other twelve. They were all *checks that could not fail*. This
+one was a **principle that was stated but not enforced** — written down, correct, sitting in the
+file, with the code directly beneath it doing the opposite. A rule you do not test is a comment.
+
+`storage_pareto` now sweeps our own `M`, per storage mode.
+
+### What it means for the build-time gap
+
+Our *recommended* configuration at 960-d is `Storage::RaBitQ`, and RaBitQ genuinely wants the dense
+graph (m0=64) — so the build cost is real, not an artifact. We build ~1,141 s to faiss's 408 s, and
+we query 1.4–1.8x faster than faiss at matched recall. **That is a trade, and it should be stated
+as one, not filed as a mystery.** (For `Storage::F32` the gap largely closes: m0=32 builds 2.5x
+faster than our old default and queries faster too.)
 
 > ### ⚠️ Pick your storage mode by dimension. The two quantizers swap places.
 >

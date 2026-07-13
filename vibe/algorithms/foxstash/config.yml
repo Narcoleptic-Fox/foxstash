@@ -1,0 +1,53 @@
+# foxstash HNSW. Listed under "any" (not a specific metric) because the Rust extension itself
+# maps VIBE's metric string to `DistanceMetric` and errors on anything it doesn't support
+# (`ip`, `normalized`, `hamming`) — see `crates/python/src/lib.rs::parse_metric`. base_args
+# supplies '@metric' and '@dimension', matching `Foxstash.__init__(metric, dim, m,
+# ef_construction, storage, rerank_candidates)` positionally.
+#
+# storage is swept, not hardcoded: SQ8 vs RaBitQ crossover is dimension- AND metric-dependent
+# (SQ8 wins at <=384-d, RaBitQ at >=768-d, under L2; cosine shifts the crossover down — see
+# `Storage::RaBitQ` docs in crates/core/src/index/hnsw.rs) and depends on the dataset VIBE is
+# running, not on anything knowable here. Submitting all three modes lets the recall/QPS
+# Pareto frontier pick per-dataset instead of us guessing.
+#
+# rerank_candidates is fixed at build time to a value large enough that the full-precision
+# vectors are retained (any value > 0 retains them all; the number only bounds the query-time
+# pool — see `HNSWIndex::push_node`/`set_rerank_candidates`), then swept downward at query
+# time via `set_query_arguments`'s `rerank` argument for the quantized storages. It has no
+# effect under `storage: f32` (search_inner only reranks when `storage != F32`), so that run
+# group fixes it at 0 rather than wasting a sweep dimension that cannot change anything.
+float:
+  any:
+  - base_args: ['@metric', '@dimension']
+    constructor: FoxstashHNSW
+    disabled: false
+    singularity_image: foxstash
+    module: vibe.algorithms.foxstash
+    name: foxstash
+    run_groups:
+      f32:
+        args:
+          m: [16, 32]
+          ef_construction: [100, 200, 500]
+          storage: [f32]
+          rerank_candidates: [0]
+        query_args:
+          ef: [10, 20, 50, 100, 200, 500]
+      sq8:
+        args:
+          m: [16, 32]
+          ef_construction: [100, 200, 500]
+          storage: [sq8]
+          rerank_candidates: [500]
+        query_args:
+          ef: [10, 20, 50, 100, 200, 500]
+          rerank: [50, 100, 200, 500]
+      rabitq:
+        args:
+          m: [16, 32]
+          ef_construction: [100, 200, 500]
+          storage: [rabitq]
+          rerank_candidates: [500]
+        query_args:
+          ef: [10, 20, 50, 100, 200, 500]
+          rerank: [50, 100, 200, 500]

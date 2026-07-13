@@ -37,6 +37,26 @@ use std::time::Instant;
 const K: usize = 10;
 const EFS: &[usize] = &[20, 50, 100, 200, 500];
 
+/// Sweep OUR `M` too, and report our own best-of-M frontier.
+///
+/// `competitors.py` carries this comment, and it is right:
+///
+/// > "Sweep M on EVERY library, not just ours. Tuning our own M while pinning theirs at a default
+/// > would manufacture a win — which is precisely the class of error that produced this repo's
+/// > earlier false headlines."
+///
+/// And then this example did the exact thing that comment warns against, in reverse: it swept
+/// hnswlib's and faiss's M over {16, 32} and PINNED OURS at 32. Every published foxstash number
+/// was measured at a single degree, chosen by nobody, while the competition was shown at its best.
+///
+/// That handicap was real and it was large. Once `config.m0` actually reached the parallel builder
+/// (it was hardcoded to 64 — see `BuildStrategy`), m=16/m0=32 turned out to DOMINATE m=32/m0=64 on
+/// GIST: 2.5x faster to build (67s vs 167s at 200k) AND ~1.3x faster to query at matched recall.
+/// Our default degree was simply twice what it should have been.
+///
+/// Fairness cuts both ways. A harness rigged against yourself is still a rigged harness.
+const MS: &[(usize, usize)] = &[(16, 32), (32, 64)];
+
 fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "sift1m".into());
     let ds = Dataset::load("benchmarks/data", &name).unwrap_or_else(|e| panic!("load {name}: {e}"));
@@ -52,7 +72,9 @@ fn main() {
 
     let dim = ds.dim();
     println!(
-        "{} — {} base x {}d, {} queries, k={K}, M=32/m0=64, ef_c=200\nexact control: {:.2}%  PASS\n",
+        "{} — {} base x {}d, {} queries, k={K}, ef_c=200\nexact control: {:.2}%  PASS\n\
+         Sweeping M over {MS:?} — our own best-of-M frontier, the same courtesy competitors.py\n\
+         extends to hnswlib and faiss. Read ACROSS M at matched recall.\n",
         ds.name,
         ds.base.len(),
         dim,
@@ -76,13 +98,14 @@ fn main() {
         ("SQ8 + rerank", Storage::SQ8, 100),
         ("RaBitQ + rerank", Storage::RaBitQ, 400),
     ] {
+      for &(m, m0) in MS {
         let t = Instant::now();
         let mut index = HNSWIndex::build_parallel(
             ds.base.clone(),
             HNSWConfig {
                 metric: DistanceMetric::L2,
-                m: 32,
-                m0: 64,
+                m,
+                m0,
                 ef_construction: 200,
                 storage,
                 rerank_candidates: rerank,
@@ -94,7 +117,7 @@ fn main() {
         let mem = index.memory_breakdown().total() as f64 / 1e6;
 
         println!(
-            "\n=== {label} ===  build {:.0}s, {mem:.0} MB",
+            "\n=== {label}  M={m}/m0={m0} ===  build {:.0}s, {mem:.0} MB",
             build.as_secs_f64()
         );
         println!(
@@ -137,6 +160,7 @@ fn main() {
                 el.as_nanos() as f64 / d
             );
         }
+      }
     }
 
     println!(
