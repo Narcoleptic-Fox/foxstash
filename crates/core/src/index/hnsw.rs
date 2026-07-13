@@ -369,13 +369,26 @@ pub struct HNSWConfig {
     pub rerank_candidates: usize,
 }
 
-/// Distance metric for [`HNSWIndex`].
+/// Distance metric for [`HNSWIndex`]. **Every** storage mode honours it.
 ///
-/// The quantized index types not yet folded into this enum (`RaBitQHNSWIndex`,
-/// `PQHNSWIndex`) are L2-only — they have no `metric` field at all. Before this enum
-/// existed `HNSWIndex` was cosine-only too, so swapping index type to save memory
-/// silently changed the metric. Set this explicitly on `HNSWConfig` to keep the storage
-/// modes here consistent; the two standalone types above still carry the footgun.
+/// That sentence is the whole point, and it was not always true. This library used to ship three
+/// standalone quantized index types (`SQ8HNSWIndex`, `RaBitQHNSWIndex`, `PQHNSWIndex`), and not
+/// one of them had a `metric` field: all three were hardcoded L2, while [`HNSWConfig`] defaults
+/// to **cosine**. So swapping index type to save memory silently changed *the question being
+/// asked*, and every caller escaped only by passing `L2` by hand. Worse, the same bug lived
+/// inside [`HNSWIndex`] itself for a release — the quantized traversal ignored `config.metric`
+/// and always ranked by L2, which is what made SQ8 read 71.4% recall when it was really capable
+/// of 99.33%. A metric bug does not look like a crash. It looks like a mediocre quantizer.
+///
+/// All three standalone types are now deleted and quantization is a [`Storage`] mode on this one
+/// index, so there is exactly one place the metric can be set and exactly one place it is read.
+///
+/// **Set it explicitly.** The default is [`DistanceMetric::Cosine`], which is right for
+/// embeddings; SIFT/GIST-style benchmarks want [`DistanceMetric::L2`]. Getting it wrong does not
+/// error — it silently answers a different question. And note the two are *not* interchangeable
+/// for quantization: under cosine, `Storage::RaBitQ` encodes a unit-normalized copy, discarding
+/// magnitude, which is exactly what cosine ignores and exactly what a 1-bit code cannot carry.
+/// RaBitQ is therefore materially *better* under cosine than under L2 (see [`Storage`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum DistanceMetric {
     /// `1 - cosine_similarity`. Magnitude-invariant; the historical default.

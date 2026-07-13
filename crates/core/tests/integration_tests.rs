@@ -12,14 +12,13 @@
 
 use foxstash_core::index::{
     BatchBuilder, BatchConfig, DistanceMetric, FilteredSearchBuilder, FlatIndex, HNSWConfig,
-    HNSWIndex, PQHNSWConfig, PQHNSWIndex, SearchPage, SearchResultIterator, Storage,
+    HNSWIndex, SearchPage, SearchResultIterator, Storage,
 };
 use foxstash_core::storage::compression::{self, Codec};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::storage::incremental::{
     IncrementalConfig, IncrementalStorage, IndexMetadata, RecoveryHelper, WalOperation,
 };
-use foxstash_core::vector::product_quantize::PQConfig;
 use foxstash_core::{Document, SearchResult};
 
 use std::collections::HashSet;
@@ -450,37 +449,70 @@ mod quantized_accuracy {
         }
     }
 
+    /// Replaces `pq_index_returns_results`. `PQHNSWIndex` was deleted (dominated: a ~62% recall
+    /// ceiling, because the graph is traversed on PQ codes so the candidate pool never contains
+    /// the true neighbours). RaBitQ is the surviving 1-bit path.
+    ///
+    /// The old test asserted only "returns k results, in sorted order". That is the vacuous shape
+    /// this codebase keeps getting burned by — an index that returned the k *worst* matches, or
+    /// the same node k times, would pass it. Sorted-ness is a property of the output formatter,
+    /// not of the search. So this one asserts RETRIEVAL: the index must actually find the true
+    /// nearest neighbours, scored against brute force.
     #[test]
-    fn pq_index_returns_results() {
+    fn rabitq_storage_actually_retrieves_nearest_neighbours() {
         let dim = 64;
-        let n = 80;
+        let n = 200;
         let k = 5;
 
-        // Generate training data and documents
-        let training_data: Vec<Vec<f32>> = (0..200)
-            .map(|i| deterministic_embedding(dim, i + 10000))
-            .collect();
-
-        let pq_config = PQConfig::new(dim, 8, 8)
-            .with_seed(42)
-            .with_kmeans_iterations(5);
-
-        let mut pq_index =
-            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
-
-        for i in 0..n {
-            let doc = make_doc(&format!("doc_{}", i), dim, i);
-            pq_index.add(doc).unwrap();
-        }
+        let base: Vec<Vec<f32>> = (0..n).map(|i| deterministic_embedding(dim, i)).collect();
+        let index = HNSWIndex::build_parallel(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                storage: Storage::RaBitQ,
+                rerank_candidates: 50,
+                seed: Some(7),
+                ..Default::default()
+            },
+        );
 
         let query = deterministic_embedding(dim, 9999);
-        let results = pq_index.search(&query, k).unwrap();
 
-        assert_eq!(results.len(), k, "PQ should return {} results", k);
+        // The oracle.
+        let mut exact: Vec<(f32, usize)> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    v.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum(),
+                    i,
+                )
+            })
+            .collect();
+        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let truth: Vec<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
 
-        // Results should be sorted by score descending
+        let results = index.search(&query, k).unwrap();
+        assert_eq!(results.len(), k);
+
+        let got: Vec<usize> = results
+            .iter()
+            .filter_map(|r| r.id.parse::<usize>().ok())
+            .collect();
+        let hits = got.iter().filter(|i| truth.contains(i)).count();
+
+        // With an exact rerank pool of 50 over 200 vectors, this should be near-perfect. The
+        // point is that it must RETRIEVE, not merely return something sorted.
+        assert!(
+            hits >= 4,
+            "RaBitQ + rerank found only {hits}/{k} true nearest neighbours (got {got:?},              truth {truth:?}) — the index returns results but is not searching"
+        );
+
         for window in results.windows(2) {
-            assert!(window[0].score >= window[1].score, "PQ results not sorted");
+            assert!(
+                window[0].score >= window[1].score,
+                "results not sorted by score"
+            );
         }
     }
 }

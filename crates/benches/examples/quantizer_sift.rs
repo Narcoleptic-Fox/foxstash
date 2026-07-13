@@ -24,8 +24,8 @@
 //! wrong and every other row is meaningless.
 
 #[allow(deprecated)]
-use foxstash_core::index::hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex};
 use foxstash_core::vector::quantize::{BinaryQuantizer, Quantizer, ScalarQuantizer};
+use foxstash_core::index::hnsw::{DistanceMetric, HNSWConfig, HNSWIndex, Storage};
 use foxstash_core::vector::rabitq::RaBitQuantizer;
 use foxstash_core::Document;
 use std::collections::HashSet;
@@ -240,17 +240,25 @@ fn main() {
         metadata: None,
     };
 
+    // `RaBitQHNSWIndex` was deleted — RaBitQ is a STORAGE MODE on the one index now, which
+    // brings the arena layout, a rayon build, and an actual `metric` field with it. The legacy
+    // type's per-query rerank pool lives on as `set_rerank_candidates`.
     let t0 = Instant::now();
-    let mut rb_index = RaBitQHNSWIndex::fit(&base, QuantizedHNSWConfig::default());
-    for (i, v) in base.iter().enumerate() {
-        rb_index.add_with_full_precision(docs(v, i)).unwrap();
-    }
+    let rb_index = HNSWIndex::build_parallel(
+        base.clone(),
+        HNSWConfig {
+            metric: DistanceMetric::L2,
+            storage: Storage::RaBitQ,
+            rerank_candidates: POOL,
+            ..Default::default()
+        },
+    );
     let rb_build = t0.elapsed();
 
     let t0 = Instant::now();
     let rb_hnsw = index_recall(&queries, &truth, |q| {
         rb_index
-            .search_and_rerank(q, POOL, K)
+            .search(q, K)
             .unwrap()
             .into_iter()
             .filter_map(|r| r.id.parse::<usize>().ok())
@@ -300,7 +308,7 @@ fn main() {
     println!("{:-<70}", "");
     println!(
         "{:<22} {:>10} {:>13.1}% {:>9.1}s {:>10.0}",
-        "RaBitQHNSWIndex",
+        "Storage::RaBitQ",
         "32x",
         rb_hnsw * 100.0,
         rb_build.as_secs_f64(),

@@ -4,8 +4,10 @@
 //!   [`Storage`] mode on this index, not a separate type — see below.
 //! - [`FlatIndex`]: brute force. Exact, O(n) per query. Use it as a control, and for tiny
 //!   corpora where an approximate index cannot pay for itself.
-//! - [`RaBitQHNSWIndex`]: 1-bit quantization, 32x compression. Still a separate type; being
-//!   folded into [`Storage`].
+//!
+//! There is exactly ONE approximate index type. There used to be four. `SQ8HNSWIndex`,
+//! `RaBitQHNSWIndex` and `PQHNSWIndex` were all deleted — see "The standalone index types, and
+//! why they are gone" below.
 //!
 //! # Quantization is a storage mode, not an index type
 //!
@@ -25,10 +27,47 @@
 //! search is memory-latency bound. `rerank_candidates: 0` drops the f32 vectors entirely
 //! (0.73x hnswlib's memory) at a recall ceiling near 98.9%.
 //!
-//! A standalone `SQ8HNSWIndex` used to exist. It was deleted: the storage mode beat it on
-//! recall, throughput *and* build time at every `ef` (see `benchmarks/RESULTS.md`), and it was
-//! a metric footgun — hardcoded L2 with no `metric` field, while [`HNSWConfig`] defaults to
-//! cosine, so swapping index types silently changed the question being asked.
+//! # The standalone index types, and why they are gone
+//!
+//! Three of them existed. All three are deleted. They shared one shape: a "fat node"
+//! (`Vec<HashSet<usize>>` adjacency plus a `String` id and `String` content **per node**), no
+//! rayon so builds were sequential, and **no `metric` field at all** — hardcoded L2, while
+//! [`HNSWConfig`] defaults to *cosine*. Swapping index type to save memory silently changed the
+//! question being asked.
+//!
+//! * **`SQ8HNSWIndex`** — superseded by [`Storage::SQ8`], which beat it on recall, throughput
+//!   *and* build time at every `ef`.
+//! * **`RaBitQHNSWIndex`** — superseded by [`Storage::RaBitQ`]. Same capability, minus the
+//!   pathology. (Its one unique trick, a per-query rerank pool, survives as
+//!   [`HNSWIndex::set_rerank_candidates`].)
+//! * **`PQHNSWIndex`** — *not* superseded. Deleted because it was **dominated**. Its selling
+//!   point was 192x compression of the vector payload, and it could not convert that into a
+//!   usable index. Measured on GIST (960-d, 100k, L2 — PQ's best case, since it is L2-only):
+//!
+//! ```text
+//!                                   MB   recall@10     QPS
+//!   PQHNSWIndex, no rerank          18      23.07%    1293
+//!   PQHNSWIndex, rerank 100        402      62.27%     790   <- ceiling
+//!   PQHNSWIndex, rerank 400        402      60.97%     446   <- gets WORSE
+//!   Storage::RaBitQ + rerank       440      97.97%    1970
+//!   Storage::SQ8, no rerank        139      98.40%     760
+//! ```
+//!
+//!   The ~62% is a **ceiling, not a knob**: the graph is traversed on PQ codes, so the candidate
+//!   pool handed to the rescoring stage does not *contain* the true neighbours — and you cannot
+//!   rerank your way to items you never retrieved. Widening the pool made recall fall. Worse, the
+//!   compression evaporates precisely when it becomes useful: reaching even 62% requires
+//!   retaining the f32 vectors (402 MB), at which point [`Storage::RaBitQ`] costs 440 MB and
+//!   delivers 98%.
+//!
+//!   Note what the docs said before anyone re-measured: **"~55% recall@10"**. That figure was
+//!   produced with `rerank_candidates` at its default of **0** — the accuracy stage switched off.
+//!   The true no-rerank number is 23%. A bad number produced by a *disabled feature* makes the
+//!   feature look inherently bad, and then nobody re-measures it. This library has now been bitten
+//!   by that four separate times; see `benchmarks/RESULTS.md`.
+//!
+//! The [`ProductQuantizer`](crate::vector::product_quantize::ProductQuantizer) primitive is kept.
+//! It is a perfectly good quantizer. It is just not a viable way to traverse a graph.
 //!
 //! A plain zero-threshold binary quantizer is not offered: on non-negative data (SIFT, and
 //! most embedding models) every bit is set and the code carries no information — it measured
@@ -66,16 +105,12 @@
 
 pub mod flat;
 pub mod hnsw;
-pub mod hnsw_pq;
-pub mod hnsw_quantized;
 pub mod streaming;
 
 pub use flat::FlatIndex;
 pub use hnsw::{
     BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown, Searcher, Storage,
 };
-pub use hnsw_pq::{PQHNSWConfig, PQHNSWIndex};
-pub use hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex};
 pub use streaming::{
     BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult, FilteredSearchBuilder,
     PaginationConfig, SearchPage, SearchResultIterator,

@@ -97,8 +97,11 @@ If recall *falls* as you raise `ef_search`, that is the rerank pool, not the qua
 distractors crowd a fixed pool and evict true neighbours before the exact rescore sees them.
 Raise `rerank_candidates`.
 
-Set `rerank_candidates: 0` to drop the full-precision vectors entirely — the smallest index
-foxstash can build, at the cost of a recall ceiling. Measure that trade on your own data.
+Set `rerank_candidates: 0` to drop the full-precision vectors entirely. This is **not** merely a
+"smallest index, at the cost of recall" trade — at high dimension it is one of the best points on
+the whole frontier. On GIST (960-d, 100k), `Storage::SQ8` with `rerank_candidates: 0` gives
+**98.40% recall@10 in 139 MB** — 3.2x smaller than `RaBitQ + rerank` (440 MB) at the same recall,
+trading about 2.6x QPS. If memory is your binding constraint, start here.
 
 > ### ⚠️ Pick your storage mode by dimension — the two swap places
 >
@@ -182,34 +185,40 @@ foxstash can build, at the cost of a recall ceiling. Measure that trade on your 
 Rerank needs the full-precision vectors, so the fastest configuration is also the largest.
 Speed crown or memory crown — not both, yet.
 
-### Product Quantization (Extreme Compression)
+### Product Quantization was removed in 1.0 — it was dominated
 
-PQ compresses the **vector payload** 192x — 8 bytes of codes in place of a 384-dim f32
-(1,536 bytes). It does not compress the graph, so end-to-end index memory falls by far
-less than 192x. And it costs a lot of recall: with the default 8x8 config, `PQHNSWIndex`
-measured **~55% recall@10** on clustered data. It is for the case where the corpus does
-not fit in RAM at all, not for a routine memory saving — reach for `Storage::SQ8` first.
+`PQHNSWIndex` compressed the vector payload **192x**. It is gone, and the measurement that
+killed it is worth reading, because the number we published about it for a year was invalid.
 
-```rust
-use foxstash_core::index::{PQHNSWIndex, PQHNSWConfig};
-use foxstash_core::vector::product_quantize::PQConfig;
+The docs said PQ got **~55% recall@10**. That figure was produced with `rerank_candidates` at
+its **default of 0** — the exact-rescoring stage *switched off*. Measured properly on GIST
+(960-d, 100k, L2 — PQ's best case, since PQ was L2-only):
 
-// Configure PQ: 8 subvectors, 256 centroids each
-let pq_config = PQConfig::new(384, 8, 8)
-    .with_kmeans_iterations(20);
+| | MB | recall@10 | QPS |
+|---|---|---|---|
+| `PQHNSWIndex`, no rerank | **18** | **23.07%** | 1,293 |
+| `PQHNSWIndex`, rerank 100 | 402 | **62.27%** ← ceiling | 790 |
+| `PQHNSWIndex`, rerank 400 | 402 | 60.97% ← *worse* | 446 |
+| `Storage::RaBitQ` + rerank | 440 | **97.97%** | **1,970** |
+| `Storage::SQ8`, no rerank | **139** | **98.40%** | 760 |
 
-// Train on sample vectors
-let training_data = load_sample_vectors(10_000);
-let mut index = PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default())?;
+**62% is a ceiling, not a knob.** The graph is *traversed* on PQ codes, so the candidate pool
+handed to the rescoring stage does not contain the true neighbours — and you cannot rerank your
+way to items you never retrieved. Widening the pool made recall *fall*.
 
-// Add documents (automatically compressed)
-for doc in documents {
-    index.add(doc)?;
-}
+And the compression evaporates exactly when it becomes useful: reaching even 62% requires
+retaining the f32 vectors (402 MB), at which point `Storage::RaBitQ` costs 440 MB and delivers
+**98%**. PQ's only unique point was 18 MB at 23% recall — which is not a retrieval index.
 
-// Search using Asymmetric Distance Computation (ADC)
-let results = index.search(&query, 10)?;
-```
+The [`ProductQuantizer`] primitive is still there (`vector::product_quantize`). It is a fine
+quantizer. It is just not a viable way to traverse a graph.
+
+> **The pattern to take away**, because it has now cost this project four times: *a bad number
+> produced by a disabled feature makes the feature look inherently bad, and then nobody
+> re-measures it.* SQ8 was advertised at 71.4% recall (a metric bug — really 99.33%). PQ's
+> reranking was a silent no-op for a release. RaBitQ was nearly deleted on 128-d evidence in a
+> library whose users run 384–1536-d. And PQ was judged on a figure taken with its accuracy stage
+> off. Check what a number was *measured with* before you let it decide anything.
 
 ### Streaming Batch Ingestion
 
@@ -621,7 +630,7 @@ index scores far better on SIFT100K because the task is easier, not because it i
 - [x] SQ8 8-bit traversal (`Storage::SQ8`) — beats hnswlib 1.20x at 99.5% recall on SIFT1M
 - [x] Streaming add/search for large datasets
 - [x] Incremental persistence (WAL + checkpointing)
-- [x] Product quantization (PQ) — 192x on the vector payload, at ~55% recall@10
+- [x] ~~Product quantization (PQ)~~ — **removed in 1.0**: dominated. ~62% recall ceiling, and no memory win once the rerank stage it needs is enabled. See above.
 - [x] Diversity-aware neighbor selection (Algorithm 4)
 - [x] Hybrid search (BM25 + vector, RRF and WeightedSum)
 - [x] VectorIndex / TextIndex trait abstractions

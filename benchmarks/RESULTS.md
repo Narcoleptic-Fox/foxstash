@@ -556,6 +556,55 @@ largest of the three, keeping f32 vectors *and* codes). On a tie, take RaBitQ.
 > has now published a wrong conclusion from a fixed-`ef` reading once. That is once more than the
 > caveat being written down was worth.
 
+## `PQHNSWIndex` was deleted: dominated, and judged on an invalid number
+
+PQ was the last standalone index type and the only 192x-compression option in the crate. It is
+gone. The measurement is worth keeping because the figure that had been defending it was produced
+with the feature that makes it usable **switched off**.
+
+The docs said PQ got **~55% recall@10**. That was measured with `PQHNSWConfig::rerank_candidates`
+at its default of **0** — the exact-rescoring stage disabled. Measured properly on GIST (960-d,
+100k, L2 — PQ's *best* case, since PQ was L2-only and RaBitQ is structurally better under cosine):
+
+| | MB | recall@10 | QPS |
+|---|---|---|---|
+| `PQHNSWIndex`, rerank 0 | **18** | **23.07%** | 1,293 |
+| `PQHNSWIndex`, rerank 50 | 402 | 61.80% | 775 |
+| `PQHNSWIndex`, rerank 100 | 402 | **62.27%** ← ceiling | 790 |
+| `PQHNSWIndex`, rerank 400 | 402 | 60.97% ← **worse** | 446 |
+| `Storage::RaBitQ` + rerank | 440 | **97.97%** | **1,970** |
+| `Storage::SQ8`, rerank 0 | **139** | **98.40%** | 760 |
+
+**The ~62% is a ceiling, not a knob.** The graph is *traversed* on PQ codes, so the candidate pool
+handed to the rescoring stage does not **contain** the true neighbours — and you cannot rerank your
+way to items you never retrieved. Widening the pool from 100 to 400 made recall *fall*.
+
+**The compression evaporates exactly when it becomes useful.** Reaching even 62% requires
+`rerank_candidates > 0`, which retains the f32 vectors: 402 MB. At that size `Storage::RaBitQ`
+costs 440 MB and delivers 98%. PQ's only unique point on the frontier was 18 MB at 23% recall,
+which is not a retrieval index — it is a random number generator with a graph attached.
+
+And the true no-rerank number is **23%**, not 55%. The 55% came from a small synthetic clustered
+fixture; it matched neither of the real operating points.
+
+### The pattern, for the fourth time
+
+*A bad number produced by a disabled or broken feature makes the feature look inherently bad — and
+then nobody re-measures it.* The bad number becomes the reason not to look.
+
+| the number | what produced it | the truth |
+|---|---|---|
+| SQ8 at **71.4%** recall | the metric bug (quantized traversal ignored `config.metric`) | **99.33%** |
+| PQ rerank changes nothing (0.840 vs 0.840) | `rerank_candidates` gated behind `store_original`, which defaulted false — a silent no-op | rerank works; PQ still ceilings at 62% |
+| RaBitQ is **~12x slower**, delete it | measured on 128-d SIFT, in a library whose users run 384–1536-d | **1.79x hnswlib at 960-d** |
+| PQ gets **~55%** recall | measured with `rerank_candidates: 0` — accuracy stage off | 23% off / 62% ceiling on |
+
+Three of those four nearly removed a good feature or preserved a bad one. **Check what a number was
+measured *with* before you let it decide anything.**
+
+The [`ProductQuantizer`](../crates/core/src/vector/product_quantize.rs) primitive is kept. It is a
+perfectly good quantizer. It is just not a viable way to traverse a graph.
+
 ### The near-miss
 
 On SIFT, `Storage::RaBitQ` loses ~12x and every measurement said delete it. The senior engineer

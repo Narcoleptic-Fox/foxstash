@@ -13,8 +13,7 @@
 //! wrong and every other row is void.
 
 use foxstash_benches::sift::{l2_sq, Dataset};
-use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex};
-use foxstash_core::index::hnsw_quantized::{QuantizedHNSWConfig, RaBitQHNSWIndex};
+use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, Storage};
 use foxstash_core::Document;
 use serde_json::json;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -237,25 +236,33 @@ fn main() {
         ));
     }
 
-    // ---- RaBitQ HNSW (32x), two-phase ----
-    eprintln!("[5/5] rabitq-hnsw");
+    // ---- RaBitQ (32x), two-phase — now a STORAGE MODE, not a separate index type ----
+    // `RaBitQHNSWIndex` was deleted; `Storage::RaBitQ` on the unified index does the same job
+    // with the arena layout, a rayon build, and an honest `metric` field. The legacy type's
+    // per-query rerank pool survives as `set_rerank_candidates`.
+    eprintln!("[5/5] rabitq (Storage::RaBitQ)");
     const POOL: usize = 100;
     let t = Instant::now();
-    let mut rb = RaBitQHNSWIndex::fit(&ds.base, QuantizedHNSWConfig::default());
-    for (i, v) in ds.base.iter().enumerate() {
-        rb.add_with_full_precision(doc(i, v)).unwrap();
-    }
+    let mut rb = HNSWIndex::build_parallel(
+        ds.base.clone(),
+        HNSWConfig {
+            metric: DistanceMetric::L2,
+            storage: Storage::RaBitQ,
+            rerank_candidates: POOL,
+            ..Default::default()
+        },
+    );
     let rb_build = t.elapsed().as_secs_f64();
-    let rb_r10 = ds.recall_at(10, |q| ids(rb.search_and_rerank(q, POOL, 10).unwrap()));
-    let rb_r100 = ds.recall_at(100, |q| {
-        ids(rb.search_and_rerank(q, POOL.max(200), 100).unwrap())
-    });
-    let rb_qps = measure_qps(&ds, 10, |q| ids(rb.search_and_rerank(q, POOL, 10).unwrap()));
+    let rb_r10 = ds.recall_at(10, |q| ids(rb.search(q, 10).unwrap()));
+    rb.set_rerank_candidates(POOL.max(200)).unwrap();
+    let rb_r100 = ds.recall_at(100, |q| ids(rb.search(q, 100).unwrap()));
+    rb.set_rerank_candidates(POOL).unwrap();
+    let rb_qps = measure_qps(&ds, 10, |q| ids(rb.search(q, 10).unwrap()));
     out.push(record(
-        "rabitq-hnsw",
+        "rabitq-storage",
         &ds,
         rb_build,
-        rb.memory_usage() as f64 / 1e6,
+        rb.memory_breakdown().total() as f64 / 1e6,
         rb_r10,
         rb_r100,
         rb_qps,
