@@ -1294,4 +1294,274 @@ mod tests {
             .any(|name| name.ends_with(".tmp"));
         assert!(!has_tmp);
     }
+
+    // ========================================================================
+    // Discriminating tests for `IncrementalConfig` fields flagged VACUOUS in the public-option
+    // audit: previously covered only by `test_config_builder`, which checks the field is
+    // *stored*, never that it's *honored*. NOT COMPILED — the team lead will compile and
+    // sabotage-verify these directly.
+    // ========================================================================
+
+    /// `checkpoint_codec` must select which codec compresses the checkpoint file, not just
+    /// round-trip through the builder. `compression::create_header` writes the codec's wire id
+    /// as the FIRST byte of the compressed output: `Codec::None` -> 0, `Codec::Gzip` -> 1 (see
+    /// `crate::storage::compression`, `Codec::id`/`Codec::from_id`). Two checkpoints of
+    /// identical data under the two codecs must therefore differ in that first byte.
+    ///
+    /// Sabotage this catches: hardcode `checkpoint()` to always call
+    /// `compression::compress_with(&data, Codec::Gzip)` regardless of
+    /// `self.config.checkpoint_codec` — the `Codec::None` config below would still produce a
+    /// file starting with byte 1 (Gzip's id), not 0.
+    #[test]
+    fn checkpoint_codec_controls_the_compression_used() {
+        let data: Vec<String> = vec!["doc1".into(), "doc2".into(), "doc3".into()];
+        let meta = || IndexMetadata {
+            document_count: 3,
+            embedding_dim: 128,
+            index_type: "test".to_string(),
+        };
+
+        let dir_none = TempDir::new().unwrap();
+        let mut storage_none = IncrementalStorage::new(
+            dir_none.path(),
+            IncrementalConfig::default().with_checkpoint_codec(Codec::None),
+        )
+        .unwrap();
+        storage_none.checkpoint(&data, meta()).unwrap();
+        let none_bytes = fs::read(dir_none.path().join("checkpoint_00001.bin")).unwrap();
+
+        let dir_gzip = TempDir::new().unwrap();
+        let mut storage_gzip = IncrementalStorage::new(
+            dir_gzip.path(),
+            IncrementalConfig::default().with_checkpoint_codec(Codec::Gzip),
+        )
+        .unwrap();
+        storage_gzip.checkpoint(&data, meta()).unwrap();
+        let gzip_bytes = fs::read(dir_gzip.path().join("checkpoint_00001.bin")).unwrap();
+
+        assert_eq!(
+            none_bytes[0], 0,
+            "Codec::None checkpoint should have header byte 0, got {}",
+            none_bytes[0]
+        );
+        assert_eq!(
+            gzip_bytes[0], 1,
+            "Codec::Gzip checkpoint should have header byte 1, got {} — checkpoint_codec is \
+             being ignored",
+            gzip_bytes[0]
+        );
+    }
+
+    /// `keep_checkpoints` must bound how many old checkpoint files survive pruning after each
+    /// new checkpoint. Six checkpoints are taken back-to-back; `keep_checkpoints: N` should leave
+    /// exactly `N` `checkpoint_*.bin` files afterwards.
+    ///
+    /// Sabotage this catches: skip `cleanup_old_checkpoints` entirely, or hardcode its cutoff —
+    /// both configs below would then leave the same file count (6, if pruning never runs, or
+    /// some other fixed number) regardless of `keep_checkpoints`.
+    #[test]
+    fn keep_checkpoints_bounds_surviving_checkpoint_files() {
+        let count_checkpoint_files = |dir: &std::path::Path| -> usize {
+            fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("checkpoint_") && name.ends_with(".bin")
+                })
+                .count()
+        };
+
+        let run_with = |keep_checkpoints: usize| -> usize {
+            let dir = TempDir::new().unwrap();
+            let mut storage = IncrementalStorage::new(
+                dir.path(),
+                IncrementalConfig::default().with_keep_checkpoints(keep_checkpoints),
+            )
+            .unwrap();
+            for i in 0..6 {
+                storage
+                    .checkpoint(
+                        &vec![format!("doc{i}")],
+                        IndexMetadata {
+                            document_count: 1,
+                            embedding_dim: 4,
+                            index_type: "test".to_string(),
+                        },
+                    )
+                    .unwrap();
+            }
+            count_checkpoint_files(dir.path())
+        };
+
+        let kept_2 = run_with(2);
+        let kept_5 = run_with(5);
+
+        assert_eq!(
+            kept_2, 2,
+            "keep_checkpoints: 2 should leave exactly 2 checkpoint files after 6 checkpoints, \
+             found {kept_2}"
+        );
+        assert_eq!(
+            kept_5, 5,
+            "keep_checkpoints: 5 should leave exactly 5 checkpoint files after 6 checkpoints, \
+             found {kept_5} — keep_checkpoints is being ignored"
+        );
+    }
+
+    /// `wal_sync_interval` must control how many WAL ops accumulate in the in-process
+    /// `BufWriter` before an fsync flushes them to disk. `WalWriter::append` only calls `sync()`
+    /// (which calls `flush()`) once `ops_since_sync >= config.wal_sync_interval`; below that,
+    /// entries sit in the `BufWriter`'s buffer and are invisible to an independent read of the
+    /// WAL file. A fresh storage's WAL file is always named `wal_00000.log` (see
+    /// `IncrementalStorage::new`).
+    ///
+    /// Sabotage this catches: hardcode the sync trigger to some fixed op count (or never sync
+    /// except via `sync_on_write`/an explicit `.sync()`) instead of reading
+    /// `self.config.wal_sync_interval` — the `wal_sync_interval: 2` config below would then also
+    /// leave the WAL file empty after 2 ops, like the `wal_sync_interval: 1000` config does.
+    #[test]
+    fn wal_sync_interval_controls_when_the_wal_hits_disk() {
+        let dir_frequent = TempDir::new().unwrap();
+        let mut storage_frequent = IncrementalStorage::new(
+            dir_frequent.path(),
+            IncrementalConfig::default().with_wal_sync_interval(2),
+        )
+        .unwrap();
+        storage_frequent
+            .log_add(&create_test_document("doc1", 4))
+            .unwrap();
+        storage_frequent
+            .log_add(&create_test_document("doc2", 4))
+            .unwrap();
+        // 2 ops with wal_sync_interval=2: the sync trigger has fired inside the 2nd `log_add`.
+        let frequent_len = fs::metadata(dir_frequent.path().join("wal_00000.log"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let dir_rare = TempDir::new().unwrap();
+        let mut storage_rare = IncrementalStorage::new(
+            dir_rare.path(),
+            IncrementalConfig::default().with_wal_sync_interval(1000),
+        )
+        .unwrap();
+        storage_rare
+            .log_add(&create_test_document("doc1", 4))
+            .unwrap();
+        storage_rare
+            .log_add(&create_test_document("doc2", 4))
+            .unwrap();
+        // Same 2 ops, but wal_sync_interval=1000: nothing has crossed the threshold, so the
+        // BufWriter has not flushed and the on-disk file should still be empty.
+        let rare_len = fs::metadata(dir_rare.path().join("wal_00000.log"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        assert_eq!(
+            rare_len, 0,
+            "wal_sync_interval: 1000 after only 2 ops should leave the WAL file un-flushed \
+             (0 bytes on disk), found {rare_len} bytes"
+        );
+        assert!(
+            frequent_len > 0,
+            "wal_sync_interval: 2 after 2 ops should have triggered a flush, but the WAL file \
+             on disk is still empty — wal_sync_interval is being ignored"
+        );
+    }
+
+    /// `max_wal_size` must feed `needs_checkpoint()`'s size-based trigger, independent of the
+    /// op-count trigger (`checkpoint_threshold`, held enormous here so it can never fire).
+    ///
+    /// Sabotage this catches: drop the `|| ... >= self.config.max_wal_size` half of
+    /// `needs_checkpoint`'s condition (or hardcode the size threshold) — the tiny-max-size
+    /// config below would then also report `false` after logging a document, the same as the
+    /// enormous-max-size config.
+    #[test]
+    fn max_wal_size_feeds_needs_checkpoint() {
+        let dir_tiny = TempDir::new().unwrap();
+        let mut storage_tiny = IncrementalStorage::new(
+            dir_tiny.path(),
+            IncrementalConfig::default()
+                .with_checkpoint_threshold(1_000_000)
+                .with_max_wal_size(1),
+        )
+        .unwrap();
+        storage_tiny
+            .log_add(&create_test_document("doc1", 4))
+            .unwrap();
+        assert!(
+            storage_tiny.needs_checkpoint(),
+            "max_wal_size: 1 should make needs_checkpoint() true after a single WAL entry, but \
+             it reported false — max_wal_size is being ignored"
+        );
+
+        let dir_huge = TempDir::new().unwrap();
+        let mut storage_huge = IncrementalStorage::new(
+            dir_huge.path(),
+            IncrementalConfig::default()
+                .with_checkpoint_threshold(1_000_000)
+                .with_max_wal_size(1024 * 1024 * 1024),
+        )
+        .unwrap();
+        storage_huge
+            .log_add(&create_test_document("doc1", 4))
+            .unwrap();
+        assert!(
+            !storage_huge.needs_checkpoint(),
+            "max_wal_size: 1 GB should leave needs_checkpoint() false after a single tiny WAL \
+             entry, but it reported true"
+        );
+    }
+
+    /// `sync_on_write` must force a sync (flush + fsync) after EVERY write, independent of
+    /// `wal_sync_interval` — held enormous here so the interval-based trigger can never fire on
+    /// its own, isolating `sync_on_write`'s effect.
+    ///
+    /// Sabotage this catches: drop the `if self.sync_on_write { self.sync()?; }` call in
+    /// `WalWriter::append` (or hardcode it to `false`) — the `sync_on_write: true` config below
+    /// would then also leave the WAL file empty after a single write.
+    #[test]
+    fn sync_on_write_forces_a_sync_on_every_write() {
+        let dir_on = TempDir::new().unwrap();
+        let mut storage_on = IncrementalStorage::new(
+            dir_on.path(),
+            IncrementalConfig::default()
+                .with_wal_sync_interval(1000)
+                .with_sync_on_write(true),
+        )
+        .unwrap();
+        storage_on
+            .log_add(&create_test_document("doc1", 4))
+            .unwrap();
+        let on_len = fs::metadata(dir_on.path().join("wal_00000.log"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let dir_off = TempDir::new().unwrap();
+        let mut storage_off = IncrementalStorage::new(
+            dir_off.path(),
+            IncrementalConfig::default()
+                .with_wal_sync_interval(1000)
+                .with_sync_on_write(false),
+        )
+        .unwrap();
+        storage_off
+            .log_add(&create_test_document("doc1", 4))
+            .unwrap();
+        let off_len = fs::metadata(dir_off.path().join("wal_00000.log"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        assert_eq!(
+            off_len, 0,
+            "sync_on_write: false with wal_sync_interval: 1000 should leave the WAL file \
+             un-flushed after one write, found {off_len} bytes"
+        );
+        assert!(
+            on_len > 0,
+            "sync_on_write: true should flush after every write regardless of \
+             wal_sync_interval, but the WAL file on disk is still empty — sync_on_write is \
+             being ignored"
+        );
+    }
 }

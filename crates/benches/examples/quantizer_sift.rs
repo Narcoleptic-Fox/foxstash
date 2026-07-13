@@ -1,9 +1,14 @@
 //! Quantizer recall comparison on **real** SIFT10K — RaBitQ vs binary vs SQ8.
 //!
-//! `BinaryHNSWIndex` was deleted (1.1% recall on any non-negative embedding). The binary
-//! *quantizer* rows below survive because they demonstrate exactly why: a zero threshold sets
-//! every bit on non-negative data, so all codes collapse to all-ones and stage 1 ranks at
-//! random. Centering the threshold recovers it. That is the lesson worth keeping.
+//! `BinaryHNSWIndex` was deleted: on any non-negative embedding it recalls at **chance** (~1%).
+//! The binary *quantizer* rows below survive because they demonstrate exactly why: a zero
+//! threshold sets every bit on non-negative data, so all codes collapse to all-ones and stage 1
+//! ranks at random. Centering the threshold recovers it. That is the lesson worth keeping.
+//!
+//! (The exact figure is deliberately not quoted here. This comment used to say "1.1%" while five
+//! other files said "1.2%" — because *no test asserts it*, and an unasserted number drifts. The
+//! measurement of record lives in `benchmarks/RESULTS.md`; what matters, and what does not drift,
+//! is that it is indistinguishable from random ranking. Precision you cannot defend is noise.)
 //!
 //! Run: cargo run -p foxstash-benches --example quantizer_sift --release
 //!

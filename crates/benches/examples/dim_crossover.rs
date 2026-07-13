@@ -31,10 +31,23 @@
 //!   skipped DRAM round-trips — is roughly FIXED per node visit. Fixed benefit, cost linear in
 //!   `dim`. Wins small, dies big.
 //! * **RaBitQ** compares sign bits: CHEAPER per dim than f32, no widening. Its cost is a coarse
-//!   estimate -> more graph hops, roughly INDEPENDENT of `dim`. Loses small, wins big.
+//!   estimate -> more graph hops — but that penalty SHRINKS with `dim`, because the code is 1 bit
+//!   PER DIMENSION: a higher-dim vector gets a proportionally longer code. Cheaper AND more
+//!   accurate as `dim` rises. Loses small, wins big.
+//!
+//! (An earlier version of this comment said RaBitQ's penalty was "roughly INDEPENDENT of dim".
+//! This example is what disproved it: recall climbs 63.7% -> 96.9% from 64-d to 768-d.)
 //!
 //! Read `ns/dist` — that is where the mechanism lives. `dist/query` is the control: if it moves
 //! a lot between modes, the graph walk changed and you are not measuring what you think.
+//!
+//! ⚠️ **THE QPS COLUMNS OF THIS EXAMPLE CANNOT BE USED TO CHOOSE A STORAGE MODE.** It runs at a
+//! FIXED `ef`, so a mode that is fast *because it stopped finding things* looks like a winner. At
+//! 384-d RaBitQ posts 3,257 QPS to SQ8's 1,898 here — and then LOSES to SQ8 at every recall level
+//! once you compare at matched recall (`--example dim_pareto gist1m 384`). It was 6.4 recall
+//! points behind; that 1.7x "win" was the throughput of giving up early. This example isolates
+//! the MECHANISM (`ns/dist`, `recall`); `dim_pareto` and `storage_pareto` choose the CONFIG.
+//! Reading a config decision out of the columns below is a mistake this repo has already made.
 //!
 //! Run on an IDLE machine.
 
@@ -179,9 +192,13 @@ fn main() {
     }
 
     println!(
-        "\nns/dist is the mechanism. SQ8's dequant tax grows with dim while the DRAM round-trips\n\
-         it saves stay ~fixed; RaBitQ's kernel is cheaper per dim than f32 and its cost (a coarse\n\
-         estimate -> more hops) is ~dim-independent. The crossover is where those lines meet.\n\
-         Recall is printed too: a mode that is fast because it stopped finding things is not fast."
+        "\nns/dist is the mechanism. SQ8's dequant tax grows with dim while the DRAM round-trips it\n\
+         saves stay ~fixed. RaBitQ's kernel is cheaper per dim than f32, AND its accuracy improves\n\
+         with dim (1 bit per dimension = longer codes at higher dim) — a scissors, not one line.\n\
+         \n\
+         ⚠️  DO NOT PICK A STORAGE MODE FROM THE QPS COLUMNS ABOVE. This runs at FIXED ef, so a\n\
+         mode that is fast because it stopped finding things looks fast. Read the recall row next\n\
+         to it: at 384-d RaBitQ shows the best QPS here and still LOSES to SQ8 at matched recall.\n\
+         For a config decision use `--example dim_pareto <ds> <dim>` or `--example storage_pareto`."
     );
 }

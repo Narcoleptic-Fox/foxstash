@@ -431,4 +431,81 @@ mod tests {
             .is_err());
         assert!(HybridConfig::default().try_with_rrf_k(-1.0).is_err());
     }
+
+    // ========================================================================
+    // Discriminating tests for options flagged VACUOUS in the public-option audit: previously
+    // only round-tripped through the builder (`config_builder`, `config_defaults`), never shown
+    // to change `merge_results`'s output. NOT COMPILED — see the note in hnsw.rs's equivalent
+    // block; the team lead will compile and sabotage-verify these.
+    // ========================================================================
+
+    /// `rrf_k` must actually enter the RRF scoring formula (`weight / (rrf_k + rank + 1)`), not
+    /// just round-trip through the builder. A single vector-only result at rank 0 has a
+    /// closed-form score of `vector_weight / (rrf_k + 1)` — two different `rrf_k` values must
+    /// therefore produce two different, exactly-predictable scores. `rrf_with_zero_rrf_k` (above)
+    /// only checks that one edge-case value doesn't crash; it never compares two values against
+    /// each other.
+    ///
+    /// Sabotage this catches: hardcode `rrf_k` to the default (60.0) inside `merge_rrf` instead
+    /// of reading `config.rrf_k` — both configs below would then produce the same score
+    /// (0.7/61 ≈ 0.0115) regardless of what a caller set `rrf_k` to.
+    #[test]
+    fn rrf_k_enters_the_scoring_formula() {
+        let vector = vec![sr("a", 0.9)];
+        let lookup = make_lookup(vec![]);
+
+        let score_at = |rrf_k: f32| -> f32 {
+            let config = HybridConfig::default().with_rrf_k(rrf_k);
+            let results = merge_results(&vector, &[], &lookup, 10, &config);
+            results[0].score
+        };
+
+        let low_k = score_at(10.0);
+        let high_k = score_at(1000.0);
+
+        let expected_low = 0.7 / (10.0 + 1.0);
+        let expected_high = 0.7 / (1000.0 + 1.0);
+
+        assert!(
+            (low_k - expected_low).abs() < 0.0005,
+            "rrf_k=10 should score {expected_low:.4}, got {low_k:.4}"
+        );
+        assert!(
+            (high_k - expected_high).abs() < 0.0005,
+            "rrf_k=1000 should score {expected_high:.4}, got {high_k:.4}"
+        );
+        assert!(
+            low_k > high_k * 5.0,
+            "rrf_k has no effect on score: {low_k:.4} at rrf_k=10 vs {high_k:.4} at rrf_k=1000 \
+             — rrf_k is being ignored"
+        );
+    }
+
+    /// `keyword_weight` must be isolable the same way `vector_weight` already is (see
+    /// `single_result_normalization`/`weighted_sum_single_element` above, both of which cover
+    /// `vector_weight` only — nothing isolates `keyword_weight` the same way). A single
+    /// keyword-only result under `WeightedSum` normalizes to 1.0, so its score is exactly
+    /// `keyword_weight * 1.0 = keyword_weight`.
+    ///
+    /// Sabotage this catches: hardcode `keyword_weight` to the default (0.3) in
+    /// `merge_weighted_sum` instead of reading `config.keyword_weight` — the 0.9-weighted config
+    /// below would still score 0.3 instead of 0.9.
+    #[test]
+    fn keyword_weight_is_isolable_under_weighted_sum() {
+        let keyword = vec![(0, 5.0)];
+        let lookup = make_lookup(vec![(0, sr("b", 5.0))]);
+
+        let config = HybridConfig::default()
+            .with_weights(0.0, 0.9)
+            .with_strategy(MergeStrategy::WeightedSum);
+        let results = merge_results(&[], &keyword, &lookup, 10, &config);
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            (results[0].score - 0.9).abs() < 0.001,
+            "keyword-only WeightedSum score should equal keyword_weight (0.9), got {} — \
+             keyword_weight is being ignored",
+            results[0].score
+        );
+    }
 }

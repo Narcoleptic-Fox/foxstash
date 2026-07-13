@@ -3,12 +3,22 @@
 //! This module provides quantization methods to reduce memory footprint while
 //! maintaining acceptable search quality:
 //!
-//! - **Scalar Quantization (SQ8)**: f32 → i8 (4x compression, 71.4% recall)
+//! - **Scalar Quantization (SQ8)**: f32 → u8 (4x compression, **99.33% recall@10** on SIFT100K
+//!   with a rerank pool of 50 — see `benchmarks/RESULTS.md` §"Quantized indexes — the metric was
+//!   broken")
 //! - **Binary Quantization (BQ)**: f32 → bit (32x compression, 1.2% recall — deprecated)
 //!
-//! Note: SQ8 recall measured on SIFT10K (benchmarks/RESULTS.md). Binary's zero threshold
+//! This module used to report SQ8 at **71.4% recall**, and that number was quoted here long after
+//! it stopped being true. It was never a quantization ceiling and never a missing rerank stage —
+//! it was a *bug* (the quantized traversal ignored `config.metric` and silently ranked by L2 while
+//! the caller asked for cosine). Fixing the bug moved it to 99.33%. A stale number sourced from a
+//! broken measurement is worse than no number: it sets an expectation that makes the real defect
+//! look like an inherent limit, which is exactly why nobody went looking for it.
+//!
+//! Binary's zero threshold
 //! collapses all codes to all-ones on non-negative embeddings (SIFT, ReLU activations),
-//! resulting in degenerate 1.2% recall; use RaBitQHNSWIndex instead for 32x compression.
+//! resulting in degenerate 1.2% recall; use `HNSWIndex` with `Storage::RaBitQ` instead
+//! for 32x compression.
 //!
 //! # Memory Comparison (1M vectors × 384 dims)
 //!

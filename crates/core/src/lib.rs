@@ -49,6 +49,16 @@ pub enum RagError {
 
     #[error("Index not trained: {0}")]
     NotTrained(String),
+
+    /// Raised when a caller asks a quantized index to rerank against full-precision vectors it
+    /// no longer has. `rerank_candidates: 0` *discards* the f32 vectors at build time — that is
+    /// the point of it, and the smallest index foxstash can build — so the pool cannot be
+    /// raised afterwards. See [`index::HNSWIndex::set_rerank_candidates`].
+    #[error(
+        "cannot rerank: this index was built with rerank_candidates = 0, which drops the \
+         full-precision vectors. Rebuild with rerank_candidates > 0 to enable reranking."
+    )]
+    FullPrecisionDropped,
 }
 
 /// Document with embedding

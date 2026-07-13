@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Reusable search context** (`Collection::create_search_context`, `Collection::search_with_context`), added below in 0.5.0 on the promise of reduced per-query allocation overhead. Measured on SIFT1M: 4,118 QPS via `search()` vs 4,121 QPS reused — **1.00x**, no measurable difference. The search is memory-latency bound, not allocation bound, so there was nothing for a reused scratch buffer to save. The underlying `HNSWIndex::search_with_context`/`create_search_context` and `search_batch_fast` (measured 0.97x `search_batch` — slower) were deleted for the same reason; see `crates/core/src/index/hnsw.rs`'s `Searcher` doc and `cargo run --release -p foxstash-benches --example search_api_cost` to reproduce. `Collection::search_batch` (also added in 0.5.0, below) is unaffected — it doesn't carry this claim and remains.
+
 ## [0.5.0] - 2026-03-01
 
 ### Added

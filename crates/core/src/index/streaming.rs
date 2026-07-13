@@ -185,7 +185,8 @@ pub trait BatchIndex {
 }
 
 // Blanket implementation for all VectorIndex types.
-// This covers HNSWIndex, FlatIndex, RaBitQHNSWIndex, and PQHNSWIndex.
+// Covers every type implementing VectorIndex, current and future — see crate::index for
+// the list rather than naming them here, where it would go stale as they change.
 impl<T: crate::index::VectorIndex> BatchIndex for T {
     fn add_document(&mut self, doc: Document) -> Result<()> {
         crate::index::VectorIndex::add(self, doc)

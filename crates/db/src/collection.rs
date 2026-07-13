@@ -429,8 +429,12 @@ impl Collection {
             return Ok(Vec::new());
         }
 
-        let default_config = HybridConfig::default();
-        let config = config.unwrap_or(&default_config);
+        // Fall back to the collection's CONFIGURED hybrid settings, not a fresh default. This
+        // used to build a throwaway `HybridConfig::default()` and defer to that, which made
+        // `DbConfig::hybrid` — a public field with a public `with_hybrid()` builder — dead:
+        // nothing in the workspace ever read it. A caller who configured custom weights and
+        // then made the documented call (`search_hybrid(.., None)`) silently got the defaults.
+        let config = config.unwrap_or(&self.config.hybrid);
 
         let inner = self.inner.read();
 
@@ -1132,6 +1136,119 @@ mod tests {
         assert_eq!(results.len(), 3);
         // "both" appears in both signals → should be ranked first.
         assert_eq!(results[0].id, "both");
+    }
+
+    // `DbConfig::hybrid` was dead code. `search_hybrid` built a throwaway
+    // `HybridConfig::default()` and deferred to *that*, so the collection's configured merge
+    // settings were silently discarded on the documented call. `with_hybrid()` was a public
+    // builder wired to nothing — `grep -rn 'config\.hybrid' crates/` returned zero hits, and
+    // no test called it. Same shape as every other bug this repo has shipped: a public knob
+    // whose tests exercise it without being able to tell whether it does anything.
+    //
+    // The fixture is chosen to DISCRIMINATE. The two strategies put the top score two orders
+    // of magnitude apart: `WeightedSum` with `vector_weight = 1.0` min-max normalizes the best
+    // vector hit to exactly 1.0, while the default `Rrf` scores it 0.7/(60 + 0 + 1) ≈ 0.0115.
+    // The first assertion below proves that gap is real on THIS data before the second one
+    // relies on it — otherwise the test would be as vacuous as the ones it replaces.
+    #[test]
+    fn a_collections_configured_hybrid_config_is_used_when_none_is_passed() {
+        let weighted = HybridConfig::default()
+            .with_strategy(crate::hybrid::MergeStrategy::WeightedSum)
+            .with_weights(1.0, 0.0);
+
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hybrid = weighted.clone();
+        let col = Collection::create("test", dir.path(), config).unwrap();
+
+        col.insert("a".into(), "gateway service".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "gateway timeout".into(), vec![0.0, 0.0, 1.0], None)
+            .unwrap();
+
+        // Control: the fixture discriminates. Forcing the DEFAULT (Rrf) via an explicit
+        // override must score the top hit far below what WeightedSum gives it. If this fails,
+        // the two configs are indistinguishable here and the real assertion proves nothing.
+        let rrf = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, Some(&HybridConfig::default()))
+            .unwrap();
+        assert!(
+            rrf[0].score < 0.1,
+            "fixture does not discriminate: Rrf top score {} is not clearly below WeightedSum's 1.0",
+            rrf[0].score
+        );
+
+        // The real assertion: passing `None` must use the COLLECTION's config (WeightedSum),
+        // not a fresh default. Before the fix this returned the ~0.0115 Rrf score above.
+        let got = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, None)
+            .unwrap();
+        assert!(
+            got[0].score > 0.9,
+            "search_hybrid(.., None) ignored the collection's configured HybridConfig: \
+             top score {} looks like Rrf, not WeightedSum",
+            got[0].score
+        );
+    }
+
+    // `DbConfig.auto_checkpoint`, flagged VACUOUS in the public-option audit: the only prior
+    // test, `concurrent_inserts_with_auto_checkpoint_persist_after_reopen`, calls `col.flush()`
+    // before dropping the collection and then reopens it — WAL replay on reopen recovers every
+    // document regardless of whether any checkpoint ever fired, so that test cannot distinguish
+    // "checkpoint fired automatically" from "checkpoint never fired, WAL replay did all the
+    // work". This test never calls `flush()` or reopens: it checks for a checkpoint FILE on disk
+    // immediately after a single insert, which only `maybe_auto_checkpoint_locked` can produce.
+    //
+    // NOT COMPILED — the team lead will compile and sabotage-verify this directly.
+    //
+    // Sabotage this catches: hardcode `maybe_auto_checkpoint_locked` to always return early (as
+    // if `auto_checkpoint` were always `false`) — the `true` config below would then also leave
+    // no `checkpoint_*.bin` file on disk after the insert.
+    #[test]
+    fn auto_checkpoint_true_writes_a_checkpoint_file_without_flush_or_reopen() {
+        let has_checkpoint_file = |dir: &std::path::Path| -> bool {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("checkpoint_") && name.ends_with(".bin")
+                })
+        };
+
+        let dir_on = TempDir::new().unwrap();
+        let config_on = DbConfig {
+            embedding_dim: 3,
+            auto_checkpoint: true,
+            storage: IncrementalConfig::default().with_checkpoint_threshold(1),
+            ..Default::default()
+        };
+        let col_on = Collection::create("test", dir_on.path(), config_on).unwrap();
+        col_on
+            .insert("a".into(), "content".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        assert!(
+            has_checkpoint_file(dir_on.path()),
+            "auto_checkpoint: true with checkpoint_threshold: 1 should have written a \
+             checkpoint file after a single insert, and none was found"
+        );
+
+        let dir_off = TempDir::new().unwrap();
+        let config_off = DbConfig {
+            embedding_dim: 3,
+            auto_checkpoint: false,
+            storage: IncrementalConfig::default().with_checkpoint_threshold(1),
+            ..Default::default()
+        };
+        let col_off = Collection::create("test", dir_off.path(), config_off).unwrap();
+        col_off
+            .insert("a".into(), "content".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        assert!(
+            !has_checkpoint_file(dir_off.path()),
+            "auto_checkpoint: false must not write a checkpoint file on insert, but one was \
+             found — auto_checkpoint is being ignored"
+        );
     }
 
     #[test]

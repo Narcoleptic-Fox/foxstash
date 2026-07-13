@@ -248,21 +248,56 @@ impl Searcher<'_> {
     }
 }
 
-/// Strategy for building the HNSW index
+/// How to build the graph.
+///
+/// # Use `Parallel` (the default). `Sequential` costs 5.2x the build time to buy ~0.1 recall.
+///
+/// Measured on SIFT1M — 1,000,000 vectors, M=32/m0=64, ef_c=200, real ground truth
+/// (`--example build_strategy_recall sift1m 1000000`, idle machine):
+///
+/// ```text
+///   build:  Sequential 865.3s   Parallel 165.8s   (5.2x faster)
+///
+///       ef     Sequential       Parallel      delta
+///       50         98.52%         98.21%     -0.31
+///      100         99.61%         99.52%     -0.08
+///      200         99.88%         99.86%     -0.02
+/// ```
+///
+/// # The `Auto` variant was removed, and the story is a warning
+///
+/// This enum used to carry a third variant, `Auto`, which resolved to `Parallel` below 50k
+/// vectors and `Sequential` at or above it — "reliability over speed" — because `Parallel` was
+/// documented as *"may have lower recall at larger scales (needs more work)"*. `Sequential` was
+/// the default for the same reason.
+///
+/// That caveat described a **real bug, which was fixed.** The parallel builder genuinely did
+/// wreck recall once — the defect that hid behind uniform-random vectors for an entire release
+/// (every ANN scores ~60% on random data, so nothing could see it). The bug died; the warning
+/// did not. It went on quietly routing **every production-sized index** onto a builder that takes
+/// five times longer, to avoid a problem that no longer existed.
+///
+/// Note what `Auto` actually was: its *only* distinct behaviour was choosing `Sequential` at
+/// scale. That is precisely the wrong choice. It was not a dispatcher with a bad threshold — it
+/// was the bug, wearing a dispatcher's clothes. So it is gone rather than inverted.
+///
+/// The 1M numbers above were produced *by this library's own flagship benchmark* (`storage_pareto`
+/// builds with `Parallel` at 1M and reports 99.5% recall), which means the evidence refuting the
+/// caveat was sitting in the README the whole time. A stale warning is not free: it keeps costing
+/// you until someone measures it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BuildStrategy {
-    /// Sequential insertion - slower but guarantees high recall (97%+)
-    /// Best for: production search, accuracy-critical applications
+    /// Rayon-parallel build. **The default.** 5.2x faster than `Sequential` at 1M vectors, for a
+    /// recall cost of 0.02–0.31 points (see the table above).
     #[default]
-    Sequential,
-    /// Parallel insertion using layer-copying approach
-    /// Fast build (6-10x faster), good recall at small scale (<50k)
-    /// May have lower recall at larger scales (needs more work)
     Parallel,
-    /// Automatically choose based on dataset size
-    /// Uses Parallel for <50k vectors (where it works well)
-    /// Uses Sequential for larger datasets (reliability over speed)
-    Auto,
+    /// One-at-a-time insertion. Slower by ~5x at 1M; buys ~0.1–0.3 recall points at low `ef`.
+    ///
+    /// Reach for this only if you have measured that the last fraction of a point matters on
+    /// *your* data — not on the strength of the word "sequential". It is also the only strategy
+    /// that must read vectors back out of storage mid-build, which is why quantized builds with
+    /// `rerank_candidates: 0` retain their f32 vectors for the duration and drop them afterwards.
+    Sequential,
 }
 
 /// Configuration for HNSW index
@@ -309,7 +344,8 @@ pub struct HNSWConfig {
     /// Only applies when use_heuristic is true.
     pub keep_pruned_connections: bool,
 
-    /// Build strategy: Sequential (high recall), Parallel (faster), or Auto
+    /// Build strategy. Defaults to [`BuildStrategy::Parallel`] — 5.2x faster at 1M vectors for
+    /// a recall cost of 0.02-0.31 points. See [`BuildStrategy`] for the measurements.
     pub build_strategy: BuildStrategy,
 
     /// Random seed for reproducible builds (None = random)
@@ -335,9 +371,11 @@ pub struct HNSWConfig {
 
 /// Distance metric for [`HNSWIndex`].
 ///
-/// The quantized indexes (`SQ8HNSWIndex`, `RaBitQHNSWIndex`) are L2-only. Before this
-/// enum existed `HNSWIndex` was cosine-only, so swapping index type to save memory
-/// silently changed the metric. Set this explicitly to keep them consistent.
+/// The quantized index types not yet folded into this enum (`RaBitQHNSWIndex`,
+/// `PQHNSWIndex`) are L2-only — they have no `metric` field at all. Before this enum
+/// existed `HNSWIndex` was cosine-only too, so swapping index type to save memory
+/// silently changed the metric. Set this explicitly on `HNSWConfig` to keep the storage
+/// modes here consistent; the two standalone types above still carry the footgun.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum DistanceMetric {
     /// `1 - cosine_similarity`. Magnitude-invariant; the historical default.
@@ -414,21 +452,48 @@ pub enum Storage {
     ///   `dim` and dies at high `dim`.
     /// * **RaBitQ** compares sign bits against a query rotated once per search — **cheaper per
     ///   dimension than f32**, with no widening at all. What it pays is a *coarser* estimate,
-    ///   which makes the graph walk take more hops. That penalty is roughly independent of
-    ///   `dim`, while the per-dimension saving grows with it: it loses at low `dim` and wins at
-    ///   high `dim`.
+    ///   which makes the graph walk take more hops. That penalty **shrinks sharply as `dim`
+    ///   rises**, because the code is 1 bit *per dimension*: a higher-dimensional vector gets a
+    ///   proportionally longer code, so the estimate gets better exactly where the vector gets
+    ///   more expensive to read. It loses at low `dim` and wins at high `dim`.
     ///
-    /// `dist/query` is the control that shows this. At 960-d RaBitQ issues 17,583 distance
-    /// computations against F32's 17,245 — only 2% more work — and each costs half as much. At
-    /// 128-d the same coarseness cost it **10x more** distance computations, which no
-    /// per-distance saving could repay, and it lost ~12x.
+    /// Both blades close at once — it is a scissors, not a single crossing line. Measured on one
+    /// corpus, prefix-truncated so `dim` is the only variable (`--example dim_crossover`, GIST,
+    /// n = 200k, ef = 100):
+    ///
+    /// ```text
+    ///   dim          64    128    192    256    384    512    768    960
+    ///   RaBitQ recall  63.7%  78.0%  84.9%  88.2%  91.4%  94.2%  96.9%  96.7%
+    ///   gap vs F32    -35.8  -20.6  -13.4  -10.0   -6.4   -3.8   -0.9   -0.9
+    ///   RaBitQ speed   1.28x  1.55x  1.58x  1.74x  1.88x  2.01x  1.98x  1.89x   (F32 ns/dist ÷ RaBitQ)
+    /// ```
+    ///
+    /// The accuracy penalty collapses by ~40x across that range while the speed advantage grows.
+    /// (An earlier version of this doc claimed the penalty was "roughly independent of `dim`" and
+    /// cited, as *supporting* evidence, that RaBitQ issues 10x more distance computations at
+    /// 128-d but only 2% more at 960-d. That is the refutation, printed next to the claim.)
     ///
     /// # Rule of thumb
     ///
     /// Real embeddings are 384-d (MiniLM) to 1536-d (OpenAI); nobody runs RAG on 128-d vectors.
-    /// **Reach for `RaBitQ` first at 768-d and above, `SQ8` at 128-d, and measure in between** —
-    /// the crossover has not been located, only bracketed. Reproduce with
-    /// `cargo run --release -p foxstash-benches --example storage_pareto gist1m`.
+    ///
+    /// **Use `SQ8` at 384-d and below. Use `RaBitQ` at 768-d and above.** In between, measure.
+    ///
+    /// 384-d is decided by measurement, not by reading the table above: at **matched recall** —
+    /// the only comparison that bills RaBitQ for its extra hops — RaBitQ *loses* at 384-d to both
+    /// SQ8 and plain F32 (`--example dim_pareto gist1m 384`, n = 200k):
+    ///
+    /// ```text
+    ///   recall@10     F32     SQ8   RaBitQ
+    ///      93.9%     3116    3371    ~2674
+    ///      98.1%     1826    1935    ~1398
+    ///      99.35%    1068    1137     ~750
+    /// ```
+    ///
+    /// At a *fixed* `ef` RaBitQ looks like the winner at 384-d (3,257 QPS vs 1,898). That reading
+    /// is an artifact: at fixed `ef` it is simply searching less hard, and 6.4 recall points
+    /// behind. A mode that is fast because it stopped finding things is not fast. Compare at
+    /// matched recall. Reproduce with `--example storage_pareto gist1m` and `--example dim_pareto`.
     ///
     /// One caveat carried from 128-d: with a coarse metric, a **too-small rerank pool** makes
     /// recall *fall* as `ef` rises, because distractors crowd the fixed pool and evict true
@@ -478,9 +543,11 @@ impl HNSWConfig {
     }
 
     /// Set build strategy
-    /// - Sequential: slower but guarantees high recall (97%+)
-    /// - Parallel: faster using instant-distance's layer-copying approach
-    /// - Auto: Sequential for <50k vectors, Parallel for larger
+    /// - [`BuildStrategy::Parallel`] (default): rayon-parallel; 5.2x faster at 1M.
+    /// - [`BuildStrategy::Sequential`]: ~5x slower; buys 0.02-0.31 recall points at 1M.
+    ///
+    /// The `Auto` variant was removed — its only distinct behaviour was choosing `Sequential`
+    /// above 50k vectors, which the measurements show is the wrong choice. See [`BuildStrategy`].
     pub fn with_build_strategy(mut self, strategy: BuildStrategy) -> Self {
         self.build_strategy = strategy;
         self
@@ -867,13 +934,44 @@ impl HNSWIndex {
         self.config.ef_search
     }
 
+    /// Resize the exact-rerank pool at search time.
+    ///
+    /// On a quantized index (`Storage::SQ8` / `Storage::RaBitQ`) the graph walk ranks by an
+    /// *estimated* distance; the top `rerank_candidates` are then rescored against the exact
+    /// f32 vectors. Like [`Self::set_ef_search`], this walks the recall/QPS curve and does
+    /// **not** require a rebuild.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RagError::FullPrecisionDropped`] if the index was built with
+    /// `rerank_candidates: 0`. That configuration *discards the f32 vectors entirely* — it is
+    /// the smallest index foxstash can build — so there is nothing left to rerank against, and
+    /// raising the pool afterwards cannot be honored. Rejecting this is the whole reason the
+    /// method returns `Result`: silently accepting it would rerank against an empty array and
+    /// quietly return the coarse ranking, which is precisely the class of no-op knob this
+    /// codebase keeps shipping. Lowering to 0, or any value on an index that kept its vectors,
+    /// is fine.
+    pub fn set_rerank_candidates(&mut self, n: usize) -> Result<()> {
+        if n > 0 && self.config.storage != Storage::F32 && self.full.is_empty() && !self.is_empty()
+        {
+            return Err(crate::RagError::FullPrecisionDropped);
+        }
+        self.config.rerank_candidates = n;
+        Ok(())
+    }
+
+    /// The exact-rerank pool size currently in effect. See [`Self::set_rerank_candidates`].
+    pub fn rerank_candidates(&self) -> usize {
+        self.config.rerank_candidates
+    }
+
     /// Build an HNSW index from embeddings using the configured strategy
     ///
     /// This is the recommended way to create an index from bulk embeddings.
     /// The build strategy is controlled by `config.build_strategy`:
     /// - `Sequential`: Slower but guarantees high recall (97%+)
     /// - `Parallel`: Faster using instant-distance's layer-copying approach
-    /// - `Auto`: Sequential for <50k vectors, Parallel for larger
+    /// - `Auto`: Parallel for <50k vectors, Sequential for larger
     ///
     /// # Arguments
     /// * `embeddings` - Vector of embedding vectors (all must have same dimension)
@@ -917,24 +1015,13 @@ impl HNSWIndex {
             );
         }
 
-        let n = embeddings.len();
-        let strategy = match config.build_strategy {
-            BuildStrategy::Auto => {
-                // Parallel works well for <50k, Sequential for larger
-                if n < 50_000 {
-                    BuildStrategy::Parallel
-                } else {
-                    BuildStrategy::Sequential
-                }
-            }
-            other => other,
-        };
-
-        match strategy {
+        // No size-based dispatch. `BuildStrategy::Auto` used to send anything >= 50k vectors to
+        // `Sequential` on the premise that `Parallel` lost recall at scale. Measured at 1M:
+        // Parallel is 5.2x faster and gives up 0.02-0.31 recall points. The premise was a fixed
+        // bug's warning that outlived it. See `BuildStrategy`.
+        match config.build_strategy {
             BuildStrategy::Sequential => Self::build_sequential(embeddings, config),
-            BuildStrategy::Parallel | BuildStrategy::Auto => {
-                Self::build_parallel(embeddings, config)
-            }
+            BuildStrategy::Parallel => Self::build_parallel(embeddings, config),
         }
     }
 
@@ -963,6 +1050,28 @@ impl HNSWIndex {
 
         // Create index
         let mut index = Self::new(embedding_dim, config);
+
+        // `rerank_candidates: 0` means "don't ship the f32 vectors" — a property of the finished
+        // INDEX, not of the build. Sequential insertion still needs exact vectors *while* it
+        // runs: `insert_node` reads back each candidate's embedding to select neighbours, and on
+        // quantized storage the only place that lives is `full`. Skipping it made
+        // `HNSWIndex::build(.., Storage::RaBitQ + rerank_candidates: 0)` — the README's "smallest
+        // index foxstash can build", on the #[default] build strategy — panic in release with
+        // "range start index 24 out of range for slice of length 0".
+        //
+        // (`build_parallel` never hit this: it builds the graph from the caller's f32 slice and
+        // quantizes at the end, so it never reads a vector back. Every existing caller happened
+        // to use it, and the one test covering this config used `build_parallel` explicitly —
+        // with a comment noting that `insert_node` "assumes `full` is populated". The landmine
+        // was documented and stepped over rather than defused.)
+        //
+        // So: retain the vectors for the duration of the build, then drop them below. Same end
+        // state, same memory profile for the shipped index.
+        let drop_full_after_build =
+            index.config.storage != Storage::F32 && index.config.rerank_candidates == 0;
+        if drop_full_after_build {
+            index.config.rerank_candidates = 1; // make `push_node` populate `full`
+        }
 
         // Pre-allocate
         index
@@ -1011,6 +1120,15 @@ impl HNSWIndex {
         // array, but this builder never put any there — `insert_node` wrote them directly
         // to the flat array. Running the migration would copy the empty nested layer 0 over
         // the real graph and silently erase every layer-0 link.
+
+        // The graph is built; the exact vectors have done their job. Honor the caller's
+        // `rerank_candidates: 0` by dropping them now — restoring both the config the caller
+        // actually asked for and the memory profile it promises.
+        if drop_full_after_build {
+            index.config.rerank_candidates = 0;
+            index.full = Vec::new();
+        }
+
         index.shrink_to_fit();
         index
     }
@@ -3820,11 +3938,7 @@ mod tests {
             })
             .collect();
 
-        for strategy in [
-            BuildStrategy::Sequential,
-            BuildStrategy::Parallel,
-            BuildStrategy::Auto,
-        ] {
+        for strategy in [BuildStrategy::Sequential, BuildStrategy::Parallel] {
             let config = HNSWConfig::default()
                 .with_build_strategy(strategy)
                 .with_seed(42)
@@ -3978,6 +4092,141 @@ mod tests {
     /// `rerank_candidates: 0` must work: codes-only, the cold `full` array dropped entirely,
     /// and the estimate itself used as the final ranking with no exact-distance correction.
     /// Must not panic even though `full` stays empty for the whole life of the index.
+    #[test]
+    // `HNSWIndex::build(.., Storage::RaBitQ + rerank_candidates: 0)` used to PANIC IN RELEASE:
+    //   range start index 24 out of range for slice of length 0   (hnsw.rs, get_embedding)
+    //
+    // Both halves of that config are things the docs actively recommend: `rerank_candidates: 0`
+    // is the README's "smallest index foxstash can build", and `BuildStrategy::Sequential` is
+    // the #[default]. Nobody hit it only because every caller in the tree reached for
+    // `build_parallel`, which builds the graph from the caller's f32 slice and never reads a
+    // vector back. The one test covering this config hard-coded `build_parallel` and left a
+    // comment explaining that `insert_node` "assumes `full` is populated" — the bug was
+    // documented and walked around instead of fixed.
+    //
+    // This test goes through the PUBLIC `build`, on the DEFAULT strategy, for both quantized
+    // modes, and checks the memory promise too: dropping the vectors is the entire point of
+    // `rerank_candidates: 0`, so "it stopped panicking because we kept them" is not a fix.
+    #[test]
+    fn zero_rerank_quantized_builds_on_the_default_strategy_and_still_drops_its_vectors() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let dim = 24;
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..320)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        // BOTH strategies, explicitly. `Sequential` is where the panic lived — it is the only
+        // builder that reads vectors back out of storage mid-build. It used to be the #[default],
+        // which is what made this a default-config crash; it no longer is (see `BuildStrategy`),
+        // but it is still a supported public option, so it still must not blow up. Naming it
+        // explicitly rather than leaning on the default also keeps this test from quietly
+        // becoming a no-op the next time the default moves.
+        for storage in [Storage::SQ8, Storage::RaBitQ] {
+            for build_strategy in [BuildStrategy::Sequential, BuildStrategy::Parallel] {
+                let config = HNSWConfig {
+                    metric: DistanceMetric::L2,
+                    storage,
+                    rerank_candidates: 0,
+                    seed: Some(4),
+                    build_strategy,
+                    ..Default::default()
+                };
+
+                let index = HNSWIndex::build(base.clone(), config);
+
+                assert!(
+                    index.full.is_empty(),
+                    "{storage:?}/{build_strategy:?}: rerank_candidates = 0 must still DROP the f32 \
+                     vectors — retaining them would 'fix' the panic by silently ignoring the \
+                     caller's memory request"
+                );
+                assert_eq!(
+                    index.rerank_candidates(),
+                    0,
+                    "{storage:?}/{build_strategy:?}: the caller's rerank_candidates must be \
+                     restored after the build"
+                );
+
+                // And the graph must actually work — a build that produces a valid-but-empty
+                // index would pass every assertion above.
+                let mut hits = 0;
+                for (i, q) in base.iter().enumerate().step_by(17) {
+                    let got = index.search(q, 5).expect("search must not panic");
+                    assert_eq!(got.len(), 5);
+                    if got.iter().any(|r| r.id == i.to_string()) {
+                        hits += 1;
+                    }
+                }
+                assert!(
+                    hits > 0,
+                    "{storage:?}/{build_strategy:?}: index returns results but finds nothing — \
+                     graph is broken"
+                );
+            }
+        }
+    }
+
+    // `set_rerank_candidates` exists so the rerank pool can be swept at search time, the way
+    // `set_ef_search` sweeps `ef` — the legacy `RaBitQHNSWIndex::search_and_rerank(q, pool, k)`
+    // took the pool per call, and that was the one capability `Storage::RaBitQ` lacked.
+    //
+    // The interesting half is the REFUSAL. `rerank_candidates: 0` discards the f32 vectors, so
+    // raising the pool afterwards has nothing to rescore against. Accepting it would silently
+    // return the coarse ranking — a knob that reports success and does nothing, which is the
+    // exact bug shape this codebase has now shipped ten times. So it must be an `Err`, and the
+    // test asserts the error rather than just "doesn't panic".
+    #[test]
+    fn raising_the_rerank_pool_on_an_index_that_dropped_its_vectors_is_an_error() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let dim = 24;
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..320)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        let cfg = |rerank| HNSWConfig {
+            metric: DistanceMetric::L2,
+            storage: Storage::RaBitQ,
+            rerank_candidates: rerank,
+            seed: Some(9),
+            ..Default::default()
+        };
+
+        // Built WITHOUT the f32 vectors: raising the pool must be refused, not silently ignored.
+        let mut dropped = HNSWIndex::build(base.clone(), cfg(0));
+        assert!(
+            matches!(
+                dropped.set_rerank_candidates(64),
+                Err(crate::RagError::FullPrecisionDropped)
+            ),
+            "raising the rerank pool on a vectors-dropped index must be an error"
+        );
+        assert_eq!(dropped.rerank_candidates(), 0, "the refused set must not take effect");
+        // Lowering to 0 is always fine — nothing to rescore against is what it already wants.
+        assert!(dropped.set_rerank_candidates(0).is_ok());
+
+        // Built WITH the f32 vectors: the pool is a live search-time dial.
+        let mut kept = HNSWIndex::build(base, cfg(100));
+        assert!(kept.set_rerank_candidates(64).is_ok());
+        assert_eq!(kept.rerank_candidates(), 64);
+        assert!(kept.set_rerank_candidates(0).is_ok());
+        assert_eq!(kept.rerank_candidates(), 0);
+        // ...and back up again, because this index kept what it needs to honor that.
+        assert!(kept.set_rerank_candidates(200).is_ok());
+        assert_eq!(kept.rerank_candidates(), 200);
+    }
+
     #[test]
     fn rabitq_zero_rerank_drops_full_precision_vectors_and_does_not_panic() {
         let mut rng = StdRng::seed_from_u64(55);
@@ -4302,6 +4551,554 @@ mod tests {
             results.last().unwrap().id,
             "opposite_dir",
             "opposite direction must rank last under cosine"
+        );
+    }
+
+    // ========================================================================
+    // Discriminating tests for options flagged VACUOUS/UNCOVERED in the public-option audit:
+    // each one had a test that set the field without any assertion able to tell whether it was
+    // actually read. Every test below states, in its doc comment, the specific sabotage it
+    // would catch ("if I hardcoded this to its default and deleted the config read, would this
+    // fail?"), per the standard the rest of this module already holds itself to.
+    //
+    // NOT COMPILED. Written and reasoned through by hand while a benchmark held the CPU; the
+    // team lead will compile and sabotage-verify these directly. Where a test's margin depends
+    // on empirical behavior I could not run (rather than being guaranteed by construction), the
+    // doc comment says so.
+    // ========================================================================
+
+    /// `ef_search` must bound how many candidates the layer-0 walk explores.
+    ///
+    /// Sabotage this catches: hardcode `ef` in `search_inner` to a fixed value (e.g.
+    /// `k.max(100)`) instead of reading `self.config.ef_search`. `distance_calls()` would then
+    /// stay flat no matter what a caller sets `ef_search` to, because the real code never
+    /// explores more than the hardcoded constant.
+    #[test]
+    fn ef_search_controls_distance_calls() {
+        let mut rng = StdRng::seed_from_u64(9001);
+        let centers: Vec<Vec<f32>> = (0..20)
+            .map(|_| (0..32).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..2000)
+            .map(|i| {
+                let c = &centers[i % 20];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.4).collect()
+            })
+            .collect();
+
+        let mut index = HNSWIndex::build(embeddings.clone(), HNSWConfig::default().with_seed(7));
+        let query = embeddings[0].clone();
+
+        let calls_at = |index: &mut HNSWIndex, ef: usize| -> u64 {
+            index.set_ef_search(ef);
+            let mut searcher = index.searcher();
+            searcher.search(&query, 10).unwrap();
+            searcher.distance_calls()
+        };
+
+        let low = calls_at(&mut index, 10);
+        let high = calls_at(&mut index, 800);
+
+        assert!(
+            high > low,
+            "ef_search has no effect on work done: {high} distance calls at ef=800 vs {low} at \
+             ef=10 — ef_search is being ignored"
+        );
+    }
+
+    /// `ef_construction` must bound the candidate pool used while building each node's edges. A
+    /// starved pool at build time produces a measurably worse GRAPH.
+    ///
+    /// Sabotage this catches: hardcode `ef_construction` in `insert_node` to a fixed value
+    /// instead of reading `self.config.ef_construction`. Both configs below would then build the
+    /// identical graph and score identical recall, regardless of which value a caller set.
+    ///
+    /// # The first version of this test was wrong, and wrong in an instructive way
+    ///
+    /// It held `ef_search: 300` at query time, with a comment claiming that "isolates the
+    /// build-time effect". It does the **opposite**. A large search-time `ef` explores most of
+    /// the corpus regardless of how the graph is wired, which *compensates for a bad graph* and
+    /// masks the very thing under test. On 320 vectors with `ef_search: 300` the search is
+    /// nearly exhaustive, so a graph built with `ef_construction: 1` still scored **98.7%** —
+    /// the test failed, and it deserved to.
+    ///
+    /// To see graph quality you must make the search *depend* on it: a small `ef_search`, on a
+    /// corpus too large to sweep by brute force. Then a badly-linked graph has nowhere to hide.
+    /// The threshold below is unchanged from the original — the fixture was hardened rather than
+    /// the assertion weakened, which is the rule whenever a test like this comes back red.
+    #[test]
+    fn ef_construction_controls_graph_quality() {
+        let mut rng = StdRng::seed_from_u64(3113);
+        let centers: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..24).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..800)
+            .map(|i| {
+                let c = &centers[i % 16];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..60)
+            .map(|i| {
+                let c = &centers[i % 16];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        let recall_for = |ef_construction: usize| -> f32 {
+            let index = HNSWIndex::build(
+                base.clone(),
+                HNSWConfig {
+                    m: 8,
+                    m0: 16,
+                    ef_construction,
+                    // SMALL, deliberately. A generous `ef_search` papers over a badly-linked
+                    // graph by exploring everything anyway — which is how the first version of
+                    // this test scored 98.7% on a graph built with ef_construction = 1.
+                    ef_search: 12,
+                    seed: Some(11),
+                    build_strategy: BuildStrategy::Sequential,
+                    ..Default::default()
+                },
+            );
+            let k = 10;
+            let mut total = 0.0f32;
+            for q in &queries {
+                let mut exact: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (1.0 - crate::vector::simd::cosine_similarity_simd(v, q), i))
+                    .collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let truth: HashSet<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
+
+                let got: HashSet<usize> = index
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                total += truth.intersection(&got).count() as f32 / k as f32;
+            }
+            total / queries.len() as f32
+        };
+
+        let starved = recall_for(1);
+        let generous = recall_for(200);
+
+        assert!(
+            generous > starved + 0.1,
+            "ef_construction has no measurable effect on graph quality: recall@10 = {:.3} at \
+             ef_construction=1 vs {:.3} at ef_construction=200 — ef_construction is being \
+             ignored at build time",
+            starved,
+            generous
+        );
+    }
+
+    /// `use_heuristic` must select which neighbour-selection algorithm actually runs: Algorithm
+    /// 4's diversity heuristic (default) vs plain nearest-M. Whitebox test of `select_neighbors`
+    /// directly — the two algorithms are *proven* to disagree on this exact fixture by hand
+    /// below, so there is no fixture-sensitivity risk the way an end-to-end recall test has.
+    ///
+    /// Fixture (2-D, `DistanceMetric::L2`, query at the origin):
+    ///   A = (1.00, 0.0)  dist to query = 1.00
+    ///   B = (1.05, 0.0)  dist to query = 1.05, dist to A  = 0.05
+    ///   C = (0.00, 1.2)  dist to query = 1.20, dist to A  = 1.562
+    ///
+    /// Nearest-2 by raw distance: {A, B} — 1.00 and 1.05 both beat 1.20.
+    /// Algorithm 4 with m=2: A is accepted first (always is). B is checked against A:
+    /// dist(B,A)=0.05 < dist(B,query)=1.05, so B is "behind" A and pruned. C is checked against
+    /// A: dist(C,A)=1.562 is NOT less than dist(C,query)=1.20, so C is accepted. Heuristic result:
+    /// {A, C}.
+    ///
+    /// Sabotage this catches: hardcode `use_heuristic` to `true` (delete the `if
+    /// !self.config.use_heuristic` early return in `select_neighbors`) — the `false` config
+    /// below would then also return {A, C} instead of {A, B}.
+    #[test]
+    fn use_heuristic_selects_a_different_neighbor_set_than_simple() {
+        let a = [1.0f32, 0.0];
+        let b = [1.05f32, 0.0];
+        let c = [0.0f32, 1.2];
+        let query = [0.0f32, 0.0];
+
+        let build_index = |use_heuristic: bool| -> HNSWIndex {
+            let config = HNSWConfig {
+                metric: DistanceMetric::L2,
+                use_heuristic,
+                extend_candidates: false,
+                ..Default::default()
+            };
+            let mut index = HNSWIndex::new(2, config);
+            index.push_node(&a); // id 0
+            index.push_node(&b); // id 1
+            index.push_node(&c); // id 2
+            index
+        };
+
+        let heuristic_selected: HashSet<usize> = build_index(true)
+            .select_neighbors(&[0, 1, 2], &query, 2, 0)
+            .into_iter()
+            .collect();
+        let simple_selected: HashSet<usize> = build_index(false)
+            .select_neighbors(&[0, 1, 2], &query, 2, 0)
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            heuristic_selected,
+            HashSet::from([0, 2]),
+            "Algorithm-4 heuristic should pick the diverse pair {{A, C}}, got \
+             {heuristic_selected:?}"
+        );
+        assert_eq!(
+            simple_selected,
+            HashSet::from([0, 1]),
+            "simple selection should pick the two nearest {{A, B}}, got {simple_selected:?}"
+        );
+        assert_ne!(
+            heuristic_selected, simple_selected,
+            "use_heuristic has no effect: both configs picked the same neighbours — \
+             use_heuristic is being ignored"
+        );
+    }
+
+    /// `extend_candidates` must broaden the pool `select_neighbors`'s heuristic prunes from —
+    /// pulling in each direct candidate's own layer-0 neighbours before scoring. Whitebox again:
+    /// D is the only member of `candidates`; a strictly-second point E is reachable *exclusively*
+    /// through D's layer-0 neighbour list, never passed to `select_neighbors` directly. Without
+    /// `extend_candidates`, `select_neighbors` cannot see E at all. With it, D's neighbour list
+    /// is walked and E enters the working pool before pruning.
+    ///
+    /// `keep_pruned_connections: true` (the default) is held fixed in both configs so the size
+    /// difference below is attributable only to `extend_candidates`, not to whether pruned
+    /// candidates get backfilled.
+    ///
+    /// Sabotage this catches: hardcode `extend_candidates` to `false` (delete the `if
+    /// self.config.extend_candidates` block in `select_neighbors`, or make it a no-op) — the
+    /// `true` config below would then also return only `{D}`, size 1, instead of `{D, E}`, size 2.
+    #[test]
+    fn extend_candidates_pulls_in_neighbors_of_candidates() {
+        let d = [1.0f32, 0.0];
+        let e = [2.0f32, 0.0];
+        let query = [0.0f32, 0.0];
+
+        let build_index = |extend_candidates: bool| -> HNSWIndex {
+            let config = HNSWConfig {
+                metric: DistanceMetric::L2,
+                use_heuristic: true,
+                extend_candidates,
+                keep_pruned_connections: true,
+                m0: 4,
+                ..Default::default()
+            };
+            let mut index = HNSWIndex::new(2, config);
+            index.push_node(&d); // id 0
+            index.push_node(&e); // id 1
+            // D's only layer-0 neighbour is E. `candidates` passed to `select_neighbors` below
+            // is `[0]` (D) only — E is reachable exclusively by walking this link, which only
+            // happens when `extend_candidates` is set.
+            index.l0_push(0, 1);
+            index
+        };
+
+        let extended = build_index(true).select_neighbors(&[0], &query, 2, 0);
+        let not_extended = build_index(false).select_neighbors(&[0], &query, 2, 0);
+
+        assert_eq!(
+            not_extended.len(),
+            1,
+            "without extend_candidates, only the directly-passed candidate D can be selected, \
+             got {not_extended:?}"
+        );
+        assert_eq!(
+            extended.len(),
+            2,
+            "extend_candidates has no effect: expected D's neighbour E to be pulled into the \
+             pool and selected alongside D, got {extended:?} — extend_candidates is being \
+             ignored"
+        );
+    }
+
+    /// `HNSWConfig::m` must bound the number of edges kept per node at layers >= 1, independent
+    /// of `m0` (which bounds layer 0 only — see `keep_pruned_connections_controls_graph_density_
+    /// in_both_builders` for that one). `m0`, `ml`, `ef_construction` and `seed` are held
+    /// IDENTICAL between the two configs below; only `m` differs, so any difference in average
+    /// layer-1 degree is attributable to `m` alone. `ml` is fixed at an unusually high 0.8
+    /// (rather than the typical `1/ln(m)`) purely to get enough nodes above layer 0 to average
+    /// over; sharing both `seed` and `ml` means the two builds assign the *same* set of nodes to
+    /// layer >= 1, so the population being averaged over is identical too.
+    ///
+    /// # This test was VACUOUS in its first form, and the way it failed is worth keeping
+    ///
+    /// It originally compared the *average* layer-1 degree at `m=4` vs `m=32` and asserted the
+    /// wide one was 2x the narrow one. But `config.m` is read in TWO places during insertion:
+    /// the cap on the new node's own edge count, and the pruning of each existing neighbour's
+    /// edge list. Sabotaging *either one alone* left the other to spread the averages apart, so
+    /// the test still passed. It only failed if you broke **both**. That is an OR, not an AND —
+    /// and a real regression hardcodes ONE site. The test would have sailed straight past the
+    /// bug it was written to catch. (Verified: hardcoding each site in turn → still green.)
+    ///
+    /// So don't measure a statistic; assert the **invariant**. With `m = 4`, no node above layer
+    /// 0 may hold more than 4 neighbours — *ever*. Either read site breaking that produces an
+    /// over-degree node, and there is nowhere for it to hide in an average.
+    ///
+    /// Sabotage this now catches: hardcode EITHER `self.config.m` site in `insert_node` (the
+    /// select-neighbours cap, or `neighbor_m` in the prune step) to a constant.
+    ///
+    /// The control comes first, as always: assert the cap actually BINDS on this fixture (some
+    /// node genuinely reaches `m` neighbours). If nothing ever reaches the cap, "no node exceeds
+    /// the cap" is trivially true and proves nothing — that is exactly how the `ml: 0.8` fixture
+    /// hid this, by promoting too few nodes for any degree limit to matter.
+    #[test]
+    fn m_caps_upper_layer_degree_independent_of_m0() {
+        let mut rng = StdRng::seed_from_u64(5150);
+        let centers: Vec<Vec<f32>> = (0..12)
+            .map(|_| (0..16).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..800)
+            .map(|i| {
+                let c = &centers[i % 12];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        // Max degree over every node present at `layer`, and how many nodes that was.
+        let peak_degree_at = |index: &HNSWIndex, layer: usize| -> (usize, usize) {
+            let mut peak = 0usize;
+            let mut count = 0usize;
+            for node_id in 0..index.len() {
+                if layer < index.connections[node_id].len() {
+                    peak = peak.max(index.connections[node_id][layer].len());
+                    count += 1;
+                }
+            }
+            (peak, count)
+        };
+
+        let build_with_m = |m: usize| -> HNSWIndex {
+            HNSWIndex::build(
+                embeddings.clone(),
+                HNSWConfig {
+                    m,
+                    m0: 64,
+                    // ml: 3.0, NOT the 0.8 this test used to carry. `ml` sets how aggressively
+                    // nodes are promoted above layer 0; at 0.8 barely any were, so no node ever
+                    // accumulated enough neighbours for a degree cap of 4 — let alone 32 — to
+                    // bind. An option that is never placed under load cannot be measured.
+                    ml: 3.0,
+                    ef_construction: 150,
+                    seed: Some(99),
+                    build_strategy: BuildStrategy::Sequential,
+                    ..Default::default()
+                },
+            )
+        };
+
+        let narrow = build_with_m(4);
+        let wide = build_with_m(32);
+
+        let (narrow_peak, narrow_count) = peak_degree_at(&narrow, 1);
+        let (wide_peak, wide_count) = peak_degree_at(&wide, 1);
+
+        // CONTROL 1: the fixture actually populates layer 1.
+        assert!(
+            narrow_count > 20 && wide_count > 20,
+            "fixture put almost nothing on layer 1 ({narrow_count} / {wide_count} nodes) — a \
+             degree cap cannot bind on an empty layer, so the assertions below would be vacuous"
+        );
+
+        // CONTROL 2: the cap actually BINDS. Some node must reach exactly m=4 neighbours,
+        // otherwise "no node exceeds 4" is true for free and tests nothing.
+        assert_eq!(
+            narrow_peak, 4,
+            "the m=4 cap never bound (peak layer-1 degree was {narrow_peak}) — with nothing
+             pressing against the limit, the over-degree assertion below proves nothing"
+        );
+
+        // THE INVARIANT: m=4 means *no* node above layer 0 may exceed 4 edges. Breaking either
+        // read site lets some node through, and a peak — unlike a mean — cannot absorb it.
+        assert!(
+            narrow_peak <= 4,
+            "m = 4 but a layer-1 node holds {narrow_peak} neighbours — config.m is not capping \
+             upper-layer degree"
+        );
+
+        // ...and m=32 must genuinely permit a wider graph, or `m` is being clamped somewhere.
+        assert!(
+            wide_peak > 4,
+            "m = 32 produced a peak layer-1 degree of only {wide_peak}, no better than m=4 — \
+             config.m is being ignored during insertion"
+        );
+    }
+
+    /// `HNSWConfig::seed` must control the RNG used for level generation (and everything else
+    /// stochastic in the builder) deterministically: the same seed on the same data must produce
+    /// a bit-identical graph, and two different seeds must produce a different one. Both halves
+    /// matter — see the two sabotage cases below, each caught by a different assertion.
+    ///
+    /// `BuildStrategy::Sequential` is used deliberately: `Parallel` uses rayon, and this test
+    /// asks whether `config.seed` is read at all, not whether the parallel builder is internally
+    /// deterministic under concurrent scheduling — a separate question, out of scope here.
+    ///
+    /// Sabotage this catches (two different bugs, one per assertion):
+    ///  - "same seed -> same graph" fails if `config.seed` is ignored and the code always calls
+    ///    `rand::random()` regardless of what the caller passed — two `Some(42)` builds would
+    ///    then almost certainly diverge.
+    ///  - "different seed -> different graph" fails if the code reads `config.seed` but maps it
+    ///    through a broken or constant transform (e.g. hardcoding the RNG's internal seed to a
+    ///    fixed value regardless of what `Some(N)` says) — `Some(1)` and `Some(2)` would then
+    ///    collapse onto the same graph.
+    #[test]
+    fn seed_makes_builds_reproducible_and_distinguishable() {
+        let mut rng = StdRng::seed_from_u64(2718);
+        let centers: Vec<Vec<f32>> = (0..10)
+            .map(|_| (0..12).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..400)
+            .map(|i| {
+                let c = &centers[i % 10];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+
+        let build_with_seed = |seed: u64| -> HNSWIndex {
+            HNSWIndex::build(
+                embeddings.clone(),
+                HNSWConfig {
+                    seed: Some(seed),
+                    build_strategy: BuildStrategy::Sequential,
+                    ..Default::default()
+                },
+            )
+        };
+
+        #[allow(clippy::type_complexity)]
+        let fingerprint =
+            |index: &HNSWIndex| -> (Vec<u32>, Vec<Vec<Vec<u32>>>, Option<usize>, usize) {
+                (
+                    index.nodes.clone(),
+                    index.connections.clone(),
+                    index.entry_point,
+                    index.max_layer,
+                )
+            };
+
+        let a1 = build_with_seed(42);
+        let a2 = build_with_seed(42);
+        let b = build_with_seed(43);
+
+        assert_eq!(
+            fingerprint(&a1),
+            fingerprint(&a2),
+            "two builds with the same seed produced different graphs — seed is not being used \
+             deterministically (or is being ignored in favor of a fresh random seed each time)"
+        );
+        assert_ne!(
+            fingerprint(&a1),
+            fingerprint(&b),
+            "two builds with DIFFERENT seeds produced the identical graph — seed is being \
+             ignored in favor of some fixed internal value"
+        );
+    }
+
+    /// `rerank_candidates > 0` must measurably improve recall over `rerank_candidates: 0` on the
+    /// *same* built index (same seed, same embeddings) — reranking is supposed to correct the
+    /// coarse quantized ranking's mistakes, not merely "not panic". The existing
+    /// `rabitq_zero_rerank_drops_full_precision_vectors_and_does_not_panic` only covers the zero
+    /// case in isolation and cannot tell a working rerank from a disabled one.
+    ///
+    /// This is exactly the shape of the historical `PQHNSWConfig::rerank_candidates` bug: gated
+    /// behind a second field that defaulted off, silently reranking nothing, with recall
+    /// unchanged (0.840 vs 0.840) between "on" and "off". Nothing at the `HNSWIndex` level
+    /// pairs the two the way this test does.
+    ///
+    /// `Storage::RaBitQ` is used because its 1-bit estimate is the coarsest ranking in the
+    /// crate — and per this crate's own dimension-crossover findings, RaBitQ's coarseness cost
+    /// is *worse*, not better, at low dimension, which is why `dim: 16` is used deliberately
+    /// rather than a higher, easier dimension.
+    ///
+    /// Empirical margin, not a hand-proof: this relies on the coarse RaBitQ ranking genuinely
+    /// misordering some held-out queries' top-10 on this fixture. It was reasoned through, not
+    /// run. If it turns out both configs score at or near 100% recall on this exact fixture
+    /// (i.e. the assertion fails because the values are equal or too close), that means the
+    /// fixture is too easy, not that the test is wrong — harden it (denser clusters, e.g. more
+    /// points per cluster) rather than weakening the assertion.
+    ///
+    /// Sabotage this catches: make the `rerank_candidates > 0` branch in `search_inner` a no-op
+    /// (skip the rescore-and-resort) while still keeping the full-precision array allocated —
+    /// recall for `rerank_candidates: 50` would then equal `rerank_candidates: 0`'s recall
+    /// instead of exceeding it.
+    #[test]
+    fn rerank_candidates_nonzero_beats_zero_on_the_same_index() {
+        let mut rng = StdRng::seed_from_u64(707);
+        let dim = 16;
+        let n_clusters = 10;
+        let per_cluster = 60;
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 20.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
+            .map(|i| {
+                let c = &centers[i % n_clusters];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.9).collect()
+            })
+            .collect();
+        let n_queries = 50;
+        let queries: Vec<Vec<f32>> = (0..n_queries)
+            .map(|i| {
+                let c = &centers[i % n_clusters];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.9).collect()
+            })
+            .collect();
+
+        let recall_for = |rerank_candidates: usize| -> f32 {
+            let config = HNSWConfig {
+                metric: DistanceMetric::L2,
+                m: 16,
+                m0: 32,
+                ef_construction: 150,
+                ef_search: 150,
+                storage: Storage::RaBitQ,
+                rerank_candidates,
+                seed: Some(21),
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(base.clone(), config);
+
+            let k = 10;
+            let mut total = 0.0f32;
+            for q in &queries {
+                let mut exact: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let d: f32 = v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+                        (d, i)
+                    })
+                    .collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let truth: HashSet<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
+
+                let got: HashSet<usize> = index
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                total += truth.intersection(&got).count() as f32 / k as f32;
+            }
+            total / queries.len() as f32
+        };
+
+        let coarse_only = recall_for(0);
+        let reranked = recall_for(50);
+
+        assert!(
+            reranked > coarse_only,
+            "rerank_candidates=50 must beat rerank_candidates=0 on the same index — got \
+             {reranked:.3} vs {coarse_only:.3}. Equal recall means the rerank pool is being \
+             silently ignored, exactly the shape of the historical PQHNSWConfig bug."
         );
     }
 }

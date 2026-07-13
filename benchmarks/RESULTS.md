@@ -48,19 +48,24 @@ those dominate.
 >   node visit. Fixed benefit, cost linear in `dim`: **wins small, dies big.**
 > * **RaBitQ** compares sign bits against a once-per-query rotated vector: **cheaper per dimension
 >   than f32**, no widening at all. What it pays is a *coarser* estimate, which makes the graph
->   walk take more hops — a penalty roughly **independent of `dim`**. **Loses small, wins big.**
+>   walk take more hops — and that penalty **shrinks sharply with `dim`**, because the code is
+>   1 bit *per dimension*: a higher-`dim` vector gets a proportionally **longer code**. RaBitQ
+>   gets cheaper *and* more accurate as `dim` rises. **Loses small, wins big.**
 >
-> `dist/query` is the control that proves this rather than merely narrating it: at 960-d RaBitQ
-> issues 17,583 distance computations to F32's 17,245 — **2% more work** — each at half the cost.
-> At 128-d that same coarseness cost it **10x more** distance computations, which no per-distance
-> saving could repay.
+> It is a **scissors, not a single crossing line** — both blades close at once. One corpus,
+> prefix-truncated so `dim` is the only variable (`--example dim_crossover`, GIST, n=200k, ef=100):
 >
-> **Rule of thumb: `SQ8` at 128-d, `RaBitQ` at 768-d and above, measure in between.** Real
-> embeddings are 384-d (MiniLM) to 1536-d (OpenAI) — **nobody runs RAG on 128-d vectors**, so the
-> SIFT numbers below are the *best* case for SQ8, not a typical one. The crossover is bracketed,
-> not located; `--example dim_crossover` exists to find it.
+> | dim | 64 | 128 | 192 | 256 | 384 | 512 | 768 | 960 |
+> |---|---|---|---|---|---|---|---|---|
+> | RaBitQ recall@10 | 63.7% | 78.0% | 84.9% | 88.2% | 91.4% | 94.2% | 96.9% | 96.7% |
+> | gap vs F32 | −35.8 | −20.6 | −13.4 | −10.0 | −6.4 | −3.8 | **−0.9** | **−0.9** |
+> | RaBitQ speed (F32 ns/dist ÷ RaBitQ) | 1.28x | 1.55x | 1.58x | 1.74x | 1.88x | 2.01x | 1.98x | 1.89x |
+>
+> **Rule of thumb: `SQ8` at 384-d and below, `RaBitQ` at 768-d and above, measure in between.**
+> Real embeddings are 384-d (MiniLM) to 1536-d (OpenAI) — **nobody runs RAG on 128-d vectors**, so
+> the SIFT numbers below are the *best* case for SQ8, not a typical one.
 > Do not quote the SIFT numbers below at your dimension without checking. See
-> **"The right quantizer depends on the dimension"**.
+> **"The right quantizer depends on the dimension"** and **"384-d: where I got it wrong twice"**.
 
 ## SIFT1M — QPS at matched recall, single-threaded
 
@@ -438,13 +443,118 @@ opposite sides of that trade:
   at high `dim`.
 - **RaBitQ** compares sign bits against a pre-rotated query: **cheaper per dimension than f32**,
   no widening at all. Its cost is a *coarser* distance estimate, which makes the graph walk take
-  more hops. That penalty is roughly independent of `dim`, while the per-dimension saving grows
-  with it — so it loses at low `dim` and wins at high `dim`.
+  more hops. That penalty **shrinks sharply as `dim` rises** — the code is 1 bit *per dimension*,
+  so a higher-`dim` vector gets a proportionally **longer code** and a better estimate, exactly
+  where its f32 counterpart is getting more expensive to read. Cheaper *and* more accurate with
+  `dim`: it loses at low `dim` and wins at high `dim`.
 
-Read it off `dist/query`, which is the control: at 960-d, RaBitQ issues 17,583 distance
-computations to F32's 17,245 — only **2% more work** — but each one costs 138 ns instead of 277.
-At 128-d that same coarseness cost it **10x more** distance computations, which no per-distance
-saving could repay.
+So it is a **scissors**: as `dim` grows, RaBitQ's cost advantage widens *and* its accuracy gap
+closes. Both blades. Measured on one corpus, prefix-truncated so `dim` is the only variable
+(`--example dim_crossover`, GIST, n=200k, ef=100 — same base vectors, same queries, same graph
+parameters, exact ground truth recomputed at every `dim`):
+
+| dim | 64 | 128 | 192 | 256 | 384 | 512 | 768 | 960 |
+|---|---|---|---|---|---|---|---|---|
+| RaBitQ recall@10 | 63.7% | 78.0% | 84.9% | 88.2% | 91.4% | 94.2% | 96.9% | 96.7% |
+| F32 recall@10 | 99.5% | 98.6% | 98.3% | 98.2% | 97.8% | 98.0% | 97.8% | 97.6% |
+| **gap** | **−35.8** | −20.6 | −13.4 | −10.0 | −6.4 | −3.8 | **−0.9** | **−0.9** |
+| ns/dist F32 | 53.0 | 72.4 | 85.7 | 103.7 | 137.4 | 166.3 | 221.3 | 259.4 |
+| ns/dist RaBitQ | 41.3 | 46.8 | 54.4 | 59.7 | 73.0 | 82.8 | 111.8 | 137.6 |
+| **RaBitQ speed** | 1.28x | 1.55x | 1.58x | 1.74x | 1.88x | 2.01x | 1.98x | 1.89x |
+
+The accuracy penalty collapses by a factor of ~40 across the range while the speed advantage
+roughly doubles.
+
+### The claim this replaces, and how it survived
+
+This section used to say RaBitQ's hop penalty was "**roughly independent of `dim`**" — and then
+cited, as *supporting* evidence, the very numbers that refute it: **10x more distance computations
+at 128-d, 2% more at 960-d.** A ratio that moves from 10x to 1.02x across the dimension range is
+the *opposite* of dim-independent. The disproof was printed three lines below the claim, formatted
+as a citation for it.
+
+The conclusion (use RaBitQ at high `dim`) happened to be right. The mechanism under it was half
+wrong, and a right answer resting on a wrong mechanism is a coin that has not landed yet.
+
+**Rule: read the evidence you are about to cite as if you were trying to refute the sentence above
+it.** Ask of every number: *if this claim were false, would this number look different?* If the
+figure you are citing varies along the axis you just called invariant, the claim is already dead.
+This is the prose form of the same failure as "the test that cannot fail" — a check with no power
+to discriminate.
+
+## 384-d: where I got it wrong twice
+
+384-d is the dimension that matters — MiniLM is the most common RAG embedding in existence. So it
+is worth recording that I got the 384-d answer **wrong twice, in opposite directions**, before
+measuring it properly.
+
+**Wrong once (SIFT-only):** on 128-d SIFT, RaBitQ loses ~12x, and every number said delete it. The
+senior engineer who implemented it recommended deleting it. It survived only because someone
+noticed SIFT is 128-d and *nobody runs RAG on 128-d vectors*.
+
+**Wrong twice (fixed-`ef`):** the `dim_crossover` sweep runs at a fixed `ef=100`, where RaBitQ at
+384-d posts **3,257 QPS against SQ8's 1,898** — a 1.7x win. I wrote down the caveat that fixed-`ef`
+flatters a coarse quantizer, and then reasoned as if I hadn't, and concluded 384-d was "approximately
+the crossover — MiniLM can use RaBitQ."
+
+Then I measured it at **matched recall**, which is the only comparison that bills RaBitQ for the
+extra hops its coarse estimate costs (`--example dim_pareto gist1m 384`, n=200k, exact GT recomputed
+at 384-d):
+
+| recall@10 | F32 | SQ8 | RaBitQ |
+|---|---|---|---|
+| 93.9% | 3,116 | **3,371** | ~2,674 |
+| 98.1% | 1,826 | **1,935** | ~1,398 |
+| 99.35% | 1,068 | **1,137** | ~750 |
+
+**Under L2, RaBitQ loses at 384-d — to SQ8, and to plain F32.** Its kernel really is ~1.9x cheaper
+(73 ns/dist vs 137), but it needs **2.6x more distance computations** to reach the same recall, and
+the discount does not cover the bill. Its 3,257 QPS at fixed `ef` was the throughput of *giving up
+early* — 91.4% recall against F32's 97.8%.
+
+### Wrong a third time: the whole analysis assumed L2, and RAG is cosine
+
+Everything above — every crossover number this project has ever published — was measured with
+`DistanceMetric::L2`. `dim_crossover.rs`, `dim_pareto.rs` and `storage_pareto.rs` all hardcoded it.
+But **MiniLM, OpenAI embeddings, GloVe, and five of the six standard ANN benchmark datasets are
+compared by cosine.** The storage-mode advice was extrapolated across that gap and nobody noticed —
+the same species of error as reading a 128-d SIFT result and generalizing it to 960-d. Right
+experiment, wrong regime.
+
+Measured (`--example dim_pareto gist1m <dim> 200000 cosine`, n=200k, GT recomputed under the metric
+being tested):
+
+| recall@10 | metric | F32 | SQ8 | RaBitQ |
+|---|---|---|---|---|
+| ~97.7% | `L2` | 1,826 | **1,935** | ~1,398 — *loses 0.72x* |
+| ~97.7% | `Cosine` | 1,636 | 1,897 | **~1,903** — *dead even* |
+
+**Cosine moves the crossover down.** At 960-d cosine RaBitQ beats SQ8 by **1.2–1.3x** (≈1,400 vs
+1,077 QPS at 97.7%), consistent with L2; but at 384-d it goes from *losing* under L2 to *tying*
+under cosine.
+
+**The mechanism was already in our own code.** Under cosine, `push_node` encodes a **unit-normalized**
+copy of the vector for RaBitQ (`rabitq_cosine_input`). Normalization discards magnitude — exactly the
+information a 1-bit sign code cannot carry, and exactly the information cosine does not want. Under
+L2, magnitude *is* signal, so throwing it away costs real recall. **RaBitQ is structurally suited to
+cosine**, and we had been grading it on the metric it is worst at.
+
+At 384-d cosine RaBitQ is also the *smaller* index (405 MB vs SQ8's 471 MB — `SQ8 + rerank` is the
+largest of the three, keeping f32 vectors *and* codes). On a tie, take RaBitQ.
+
+**The rule of thumb needs two axes:**
+
+| | `L2` | `Cosine` (what RAG uses) |
+|---|---|---|
+| ≤ 256-d | `SQ8` | `SQ8` |
+| 384-d (MiniLM) | `SQ8` | tie — take `RaBitQ` for the smaller index |
+| ≥ 768-d | `RaBitQ` | `RaBitQ` |
+
+> A mode that is fast because it stopped finding things is not fast. **Fixed-`ef` comparisons cannot
+> see this.** They are useful for isolating a *mechanism* (`ns/dist`, `dist/query` — what the code
+> does per unit work) and worthless for choosing a *configuration* (which mode to ship). This repo
+> has now published a wrong conclusion from a fixed-`ef` reading once. That is once more than the
+> caveat being written down was worth.
 
 ### The near-miss
 

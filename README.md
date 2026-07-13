@@ -117,15 +117,56 @@ foxstash can build, at the cost of a recall ceiling. Measure that trade on your 
 >   benefit, cost linear in `dim`: **wins small, dies big.**
 > * **RaBitQ** compares sign bits against a once-per-query rotated vector — **cheaper per
 >   dimension than f32**, no widening. What it pays is a coarser estimate, costing extra graph
->   hops, a penalty roughly **independent of `dim`**: **loses small, wins big.**
+>   hops — and that penalty **shrinks sharply as `dim` grows**, because the code is 1 bit *per
+>   dimension*: higher-dimensional vectors get proportionally **longer codes**. It gets cheaper
+>   *and* more accurate as `dim` rises: **loses small, wins big.**
 >
-> At 960-d RaBitQ issues only 2% more distance computations than F32 (17,583 vs 17,245) and each
-> costs half as much. At 128-d that same coarseness cost it **10x more** distance computations —
-> unrepayable.
+> It's a scissors, not one crossing line. One corpus, prefix-truncated so `dim` is the only
+> variable (`--example dim_crossover`, GIST, n=200k, ef=100):
 >
-> **Rule of thumb: `SQ8` at 128-d, `RaBitQ` at 768-d and above, measure in between.** MiniLM is
-> 384-d and OpenAI's are 1536-d — **nobody runs RAG on 128-d vectors**, so the SIFT numbers below
-> are the best case for SQ8, not the one you'll get. The crossover is bracketed, not located.
+> | dim | 64 | 128 | 192 | 256 | 384 | 512 | 768 | 960 |
+> |---|---|---|---|---|---|---|---|---|
+> | RaBitQ recall@10 | 63.7% | 78.0% | 84.9% | 88.2% | 91.4% | 94.2% | 96.9% | 96.7% |
+> | gap vs F32 | −35.8 | −20.6 | −13.4 | −10.0 | −6.4 | −3.8 | **−0.9** | **−0.9** |
+> | RaBitQ speed (F32 ns/dist ÷ RaBitQ) | 1.28x | 1.55x | 1.58x | 1.74x | 1.88x | 2.01x | 1.98x | 1.89x |
+>
+> The accuracy penalty collapses ~40x across that range while the speed advantage grows. Both
+> blades close.
+>
+> ### The rule of thumb needs TWO axes: dimension **and metric**
+>
+> | | `L2` | `Cosine` (what RAG uses) |
+> |---|---|---|
+> | **≤ 256-d** | `SQ8` | `SQ8` |
+> | **384-d** (MiniLM) | **`SQ8`** — RaBitQ loses (0.72x) | **tie** — take `RaBitQ` for the smaller index |
+> | **≥ 768-d** (OpenAI, GIST) | `RaBitQ` | **`RaBitQ`** (1.2–1.3x SQ8) |
+>
+> **Cosine moves the crossover down**, and this is not a curiosity — *cosine is what RAG actually
+> uses*, and every crossover number this project published before now was measured under **L2**.
+> At **matched recall**, 384-d (`--example dim_pareto gist1m 384 200000 [l2|cosine]`, n=200k):
+>
+> | recall@10 | metric | F32 | SQ8 | RaBitQ |
+> |---|---|---|---|---|
+> | ~97.7% | `L2` | 1,826 | **1,935** | ~1,398 — *loses* |
+> | ~97.7% | `Cosine` | 1,636 | 1,897 | **~1,903** — *dead even* |
+>
+> **Why:** under cosine, RaBitQ encodes a **unit-normalized** copy of each vector. Normalization
+> throws away magnitude — precisely the information a 1-bit sign code cannot represent, and
+> precisely the information cosine does not care about. Under L2 magnitude *does* matter, so
+> discarding it costs real accuracy. **RaBitQ is structurally suited to cosine.**
+>
+> At 384-d cosine, `RaBitQ` also ships a *smaller* index than `SQ8` (405 MB vs 471 MB — `SQ8 +
+> rerank` is the largest of the three, since it keeps the f32 vectors *and* the codes). So on a
+> tie, take RaBitQ.
+>
+> ### Do not read a config decision out of a fixed-`ef` benchmark
+>
+> At fixed `ef`, RaBitQ looks like the 384-d winner (3,257 QPS vs SQ8's 1,898). That is an
+> artifact: it was 6.4 recall points behind, and it was fast **because it stopped looking**. Under
+> L2 at matched recall it in fact *loses* there. **A mode that is fast because it stopped finding
+> things is not fast.** This repo has published a wrong conclusion from a fixed-`ef` reading once
+> already; always compare at matched recall.
+>
 > Reproduce: `cargo run --release -p foxstash-benches --example storage_pareto gist1m`. Mechanism
 > and full tables in `benchmarks/RESULTS.md`.
 

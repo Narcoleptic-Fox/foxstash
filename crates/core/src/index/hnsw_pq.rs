@@ -159,8 +159,8 @@ struct PQNode {
 /// PQ-compressed database vectors, via a per-subspace centroid distance table.
 ///
 /// Unlike the main [`HNSWIndex`](super::hnsw::HNSWIndex) with
-/// [`Storage::SQ8`](super::hnsw::Storage::SQ8) and
-/// [`RaBitQHNSWIndex`](super::hnsw_quantized::RaBitQHNSWIndex), this index has not been
+/// [`Storage::SQ8`](super::hnsw::Storage::SQ8) or
+/// [`Storage::RaBitQ`](super::hnsw::Storage::RaBitQ), this index has not been
 /// measured against real-data recall or throughput; see `benchmarks/RESULTS.md` for
 /// what has and has not been verified in this module before relying on a number.
 pub struct PQHNSWIndex {

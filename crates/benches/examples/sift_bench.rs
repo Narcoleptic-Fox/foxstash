@@ -261,7 +261,8 @@ fn main() {
         rb_qps,
         json!({ "compression": "32x", "rerank_pool": POOL }),
         "1-bit RaBitQ first stage + exact rerank. Supersedes BinaryHNSW, which \
-         degenerates on non-negative data (1.1% recall@10 here).",
+         degenerates to chance-level recall on non-negative data — a zero threshold sets \
+         every bit, collapsing all codes to all-ones. See benchmarks/RESULTS.md.",
     ));
 
     // ---- Emit ----

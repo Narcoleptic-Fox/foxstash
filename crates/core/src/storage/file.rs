@@ -1582,11 +1582,12 @@ mod tests {
         }
         let recall = total_recall / queries.len() as f32;
 
-        // Measured on this exact seed/config: comfortably high. A codebook refit from the
-        // wrong data, or 8-bit codes silently reinterpreted as f32, does not degrade this
-        // number gently — it craters it. See the discriminating-power check in this function's
-        // sibling verification (temporarily disabling `train()` in `to_index()` during
-        // development made this assertion fail outright, not just dip).
+        // Measured on this exact seed/config: 100%, stable across repeated runs (unlike the
+        // exact-order assertion this replaced). The floor is set well below that for margin,
+        // not at the measurement. Verified discriminating: temporarily disabling the
+        // `train()` call in `to_index()` (above) makes this test fail outright — `to_index()`
+        // returns `Err(NotTrained(_))`, which the `.expect()` a few lines up panics on, before
+        // this assertion is ever reached.
         assert!(
             recall > 0.7,
             "restored SQ8 index recall@{k} against brute-force ground truth = {:.1}% — \

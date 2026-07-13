@@ -1,5 +1,21 @@
 # HNSW Build Architecture: Foxstash vs instant-distance
 
+> **Historical design document — the "Foxstash" data structures and numbers below predate the
+> node-arena interleave (commit 0617c6c) and are no longer what the code does.**
+>
+> The `connections: Vec<Vec<HashSet<usize>>>` layout shown below was replaced with a flat,
+> interleaved node arena using `Vec<u32>` adjacency — see `benchmarks/RESULTS.md` §"Why the
+> layout mattered" for the rationale this document was arguing towards. The "parallel build
+> breaks recall at scale" finding (58% recall@10 at 100k, bottom of this file) was real for the
+> architecture described here, and was the reason the arena refactor happened — but it is not
+> the current number. The current `BuildStrategy::Parallel`, on the current arena-based
+> `HNSWIndex`, measures 99.5% recall@10 on SIFT1M and 98.3% on GIST1M (both far larger than the
+> 100k tested here) — see `benchmarks/RESULTS.md` §"Headline" and reproduce with
+> `cargo run --release -p foxstash-benches --example storage_pareto`.
+>
+> Kept for the design reasoning (Options A/B/C below, and why the fixed-array /
+> layer-copying approach was chosen), not for the numbers.
+
 ## Data Structures
 
 ### instant-distance
