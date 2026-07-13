@@ -363,7 +363,13 @@ pub struct HNSWConfig {
     /// results. If you need either — golden-file tests, debugging a specific graph, regulated
     /// reproducibility — set `build_strategy: BuildStrategy::Sequential` as well as `seed`.
     ///
-    /// Pinned by `seed_gives_reproducible_builds_only_on_the_sequential_builder`.
+    /// Incremental [`Self::add`] and [`Self::add_embedding`] **are** reproducible at a fixed seed:
+    /// they are sequential by nature, so they have no thread race to lose determinism to. (They
+    /// were not, until 1.0. `random_level` called `rand::rng()` per insert with `config.seed`
+    /// sitting unread on `&self`, so an index grown by `add()` was random at every seed.)
+    ///
+    /// Pinned by `seed_gives_reproducible_builds_only_on_the_sequential_builder` and
+    /// `seed_reaches_the_incremental_add_path`.
     pub seed: Option<u64>,
 
     /// What the traversal reads for each node's vector. See [`Storage`].
@@ -757,6 +763,15 @@ pub struct HNSWIndex {
     entry_point: Option<usize>,
     /// Maximum layer in the index
     max_layer: usize,
+
+    /// The level-assignment stream for incremental [`Self::add`].
+    ///
+    /// Seeded once, from `config.seed`, and then advanced. It exists because `random_level` used
+    /// to call `rand::rng()` per insert -- fresh OS entropy, with `self.config.seed` sitting right
+    /// there unread. Bulk builds seed their own RNG, so they were reproducible (under
+    /// `Sequential`) while an index grown by `add()` never was, at any seed. The bug survived
+    /// because its test, `random_level_never_panics`, asserted only that the call did not panic.
+    level_rng: StdRng,
 }
 
 impl HNSWIndex {
@@ -766,7 +781,9 @@ impl HNSWIndex {
     /// * `embedding_dim` - Dimensionality of embedding vectors
     /// * `config` - HNSW configuration parameters
     pub fn new(embedding_dim: usize, config: HNSWConfig) -> Self {
+        let level_rng = StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random));
         Self {
+            level_rng,
             embedding_dim,
             stride: node_stride(config.m0, embedding_dim, config.storage),
             hdr: node_hdr_len(config.m0),
@@ -997,9 +1014,9 @@ impl HNSWIndex {
     ///
     /// This is the recommended way to create an index from bulk embeddings.
     /// The build strategy is controlled by `config.build_strategy`:
-    /// - `Sequential`: Slower but guarantees high recall (97%+)
-    /// - `Parallel`: Faster using instant-distance's layer-copying approach
-    /// - `Auto`: Parallel for <50k vectors, Sequential for larger
+    /// - `Parallel` (default): 5.2x faster at 1M, for 0.02-0.31 recall points. Not reproducible
+    ///   even at a fixed `seed` — threads race to write neighbour lists.
+    /// - `Sequential`: slower, and bit-reproducible at a fixed `seed`.
     ///
     /// # Arguments
     /// * `embeddings` - Vector of embedding vectors (all must have same dimension)
@@ -1752,12 +1769,14 @@ impl HNSWIndex {
         }
     }
 
-    /// Generates a random level for a new node using exponential decay.
+    /// Generates a level for a new node using exponential decay, from the index's seeded stream.
     ///
     /// Clamps the uniform sample to `[EPSILON, 1)` to prevent `ln(0.0) = -inf`.
-    fn random_level(&self) -> usize {
-        let mut rng = rand::rng();
-        let uniform: f32 = rng.random::<f32>().max(f32::EPSILON);
+    ///
+    /// Takes `&mut self` because it advances that stream. It previously took `&self` and called
+    /// `rand::rng()`, which is what made `add()` ignore `seed`.
+    fn random_level(&mut self) -> usize {
+        let uniform: f32 = self.level_rng.random::<f32>().max(f32::EPSILON);
         (-uniform.ln() * self.config.ml).floor() as usize
     }
 
@@ -2790,6 +2809,9 @@ impl HNSWIndex {
         // is quantized, below. Layer-0 links still live in `connections`;
         // `migrate_l0_into_arena` hands them to their owner.
         let mut index = Self {
+            // Seeded from the same `seed` this build used, so a later incremental `add()` on a
+            // bulk-built index continues a reproducible stream rather than starting a random one.
+            level_rng: StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random)),
             embedding_dim,
             stride: node_stride(config.m0, embedding_dim, config.storage),
             hdr: node_hdr_len(config.m0),
@@ -3895,13 +3917,65 @@ mod tests {
         assert_eq!(results.len(), 1);
     }
 
+    /// Level assignment must never hit `ln(0) = -inf`, AND must come from the seeded stream.
+    ///
+    /// The old version of this test ran the loop and asserted nothing but the absence of a panic.
+    /// It therefore could not tell a seeded draw from `rand::rng()` — and `random_level` was in
+    /// fact calling `rand::rng()`, so `add()` ignored `seed` entirely. The panic property was
+    /// real and is kept; what it lacked was any way to fail for the reason that mattered.
     #[test]
-    fn test_random_level_never_panics() {
-        // Exercise random_level many times to verify ln(0) is impossible
-        let index = HNSWIndex::with_defaults(3);
-        for _ in 0..10_000 {
-            let _level = index.random_level();
-        }
+    fn random_level_never_panics_and_comes_from_the_seeded_stream() {
+        let draws = |seed: Option<u64>| -> Vec<usize> {
+            let mut index = HNSWIndex::new(3, HNSWConfig { seed, ..Default::default() });
+            (0..10_000).map(|_| index.random_level()).collect()
+        };
+
+        // ln(0) is impossible: a level is finite, so it is small. (`as usize` on -inf saturates
+        // to 0 rather than panicking, so assert the shape of the distribution, not just liveness.)
+        let a = draws(Some(7));
+        assert!(a.iter().all(|&l| l < 64), "exponential decay must not produce absurd levels");
+        assert!(a.iter().any(|&l| l > 0), "every node landing on layer 0 means ml is not applied");
+
+        assert_eq!(a, draws(Some(7)), "a fixed seed must give a reproducible level sequence");
+        assert_ne!(a, draws(Some(8)), "a different seed must give a different level sequence");
+    }
+
+    /// `seed` must reach the INCREMENTAL path too, not just the bulk builders.
+    ///
+    /// The bulk builders seed their own RNG, so they were reproducible while an index grown by
+    /// `add_embedding()` was not, at any seed. Found by the generated config x code-path matrix
+    /// (`xtask/config_matrix.py`): the `seed` row was empty in the `add` column, and an empty cell
+    /// there means nothing on that path reads the option.
+    #[test]
+    fn seed_reaches_the_incremental_add_path() {
+        let vecs: Vec<Vec<f32>> = (0..200)
+            .map(|i| (0..8).map(|d| ((i * 7 + d * 13) % 40) as f32 * 0.1).collect())
+            .collect();
+
+        let grown = |seed: u64| -> Vec<Vec<u32>> {
+            let mut ix = HNSWIndex::new(
+                8,
+                HNSWConfig { seed: Some(seed), m: 4, m0: 8, ..Default::default() },
+            );
+            for (i, v) in vecs.iter().enumerate() {
+                ix.add_embedding(i.to_string(), v.clone()).unwrap();
+            }
+            (0..ix.len())
+                .map(|i| {
+                    let mut n = ix.get_neighbors_l0(i).to_vec();
+                    n.sort_unstable();
+                    n
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            grown(7),
+            grown(7),
+            "an index grown by add() must be reproducible at a fixed seed -- `add` is inherently \
+             sequential, so unlike the parallel bulk builder it has no thread race to blame"
+        );
+        assert_ne!(grown(7), grown(9), "a different seed must give a different graph");
     }
 
     // ========================================================================
