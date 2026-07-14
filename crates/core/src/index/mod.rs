@@ -76,9 +76,6 @@
 //!
 //! # Streaming Operations
 //!
-//! For large datasets, use the streaming module for memory-efficient batch ingestion:
-//!
-//! ```
 //! use foxstash_core::index::streaming::{BatchBuilder, BatchConfig};
 //! use foxstash_core::index::HNSWIndex;
 //! use foxstash_core::Document;
@@ -105,15 +102,10 @@
 
 pub mod flat;
 pub mod hnsw;
-pub mod streaming;
 
 pub use flat::FlatIndex;
 pub use hnsw::{
     BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, MemoryBreakdown, Searcher, Storage,
-};
-pub use streaming::{
-    BatchBuilder, BatchConfig, BatchIndex, BatchProgress, BatchResult, FilteredSearchBuilder,
-    PaginationConfig, SearchPage, SearchResultIterator,
 };
 
 use crate::{Document, Result, SearchResult};
@@ -275,28 +267,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn batch_builder_via_blanket_impl() {
-        let mut index = HNSWIndex::with_defaults(3);
-        let config = BatchConfig::default().with_batch_size(10);
-        let mut builder = BatchBuilder::new(&mut index, config);
-
-        builder.add(make_doc("d1", vec![1.0, 0.0, 0.0])).unwrap();
-        builder.add(make_doc("d2", vec![0.0, 1.0, 0.0])).unwrap();
-
-        let result = builder.finish();
-        assert_eq!(result.documents_indexed, 2);
-        assert_eq!(index.len(), 2);
-    }
-
-    #[test]
-    fn batch_builder_flat_via_blanket_impl() {
-        let mut index = FlatIndex::new(3);
-        let config = BatchConfig::default();
-        let mut builder = BatchBuilder::new(&mut index, config);
-
-        builder.add(make_doc("f1", vec![1.0, 0.0, 0.0])).unwrap();
-        let result = builder.finish();
-        assert_eq!(result.documents_indexed, 1);
-    }
 }

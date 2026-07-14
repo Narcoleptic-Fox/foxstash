@@ -13,7 +13,6 @@
 
 use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use foxstash_core::vector::product_quantize::{PQConfig, PQDistanceCache, ProductQuantizer};
 use foxstash_core::vector::quantize::{
     hamming_distance_simd, sq8_l2_distance_simd, BinaryQuantizer, Quantizer, ScalarQuantizer,
 };
@@ -174,81 +173,6 @@ fn bench_binary(c: &mut Criterion) {
 // Product Quantization Benchmarks
 // ============================================================================
 
-fn bench_pq(c: &mut Criterion) {
-    let mut group = c.benchmark_group("product_quantization");
-    group.sample_size(50); // PQ training is slow, reduce samples
-
-    for dim in [128, 384] {
-        let vectors = create_test_vectors(dim, 42);
-        let query = create_single_vector(dim, 999);
-
-        // Train PQ
-        let pq_config = PQConfig::new(dim, 8, 8)
-            .with_seed(42)
-            .with_kmeans_iterations(10);
-        let pq = ProductQuantizer::train(&vectors, pq_config).unwrap();
-
-        // Quantize vectors
-        let codes: Vec<_> = vectors.iter().map(|v| pq.encode(v)).collect();
-
-        // Build distance cache
-        let cache = PQDistanceCache::build(&pq);
-
-        // Precompute distance table for query
-        let table = pq.compute_distance_table(&query);
-
-        group.throughput(Throughput::Elements(1000));
-
-        // ADC with precomputed table (fastest for batch)
-        group.bench_with_input(BenchmarkId::new("adc_with_table", dim), &dim, |bench, _| {
-            bench.iter(|| {
-                for code in &codes {
-                    black_box(pq.distance_with_table(&table, code));
-                }
-            });
-        });
-
-        // ADC without table (per-query)
-        group.bench_with_input(BenchmarkId::new("adc_direct", dim), &dim, |bench, _| {
-            bench.iter(|| {
-                for code in &codes {
-                    black_box(pq.asymmetric_distance(&query, code));
-                }
-            });
-        });
-
-        // Symmetric with cache
-        group.bench_with_input(
-            BenchmarkId::new("symmetric_cached", dim),
-            &dim,
-            |bench, _| {
-                let query_code = pq.encode(&query);
-                bench.iter(|| {
-                    for code in &codes {
-                        black_box(cache.distance(&query_code, code));
-                    }
-                });
-            },
-        );
-
-        // Symmetric without cache
-        group.bench_with_input(
-            BenchmarkId::new("symmetric_direct", dim),
-            &dim,
-            |bench, _| {
-                let query_code = pq.encode(&query);
-                bench.iter(|| {
-                    for code in &codes {
-                        black_box(pq.symmetric_distance(&query_code, code));
-                    }
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
 // ============================================================================
 // Memory Usage Comparison
 // ============================================================================
@@ -316,18 +240,6 @@ fn bench_memory_comparison(c: &mut Criterion) {
         });
     });
 
-    let pq_config = PQConfig::new(dim, 8, 8)
-        .with_seed(42)
-        .with_kmeans_iterations(10);
-    let pq = ProductQuantizer::train(&vectors[..1000], pq_config).unwrap();
-    group.bench_function("pq_encode", |bench| {
-        bench.iter(|| {
-            for v in &vectors {
-                black_box(pq.encode(v));
-            }
-        });
-    });
-
     group.finish();
 }
 
@@ -336,7 +248,6 @@ criterion_group!(
     bench_full_precision,
     bench_sq8,
     bench_binary,
-    bench_pq,
     bench_memory_comparison,
 );
 criterion_main!(benches);

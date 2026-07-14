@@ -5096,12 +5096,31 @@ mod tests {
             );
         }
 
-        // And end to end, through the public API, at an `ef` large enough that a miss means a bug
-        // and not merely an approximate index doing its job.
-        ix.set_ef_search(300);
+        // End to end, through the public API -- but on the SEQUENTIAL builder.
+        //
+        // This half of the test was flaky and it was my own fault. It ran on the default parallel
+        // builder and demanded, for each probe row, that the index return that exact row at k=1.
+        // The parallel builder is not reproducible (see
+        // `seed_gives_reproducible_builds_only_on_the_sequential_builder`), so whether any given
+        // node lands well-connected varies run to run, and an approximate index is entitled to
+        // miss one. It passed for a while and then failed on an unrelated commit, which is the
+        // worst way for a test to spend its time.
+        //
+        // An exact assertion needs a deterministic build. The mapping claim itself is already
+        // proven exhaustively above, for all n nodes, without going through search at all.
+        let mut seq = HNSWIndex::build(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                seed: Some(4),
+                ef_search: 300,
+                build_strategy: BuildStrategy::Sequential,
+                ..Default::default()
+            },
+        );
         for i in [0, 7, 42, 199, 292, n - 1] {
             assert_eq!(
-                ix.search(&base[i], 1).unwrap()[0].id,
+                seq.search(&base[i], 1).unwrap()[0].id,
                 i.to_string(),
                 "row {i} queried with its own vector did not come back as itself"
             );
