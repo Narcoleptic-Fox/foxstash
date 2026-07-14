@@ -775,6 +775,87 @@ pub struct HNSWIndex {
     level_rng: StdRng,
 }
 
+/// **The** neighbour-selection algorithm. HNSW paper, Algorithm 4 (SELECT-NEIGHBORS-HEURISTIC).
+///
+/// There used to be two of these — `select_neighbors` for the sequential builder and
+/// `par_select_heuristic` for the parallel one — and that duplication *is* the bug class this
+/// library spent its 1.0 audit paying for. Every option had to be plumbed into both. Every test
+/// was written against one. `Parallel` then became the default, so the tested copy stopped being
+/// the shipped copy, and `m`, `m0`, `use_heuristic` and `extend_candidates` were each silently
+/// ignored by the builder that actually ran.
+///
+/// The second copy also got the distances wrong. Under `extend_candidates` it scored each newly
+/// pulled-in candidate against *the candidate it came from* rather than against the query — the
+/// query point was never passed in, so it reached for the nearest vector to hand. The sequential
+/// copy had always been right. A bug can only hide in the difference between two implementations
+/// of one idea, so now there is one.
+///
+/// The graph structure is injected, because that is the only thing the two builders genuinely
+/// disagree about: the sequential builder reads `self`, and the parallel one reads a slice of
+/// `RwLock<ZeroNode>`. The *algorithm* is not theirs to have opinions about.
+///
+/// `candidates` must be sorted nearest-first, and every distance in it — and every distance the
+/// closures return — is a distance **to the query**.
+#[allow(clippy::too_many_arguments)]
+fn select_neighbors_core(
+    candidates: &[(f32, usize)],
+    m: usize,
+    use_heuristic: bool,
+    extend_candidates: bool,
+    keep_pruned: bool,
+    neighbours_of: impl Fn(usize) -> Vec<usize>,
+    dist_to_query: impl Fn(usize) -> f32,
+    dist_between: impl Fn(usize, usize) -> f32,
+) -> Vec<(f32, usize)> {
+    // No diversity filter: keep the m nearest. `select_neighbors_simple`, in the old world.
+    if !use_heuristic {
+        return candidates.iter().take(m).copied().collect();
+    }
+
+    // `extendCandidates`: widen the pool with the candidates' own neighbours before filtering.
+    let mut pool: Vec<(f32, usize)> = candidates.to_vec();
+    if extend_candidates {
+        let mut seen: HashSet<usize> = candidates.iter().map(|&(_, id)| id).collect();
+        let mut extra: Vec<(f32, usize)> = Vec::new();
+        for &(_, cid) in candidates {
+            for n in neighbours_of(cid) {
+                if seen.insert(n) {
+                    extra.push((dist_to_query(n), n));
+                }
+            }
+        }
+        pool.extend(extra);
+        pool.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+
+    // Accept a candidate unless it lies closer to an already-accepted neighbour than to the query
+    // — i.e. it sits "behind" one, and adds reach we already have.
+    let mut selected: Vec<(f32, usize)> = Vec::with_capacity(m);
+    let mut pruned: Vec<(f32, usize)> = Vec::new();
+    for &(dq, cid) in &pool {
+        if selected.len() >= m {
+            break;
+        }
+        if selected.iter().all(|&(_, sid)| dist_between(cid, sid) >= dq) {
+            selected.push((dq, cid));
+        } else {
+            pruned.push((dq, cid));
+        }
+    }
+
+    // Backfill from the rejects, nearest-first, if the filter left us short.
+    if keep_pruned && selected.len() < m {
+        for c in pruned {
+            if selected.len() >= m {
+                break;
+            }
+            selected.push(c);
+        }
+    }
+    selected
+}
+
+
 impl HNSWIndex {
     /// Creates a new HNSW index with custom configuration
     ///
@@ -2050,18 +2131,8 @@ impl HNSWIndex {
         results
     }
 
-    /// Selects M best neighbors using a heuristic
-    ///
-    /// When `use_heuristic` is enabled (default), uses Algorithm 4 from the HNSW paper
-    /// which ensures diversity by only selecting candidates that are closer to the query
-    /// than to any already-selected neighbor. This prevents selecting neighbors that are
-    /// "behind" other neighbors, improving graph connectivity.
-    ///
-    /// # Arguments
-    /// * `candidates` - Candidate neighbor IDs
-    /// * `query` - Query point
-    /// * `m` - Number of neighbors to select
-    /// * `layer` - Current layer
+    /// The sequential builder's adapter over [`select_neighbors_core`]. It supplies the graph
+    /// access — layer 0 lives in the flat arena, layers >= 1 in `connections` — and nothing else.
     fn select_neighbors(
         &self,
         candidates: &[usize],
@@ -2069,107 +2140,33 @@ impl HNSWIndex {
         m: usize,
         layer: usize,
     ) -> Vec<usize> {
-        if !self.config.use_heuristic {
-            // Simple heuristic: select M closest neighbors
-            return self.select_neighbors_simple(candidates, query, m);
-        }
-
-        // Algorithm 4 from the HNSW paper: SELECT-NEIGHBORS-HEURISTIC
-        // This ensures diversity by checking if each candidate is closer to query
-        // than to any already-selected neighbor.
-
-        // Optionally extend candidates with their neighbors
-        let mut working_candidates: Vec<usize> = candidates.to_vec();
-        if self.config.extend_candidates {
-            let mut seen: HashSet<usize> = candidates.iter().copied().collect();
-            for &candidate in candidates {
-                // Layer 0 lives in the flat array; layers >= 1 in the nested structure.
-                let neighbors: Vec<u32> = if layer == 0 {
-                    self.get_neighbors_l0(candidate).to_vec()
-                } else if layer < self.connections[candidate].len() {
-                    self.connections[candidate][layer].clone()
-                } else {
-                    Vec::new()
-                };
-                for neighbor_u32 in neighbors {
-                    let neighbor = neighbor_u32 as usize;
-                    if seen.insert(neighbor) {
-                        working_candidates.push(neighbor);
-                    }
-                }
-            }
-        }
-
-        // Score and sort candidates by distance to query
-        let mut scored: Vec<(f32, usize)> = working_candidates
-            .iter()
-            .map(|&id| {
-                let dist = self.distance(query, self.get_embedding(id));
-                (dist, id)
-            })
-            .collect();
-        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-        // Select neighbors using the heuristic
-        let mut selected: Vec<usize> = Vec::with_capacity(m);
-        let mut pruned: Vec<(f32, usize)> = Vec::new();
-
-        for (dist_to_query, candidate_id) in scored {
-            if selected.len() >= m {
-                break;
-            }
-
-            // Check if this candidate is closer to query than to any selected neighbor
-            let candidate_embedding = self.get_embedding(candidate_id);
-            let mut is_good = true;
-
-            for &selected_id in &selected {
-                let selected_embedding = self.get_embedding(selected_id);
-                let dist_to_selected = self.distance(candidate_embedding, selected_embedding);
-
-                // If candidate is closer to a selected neighbor than to query,
-                // it's "behind" that neighbor and we should skip it
-                if dist_to_selected < dist_to_query {
-                    is_good = false;
-                    pruned.push((dist_to_query, candidate_id));
-                    break;
-                }
-            }
-
-            if is_good {
-                selected.push(candidate_id);
-            }
-        }
-
-        // Optionally add back some pruned connections if we didn't get enough
-        if self.config.keep_pruned_connections && selected.len() < m {
-            for (_, pruned_id) in pruned {
-                if selected.len() >= m {
-                    break;
-                }
-                if !selected.contains(&pruned_id) {
-                    selected.push(pruned_id);
-                }
-            }
-        }
-
-        selected
-    }
-
-    /// Simple neighbor selection: just pick M closest
-    #[inline]
-    fn select_neighbors_simple(&self, candidates: &[usize], query: &[f32], m: usize) -> Vec<usize> {
         let mut scored: Vec<(f32, usize)> = candidates
             .iter()
-            .map(|&id| {
-                let dist = self.distance(query, self.get_embedding(id));
-                (dist, id)
-            })
+            .map(|&id| (self.distance(query, self.get_embedding(id)), id))
             .collect();
-
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-        scored.truncate(m);
-        scored.into_iter().map(|(_, id)| id).collect()
+
+        select_neighbors_core(
+            &scored,
+            m,
+            self.config.use_heuristic,
+            self.config.extend_candidates,
+            self.config.keep_pruned_connections,
+            |id| {
+                if layer == 0 {
+                    self.get_neighbors_l0(id).iter().map(|&n| n as usize).collect()
+                } else if layer < self.connections[id].len() {
+                    self.connections[id][layer].iter().map(|&n| n as usize).collect()
+                } else {
+                    Vec::new()
+                }
+            },
+            |id| self.distance(query, self.get_embedding(id)),
+            |a, b| self.distance(self.get_embedding(a), self.get_embedding(b)),
+        )
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect()
     }
 
     /// Computes distance between two vectors under the configured metric (SIMD accelerated).
@@ -2555,6 +2552,7 @@ impl HNSWIndex {
         // the sequential build path.
         let found = Self::par_select_heuristic(
             metric,
+            point,
             search.select_simple(),
             points,
             m0,
@@ -2604,8 +2602,17 @@ impl HNSWIndex {
     /// while faiss, at the same `M`, averages 25. Every hop then scans 2.5x more neighbours,
     /// which is where foxstash's extra ~32% of distance computations per query came from.
     #[allow(clippy::too_many_arguments)]
+    /// The parallel builder's adapter over [`select_neighbors_core`]. It supplies the graph
+    /// access (a slice of `RwLock<ZeroNode>`) and the distance function, and nothing else.
+    ///
+    /// `query` is the point the candidates were scored against. It is a parameter because the
+    /// previous copy of this algorithm did not have it, and under `extend_candidates` scored each
+    /// newly pulled-in candidate against the candidate it came from instead — the wrong distance,
+    /// in the field the diversity filter then compares against.
+    #[allow(clippy::too_many_arguments)]
     fn par_select_heuristic(
         metric: DistanceMetric,
+        query: &[f32],
         sorted: &[Candidate],
         points: &[Vec<f32>],
         m: usize,
@@ -2614,67 +2621,22 @@ impl HNSWIndex {
         extend_candidates: bool,
         zero: &[RwLock<ZeroNode>],
     ) -> Vec<Candidate> {
-        // `use_heuristic: false` = plain "keep the m nearest", no diversity filter. The sequential
-        // builder has always honoured this (`select_neighbors` early-returns to
-        // `select_neighbors_simple`); the parallel builder used to ignore it entirely.
-        if !use_heuristic {
-            return sorted.iter().take(m).copied().collect();
-        }
+        let scored: Vec<(f32, usize)> =
+            sorted.iter().map(|c| (c.distance, c.pid.as_usize())).collect();
 
-        // `extend_candidates: true` = also consider the neighbours OF the candidates, widening the
-        // pool before the diversity filter runs. Algorithm 4's `extendCandidates` flag.
-        let mut pool: Vec<Candidate> = sorted.to_vec();
-        if extend_candidates {
-            let mut seen: HashSet<u32> = sorted.iter().map(|c| c.pid.0).collect();
-            let mut extra: Vec<Candidate> = Vec::new();
-            for &cand in sorted {
-                let node = zero[cand.pid.as_usize()].read();
-                for pid in node.iter() {
-                    if seen.insert(pid.0) {
-                        extra.push(Candidate {
-                            distance: Self::parallel_distance(
-                                metric,
-                                &points[cand.pid.as_usize()],
-                                &points[pid.as_usize()],
-                            ),
-                            pid,
-                        });
-                    }
-                }
-            }
-            pool.extend(extra);
-            pool.sort_unstable();
-        }
-        let sorted: &[Candidate] = &pool;
-
-        let mut selected: Vec<Candidate> = Vec::with_capacity(m);
-        for &cand in sorted {
-            if selected.len() >= m {
-                break;
-            }
-            // Keep `cand` unless it is closer to an already-selected neighbor
-            // than to the query point (i.e. it sits "behind" a selected node).
-            let cand_point = &points[cand.pid.as_usize()];
-            let diverse = selected.iter().all(|s| {
-                Self::parallel_distance(metric, cand_point, &points[s.pid.as_usize()])
-                    >= cand.distance
-            });
-            if diverse {
-                selected.push(cand);
-            }
-        }
-
-        if keep_pruned && selected.len() < m {
-            for &cand in sorted {
-                if selected.len() >= m {
-                    break;
-                }
-                if !selected.iter().any(|s| s.pid == cand.pid) {
-                    selected.push(cand);
-                }
-            }
-        }
-        selected
+        select_neighbors_core(
+            &scored,
+            m,
+            use_heuristic,
+            extend_candidates,
+            keep_pruned,
+            |id| zero[id].read().iter().map(|pid| pid.as_usize()).collect(),
+            |id| Self::parallel_distance(metric, query, &points[id]),
+            |a, b| Self::parallel_distance(metric, &points[a], &points[b]),
+        )
+        .into_iter()
+        .map(|(distance, id)| Candidate { distance, pid: PointId(id as u32) })
+        .collect()
     }
 
     /// Add reverse connection from neighbor to new node, maintaining SORTED order by distance
@@ -2745,6 +2707,7 @@ impl HNSWIndex {
         // Extending it again would re-walk the same graph. Algorithm 4 extends only at insertion.
         let selected = Self::par_select_heuristic(
             metric,
+            neighbor_point,
             &cands,
             points,
             m0,
@@ -5085,6 +5048,78 @@ mod tests {
     /// So the control comes first and it is not optional: build the SAME config twice, measure how
     /// much it varies from thread scheduling alone, and only then require the option's effect to
     /// exceed that floor by a clear margin. A difference smaller than the noise is not evidence.
+    /// The two builders must produce the SAME GRAPH, to within the parallel builder's thread noise.
+    ///
+    /// This is the guard on the bug class, rather than on any one bug. Both builders now call one
+    /// [`select_neighbors_core`], so an option cannot be honoured by one and ignored by the other —
+    /// but they still adapt it to different graph storage, and an adapter can lie. This test fails
+    /// the moment those adapters disagree about anything: a dropped option, a wrong distance, a
+    /// different pruning rule.
+    ///
+    /// It is the test that would have caught, in one shot, every builder bug in the 1.0 audit:
+    ///
+    /// | bug | the gap it opened |
+    /// |---|---|
+    /// | parallel ignored `m`/`m0` | degree pinned at the capacity constant |
+    /// | parallel ignored `use_heuristic` | 16.00 vs 8.11 |
+    /// | parallel ignored `extend_candidates` | 7.99 vs 9.06 |
+    /// | parallel scored extended candidates against the wrong point | 10.58 vs 9.06 |
+    ///
+    /// The last of those was introduced *while fixing* the third, and shipped for three commits
+    /// under a test that watched degree move and concluded the option worked. Degree moved. It
+    /// moved to the wrong number.
+    #[test]
+    fn both_builders_produce_the_same_graph() {
+        let mut rng = StdRng::seed_from_u64(31337);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..16).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..600)
+            .map(|i| {
+                let c: &Vec<f32> = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.4).collect()
+            })
+            .collect();
+
+        let avg_degree = |strategy: BuildStrategy, heuristic: bool, extend: bool| -> f64 {
+            let reps = 3;
+            (0..reps)
+                .map(|r| {
+                    let ix = HNSWIndex::build(
+                        base.clone(),
+                        HNSWConfig {
+                            metric: DistanceMetric::L2,
+                            m: 8,
+                            m0: 16,
+                            ef_construction: 16,
+                            seed: Some(21 + r),
+                            use_heuristic: heuristic,
+                            extend_candidates: extend,
+                            keep_pruned_connections: false,
+                            build_strategy: strategy,
+                            ..Default::default()
+                        },
+                    );
+                    let total: usize = (0..ix.len()).map(|i| ix.get_neighbors_l0(i).len()).sum();
+                    total as f64 / ix.len() as f64
+                })
+                .sum::<f64>()
+                / reps as f64
+        };
+
+        for (heuristic, extend) in [(false, false), (true, false), (true, true)] {
+            let par = avg_degree(BuildStrategy::Parallel, heuristic, extend);
+            let seq = avg_degree(BuildStrategy::Sequential, heuristic, extend);
+            assert!(
+                (par - seq).abs() < 0.5,
+                "use_heuristic={heuristic} extend_candidates={extend}: the parallel builder \
+                 produced average degree {par:.2} and the sequential one {seq:.2}. They run the \
+                 same algorithm on the same seed, so a gap this size means an adapter is dropping \
+                 an option or computing a distance against the wrong point."
+            );
+        }
+    }
+
     #[test]
     fn use_heuristic_and_extend_candidates_are_honoured_by_both_builders() {
         let mut rng = StdRng::seed_from_u64(31337);
