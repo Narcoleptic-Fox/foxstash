@@ -6,8 +6,16 @@ Cargo.lock
 *.onnx
 *.bin
 /models/
+# Python virtualenvs. NOTE: an entry here does NOT untrack files already in the
+# index — `benchmarks/python/venv/` was listed below for months while 16,164 of
+# its files stayed tracked. If you add a venv here, also `git rm -r --cached` it.
 benchmarks/python/venv/
+benchmarks/python/.venv_win/
 .bench-venv/
+**/.venv/
+**/venv/
+__pycache__/
+*.py[cod]
 
 # ANN benchmark corpora — large, and reproducible from benchmarks/fetch-data.sh.
 # Do not commit these. A dataset in git is a dataset nobody re-verifies; the
