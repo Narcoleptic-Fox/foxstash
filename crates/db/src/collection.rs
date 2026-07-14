@@ -95,7 +95,7 @@ impl Collection {
                 index: HNSWIndex::new(config.embedding_dim, config.hnsw.clone()),
                 id_map: IdMap::new(),
                 documents: Vec::new(),
-                text_index: InvertedIndex::new(),
+                text_index: InvertedIndex::with_config(config.bm25.clone()),
                 tokenizer: SimpleTokenizer::new(),
             }),
             config,
@@ -299,7 +299,7 @@ impl Collection {
 
         let mut new_index = HNSWIndex::new(self.config.embedding_dim, self.config.hnsw.clone());
         let mut new_id_map = IdMap::new();
-        let mut new_text_index = InvertedIndex::new();
+        let mut new_text_index = InvertedIndex::with_config(self.config.bm25.clone());
 
         for doc in &live_docs {
             new_index.add(doc.clone()).map_err(DbError::Core)?;
@@ -1150,6 +1150,68 @@ mod tests {
     // vector hit to exactly 1.0, while the default `Rrf` scores it 0.7/(60 + 0 + 1) ≈ 0.0115.
     // The first assertion below proves that gap is real on THIS data before the second one
     // relies on it — otherwise the test would be as vacuous as the ones it replaces.
+    /// `DbConfig::bm25` must actually reach the `InvertedIndex`.
+    ///
+    /// `BM25Config` was public and `InvertedIndex::with_config` was public and NOTHING CONNECTED
+    /// THEM: every construction site -- `Collection::create`, `Collection::compact`,
+    /// `recovery::recover` -- called `InvertedIndex::new()`, so `k1` and `b` were unreachable from
+    /// any public API. Same shape as `DbConfig::hybrid`, which was dead for a release, and same
+    /// shape as four options the parallel index builder ignored. A knob you cannot turn is not a
+    /// knob, and its passing test (`with_config` round-trips a struct) could never say so.
+    ///
+    /// Discriminates on `k1`, the term-frequency saturation parameter. At `k1 = 0` BM25 ignores
+    /// term frequency entirely -- a document containing a term ten times scores exactly as a
+    /// document containing it once. At a high `k1` the repetition is rewarded. So the same corpus
+    /// and the same query must produce a different ranking, and if they do not, the config never
+    /// arrived.
+    #[test]
+    fn a_collections_configured_bm25_config_reaches_the_text_index() {
+        let scores_with = |k1: f32| -> Vec<(String, f32)> {
+            let dir = TempDir::new().unwrap();
+            let mut config = cfg(3);
+            config.bm25 = crate::inverted_index::BM25Config { k1, b: 0.75 };
+            let col = Collection::create("test", dir.path(), config).unwrap();
+
+            // `rare` appears once in `once` and five times in `often`. Under k1 = 0 the two are
+            // indistinguishable to BM25; under a large k1, `often` pulls ahead.
+            col.insert("once".into(), "rare filler filler filler filler".into(),
+                       vec![1.0, 0.0, 0.0], None).unwrap();
+            col.insert("often".into(), "rare rare rare rare rare".into(),
+                       vec![1.0, 0.0, 0.0], None).unwrap();
+
+            let hits = col.search_text("rare", 2, None).unwrap();
+            hits.into_iter().map(|h| (h.id, h.score)).collect()
+        };
+
+        let flat = scores_with(0.0);
+        let saturating = scores_with(4.0);
+
+        let get = |v: &[(String, f32)], id: &str| -> f32 {
+            v.iter().find(|(i, _)| i == id).map(|(_, s)| *s).unwrap()
+        };
+
+        // Control: the fixture discriminates. With k1 = 0, term frequency is ignored, so the
+        // doc containing `rare` five times must score the SAME as the one containing it once.
+        // If this control fails the fixture is not exercising k1 at all and the assertion below
+        // would be meaningless.
+        assert!(
+            (get(&flat, "once") - get(&flat, "often")).abs() < 1e-4,
+            "control failed: at k1 = 0, BM25 must ignore term frequency, so `once` ({:.4}) and \
+             `often` ({:.4}) should score identically. They do not, so this fixture is not \
+             measuring k1 and the real assertion below proves nothing.",
+            get(&flat, "once"), get(&flat, "often")
+        );
+
+        // The real assertion: raising k1 must reward the repeated term.
+        assert!(
+            get(&saturating, "often") > get(&saturating, "once") * 1.2,
+            "at k1 = 4.0 the document repeating `rare` five times ({:.4}) must outscore the one \
+             containing it once ({:.4}). It does not, so `DbConfig::bm25` never reached the \
+             InvertedIndex -- it is going into the struct and quietly nowhere.",
+            get(&saturating, "often"), get(&saturating, "once")
+        );
+    }
+
     #[test]
     fn a_collections_configured_hybrid_config_is_used_when_none_is_passed() {
         let weighted = HybridConfig::default()

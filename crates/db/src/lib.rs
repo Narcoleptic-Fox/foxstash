@@ -45,6 +45,7 @@ pub mod store;
 #[cfg(not(target_arch = "wasm32"))]
 use foxstash_core::index::{HNSWConfig, Storage};
 #[cfg(not(target_arch = "wasm32"))]
+use crate::inverted_index::BM25Config;
 use foxstash_core::storage::IncrementalConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use thiserror::Error;
@@ -106,6 +107,13 @@ pub struct DbConfig {
     pub hnsw: HNSWConfig,
     /// Incremental storage configuration.
     pub storage: IncrementalConfig,
+    /// BM25 scoring parameters for the keyword half of hybrid search.
+    ///
+    /// `BM25Config` was public, and `InvertedIndex::with_config` was public, and there was no path
+    /// between them: every construction site in `Collection` and `recovery` called
+    /// `InvertedIndex::new()`, so `k1` and `b` were unreachable from any public API. A knob you
+    /// cannot turn is not a knob. This field is the path.
+    pub bm25: BM25Config,
     /// Embedding dimensionality shared by every collection in this store.
     ///
     /// All documents inserted into any collection must have embeddings of
@@ -125,6 +133,7 @@ impl Default for DbConfig {
         Self {
             hnsw: HNSWConfig::default(),
             storage: IncrementalConfig::default(),
+            bm25: BM25Config::default(),
             embedding_dim: 384,
             auto_checkpoint: true,
             hybrid: HybridConfig::default(),
