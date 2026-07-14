@@ -37,6 +37,3 @@ harness = false
 name = "full"
 harness = false
 
-[[bench]]
-name = "comparison"
-harness = false

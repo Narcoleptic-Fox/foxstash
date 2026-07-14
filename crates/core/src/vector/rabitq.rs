@@ -129,17 +129,6 @@ impl RaBitQuantizer {
         }
     }
 
-    /// Construct directly from a known centroid (e.g. an IVF coarse centroid).
-    pub fn with_centroid(centroid: Vec<f32>, seed: u64) -> Self {
-        let dim = centroid.len();
-        assert!(dim > 0, "Dimension must be positive");
-        let rotation = random_orthonormal(dim, seed);
-        Self {
-            dim,
-            centroid,
-            rotation,
-        }
-    }
 
     /// Dimensionality.
     pub fn dim(&self) -> usize {

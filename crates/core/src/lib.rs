@@ -79,29 +79,5 @@ pub struct SearchResult {
     pub metadata: Option<serde_json::Value>,
 }
 
-/// Configuration for RAG system
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RagConfig {
-    pub embedding_dim: usize,
-    pub max_documents: usize,
-    pub index_type: IndexType,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub enum IndexType {
-    Flat,
-    HNSW,
-}
-
-impl Default for RagConfig {
-    fn default() -> Self {
-        Self {
-            embedding_dim: 384, // MiniLM-L6-v2
-            max_documents: 10_000,
-            index_type: IndexType::HNSW,
-        }
-    }
-}
-
 // Re-export commonly used items
 pub use vector::{cosine_similarity, dot_product, l2_distance, normalize};

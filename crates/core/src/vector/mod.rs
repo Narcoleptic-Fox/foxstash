@@ -55,7 +55,7 @@ pub mod simd;
 use crate::{RagError, Result};
 
 // Re-export commonly used functions
-pub use ops::{approx_equal, cosine_similarity, dot_product, l2_distance, normalize};
+pub use ops::{cosine_similarity, dot_product, l2_distance, normalize};
 
 // Re-export SIMD functions
 pub use simd::{
