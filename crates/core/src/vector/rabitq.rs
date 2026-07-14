@@ -38,7 +38,6 @@
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use super::quantize::Quantizer;
 
 /// Default seed for the rotation, so builds are reproducible by default.
 const DEFAULT_SEED: u64 = 0x5241_4249_5451_5121; // "RABITQ!" ish
@@ -243,14 +242,24 @@ impl RaBitQuantizer {
     }
 }
 
-impl Quantizer for RaBitQuantizer {
-    type Quantized = RaBitCode;
-
-    fn quantize(&self, vector: &[f32]) -> Self::Quantized {
+/// Inherent, not a trait impl.
+///
+/// These used to satisfy a `Quantizer` trait in `vector::quantize`, which had three implementors
+/// and was used polymorphically by nothing -- no `dyn Quantizer`, no `T: Quantizer` bound anywhere
+/// in the workspace. The other two implementors (`ScalarQuantizer`, `BinaryQuantizer`) were a
+/// SECOND implementation of SQ8, which the index never called: `hnsw.rs` has its own SoA layout
+/// and its own AVX2 kernels in `vector::simd`. Two copies of one idea, one of them shipped and
+/// one of them merely benchmarked. That is the shape of every bug in the 1.0 audit, so the copy
+/// nobody ran was deleted and the abstraction over it went with it.
+impl RaBitQuantizer {
+    /// Encode a vector to its 1-bit code. See [`Self::encode`].
+    pub fn quantize(&self, vector: &[f32]) -> RaBitCode {
         self.encode(vector)
     }
 
-    fn dequantize(&self, quantized: &Self::Quantized) -> Vec<f32> {
+    /// Reconstruct an approximate vector from its code. Lossy (sign-only) but directionally
+    /// correct; used by [`Self::distance_symmetric`].
+    pub fn dequantize(&self, quantized: &RaBitCode) -> Vec<f32> {
         // Reconstruct o ≈ c + dtc · Rᵀ · x̄, where x̄ᵢ = ±1/√D from the sign bits.
         // Lossy (sign-only), but directionally correct.
         let d = self.dim;
@@ -268,13 +277,16 @@ impl Quantizer for RaBitQuantizer {
             .collect()
     }
 
-    fn distance_quantized(&self, a: &Self::Quantized, b: &Self::Quantized) -> f32 {
-        // Asymmetric estimator with one side dequantized (RaBitQ is asymmetric).
+    /// Distance between two codes, with one side dequantized -- RaBitQ's estimator is asymmetric,
+    /// so there is no honest code-to-code distance.
+    pub fn distance_quantized(&self, a: &RaBitCode, b: &RaBitCode) -> f32 {
         let a_full = self.dequantize(a);
         self.distance_asymmetric(&a_full, b)
     }
 
-    fn distance_asymmetric(&self, query: &[f32], quantized: &Self::Quantized) -> f32 {
+    /// Distance from a full-precision query to a code. This is the estimator the index uses,
+    /// though the hot path goes through `simd::rabitq_asymmetric_l2_simd` rather than here.
+    pub fn distance_asymmetric(&self, query: &[f32], quantized: &RaBitCode) -> f32 {
         let prepared = self.prepare_query(query);
         self.estimate_dist_sq(&prepared, quantized).sqrt()
     }

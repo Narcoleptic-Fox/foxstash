@@ -49,7 +49,6 @@
 //! ```
 
 pub mod ops;
-pub mod quantize;
 pub mod rabitq;
 pub mod simd;
 
