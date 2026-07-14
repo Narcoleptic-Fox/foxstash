@@ -556,7 +556,6 @@ pub fn create_flat_index(embedding_dim: usize, documents: Vec<Document>) -> Seri
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 
 /// Serializes a FlatIndex to SerializedFlatIndex
 pub fn serialize_flat_index(
