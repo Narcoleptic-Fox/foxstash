@@ -121,7 +121,7 @@ fn main() {
     // Multi-threaded, at ef=100, for comparison with hnswlib's default knn_query
     // (which fans out across every core).
     index.set_ef_search(100);
-    std::hint::black_box(index.search_batch(&ds.queries[..64].to_vec(), K).unwrap());
+    std::hint::black_box(index.search_batch(&ds.queries[..64], K).unwrap());
     let t = Instant::now();
     std::hint::black_box(index.search_batch(&ds.queries, K).unwrap());
     println!(

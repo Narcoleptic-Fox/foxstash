@@ -27,7 +27,8 @@
 //! cargo bench -p foxstash-benches -- --ignored
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
 use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};

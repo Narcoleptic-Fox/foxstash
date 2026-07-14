@@ -831,7 +831,7 @@ mod tests {
         assert!(index.is_empty());
 
         // Search on empty index should return no results
-        let results = index.search(&vec![1.0, 0.0, 0.0], 10).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 10).unwrap();
         assert_eq!(results.len(), 0);
     }
 

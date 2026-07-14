@@ -4036,18 +4036,6 @@ mod tests {
         assert_eq!(DistanceMetric::default(), DistanceMetric::Cosine);
     }
 
-    /// Every build strategy must produce a working graph.
-    ///
-    /// `BuildStrategy::Sequential` panicked outright for an entire release: the layer-0
-    /// refactor made the flat array the sole owner of layer-0 links, and the sequential
-    /// builder was never taught to grow it. Nothing caught it — every other test and every
-    /// doctest either forces `Parallel` or takes the default, so `Sequential` had no
-    /// coverage at all despite being a documented public option.
-    ///
-    /// This asserts *recall*, not merely absence of a panic: the same refactor left a
-    /// `build_l0_cache()` call that would have copied an empty nested layer 0 over the real
-    /// graph, erasing every layer-0 link and failing silently with a still-"working" index.
-    #[test]
     /// `keep_pruned_connections` must actually do something in **both** builders.
     ///
     /// It did not. The parallel builder — the default path, and the one every benchmark uses —
@@ -4101,6 +4089,17 @@ mod tests {
         }
     }
 
+    /// Every build strategy must produce a working graph.
+    ///
+    /// `BuildStrategy::Sequential` panicked outright for an entire release: the layer-0
+    /// refactor made the flat array the sole owner of layer-0 links, and the sequential
+    /// builder was never taught to grow it. Nothing caught it — every other test and every
+    /// doctest either forces `Parallel` or takes the default, so `Sequential` had no
+    /// coverage at all despite being a documented public option.
+    ///
+    /// This asserts *recall*, not merely absence of a panic: the same refactor left a
+    /// `build_l0_cache()` call that would have copied an empty nested layer 0 over the real
+    /// graph, erasing every layer-0 link and failing silently with a still-"working" index.
     #[test]
     fn every_build_strategy_produces_a_searchable_graph() {
         // Clustered, not uniform-random: random vectors have no structure to recover, and
@@ -4270,7 +4269,6 @@ mod tests {
     /// `rerank_candidates: 0` must work: codes-only, the cold `full` array dropped entirely,
     /// and the estimate itself used as the final ranking with no exact-distance correction.
     /// Must not panic even though `full` stays empty for the whole life of the index.
-    #[test]
     // `HNSWIndex::build(.., Storage::RaBitQ + rerank_candidates: 0)` used to PANIC IN RELEASE:
     //   range start index 24 out of range for slice of length 0   (hnsw.rs, get_embedding)
     //

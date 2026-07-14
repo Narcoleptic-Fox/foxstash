@@ -233,7 +233,7 @@ fn main() {
     // The rows above compare quantizers in isolation (brute-force stage 1 over the
     // whole corpus). These rows exercise the actual index: approximate graph traversal
     // using the quantized estimate, then rerank. This is what a caller actually gets.
-    let docs = |v: &Vec<f32>, i: usize| Document {
+    let _docs = |v: &Vec<f32>, i: usize| Document {
         id: i.to_string(),
         content: String::new(),
         embedding: v.clone(),

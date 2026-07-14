@@ -2,7 +2,8 @@
 //!
 //! Run with: cargo bench -p foxstash-benches --bench comparison
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use instant_distance::{Builder, Search};
 use std::time::Instant;
 

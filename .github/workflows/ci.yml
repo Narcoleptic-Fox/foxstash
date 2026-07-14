@@ -86,13 +86,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy foxstash-core
-        run: cargo clippy -p foxstash-core -- -D warnings
+        run: cargo clippy -p foxstash-core --all-targets -- -D warnings
 
       - name: Clippy foxstash-db
-        run: cargo clippy -p foxstash-db -- -D warnings
+        run: cargo clippy -p foxstash-db --all-targets -- -D warnings
 
       - name: Clippy foxstash-native
-        run: cargo clippy -p foxstash-native -- -D warnings
+        run: cargo clippy -p foxstash-native --all-targets -- -D warnings
 
   fmt:
     name: Format

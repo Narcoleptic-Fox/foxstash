@@ -11,7 +11,8 @@
 //! cargo bench -p foxstash-core --bench quantization
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::vector::product_quantize::{PQConfig, PQDistanceCache, ProductQuantizer};
 use foxstash_core::vector::quantize::{
     hamming_distance_simd, sq8_l2_distance_simd, BinaryQuantizer, Quantizer, ScalarQuantizer,
