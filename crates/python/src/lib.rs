@@ -2,8 +2,9 @@
 //! harnesses (VIBE, and anything else shaped like ann-benchmarks) rather than as a general
 //! embedding client — see `vibe/algorithms/foxstash/` for the harness-side wrapper.
 //!
-//! Not compiled or run as part of writing this file. `maturin build` from this directory is
-//! the first thing to run against it.
+//! Built and tested against PyO3 0.29. Note `Python::detach` (formerly `allow_threads`) and
+//! `Python::attach` (formerly `with_gil`) — renamed upstream once Python 3.13 free-threading made
+//! "the GIL" the wrong noun for what is an attach/detach of this thread from the interpreter.
 
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -136,7 +137,11 @@ impl Foxstash {
         // `embeddings` is plain owned Rust data (no Py<T>/Bound<T> inside it), so it's safe
         // to move into a GIL-released closure. VIBE times query latency single-threaded, but
         // there's no reason to hold the GIL hostage for the whole build either.
-        let index = py.allow_threads(move || HNSWIndex::build_parallel(embeddings, config));
+        //
+        // `detach`, not `allow_threads`: PyO3 renamed it (along with `with_gil` -> `attach`) when
+        // Python 3.13 free-threading made "the GIL" the wrong noun for what is really an
+        // attach/detach of this thread from the interpreter.
+        let index = py.detach(move || HNSWIndex::build_parallel(embeddings, config));
         self.index = Some(index);
         Ok(())
     }
@@ -150,22 +155,34 @@ impl Foxstash {
     /// `RagError::FullPrecisionDropped`, propagated below rather than swallowed.
     #[pyo3(signature = (ef, rerank=None))]
     fn set_query_arguments(&mut self, ef: usize, rerank: Option<usize>) -> PyResult<()> {
-        let index = self.built_mut()?;
-        index.set_ef_search(ef);
+        // Scoped, so the mutable borrow of `self.index` ends before the bookkeeping fields are
+        // written. The fields are only mirrored for `__str__`, so they are updated only once the
+        // index has actually accepted the values -- if `set_rerank_candidates` rejects `r`,
+        // `__str__` must not claim we applied it.
+        {
+            let index = self.built_mut()?;
+            index.set_ef_search(ef);
+            if let Some(r) = rerank {
+                index
+                    .set_rerank_candidates(r)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            }
+        }
         self.ef_query = ef;
         if let Some(r) = rerank {
-            index
-                .set_rerank_candidates(r)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
             self.rerank_candidates = r;
         }
         Ok(())
     }
 
-    /// Single-query search, returning the `n` nearest neighbours' row indices into the `X`
-    /// passed to `fit()` (that mapping holds regardless of `build_parallel`'s internal
-    /// insertion-order shuffle — see `HNSWIndex::build_parallel`, which re-derives each
-    /// node's id from its original position before returning).
+    /// Single-query search, returning the `n` nearest neighbours' row indices into the `X` passed
+    /// to `fit()`.
+    ///
+    /// That mapping survives `build_parallel`'s internal insertion-order shuffle. This used to be
+    /// asserted here, in a comment, which is worth nothing: had the shuffle leaked, every recall
+    /// number this binding reports would have been scored against the wrong ground-truth rows —
+    /// silently, with no crash and nothing looking wrong. It is now pinned in core by
+    /// `build_parallel_returns_original_row_indices_despite_its_shuffle`, which fails if it does.
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -176,7 +193,7 @@ impl Foxstash {
         let query: Vec<f32> = v.as_slice()?.to_vec();
 
         let results = py
-            .allow_threads(move || index.search(&query, n))
+            .detach(move || index.search(&query, n))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let ids: Vec<i64> = results

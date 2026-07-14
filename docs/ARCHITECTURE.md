@@ -249,7 +249,37 @@ not a known win.
 
 ---
 
-## 7. The bug class, in one line
+## 7. Fixtures: the one that stresses the graph is not the one that stresses the quantizer
+
+Two different failure modes need two different corpora, and using the wrong one produces a
+confident, completely wrong number in either direction.
+
+| corpus | hides | because |
+|---|---|---|
+| **uniform-random** | **graph** bugs | there is no neighbourhood structure to recover, so every ANN scores ~60% whether or not its graph is intact. A parallel-build bug hid behind this for a release. |
+| **tight, well-separated clusters** | **quantizer** bugs | a 1-bit code encodes *which cluster* a point is in and nothing about where it sits inside one — but recall@10 is a purely *within-cluster* ranking problem, so the code is blind to exactly the question being asked. |
+
+Measured, cosine, 256-d, `rerank_candidates: 50`, varying only how far apart the synthetic clusters
+sit relative to their own spread:
+
+| cluster separation | `F32` | `SQ8` | `RaBitQ` |
+|---|---|---|---|
+| 6.0 (tight blobs) | 99.9% | 99.9% | **27.5%** |
+| 1.5 | 100% | 100% | 64.8% |
+| 0.75 | 100% | 100% | 79.8% |
+| **real GIST, 960-d** | — | — | **97.98%** |
+
+The 27.5% is a fact about the fixture, not about the quantizer. Real embeddings carry local
+structure that a mixture of Gaussian blobs does not.
+
+A third trap, same family: **hold your queries out of the corpus's own generator.** Drawing them
+from a fresh set of cluster centers makes every query an outlier whose nearest neighbours are
+ill-conditioned peripheral points, and drags even exact `F32` storage down to 83% — which reads
+exactly like a broken index.
+
+---
+
+## 8. The bug class, in one line
 
 > **A rule you don't test is a comment.**
 

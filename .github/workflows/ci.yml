@@ -176,3 +176,24 @@ jobs:
       # docs/ARCHITECTURE.md has drifted from the source. A generated diagram that is allowed to
       # go stale is worse than no diagram: it rots while looking authoritative.
       - run: python3 xtask/config_matrix.py
+
+  python:
+    name: Python binding (recall vs brute force)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install maturin numpy pytest
+      - run: python -m venv .venv && .venv/bin/pip install numpy pytest
+      # Scores every query against brute-force ground truth computed in numpy from the same X.
+      # A binding that mis-mapped row indices would still return k plausible integers per query
+      # and would look perfectly healthy; brute-force scoring is what tells them apart.
+      - name: Build and test the binding
+        run: |
+          cd crates/python
+          VIRTUAL_ENV=$GITHUB_WORKSPACE/.venv maturin develop --release
+          cd "$GITHUB_WORKSPACE"
+          .venv/bin/python -m pytest crates/python/tests -q

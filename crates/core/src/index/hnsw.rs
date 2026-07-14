@@ -5046,6 +5046,68 @@ mod tests {
     /// So the control comes first and it is not optional: build the SAME config twice, measure how
     /// much it varies from thread scheduling alone, and only then require the option's effect to
     /// exceed that floor by a clear margin. A difference smaller than the noise is not evidence.
+    /// `build_parallel` shuffles its insertion order. The ids it hands back must still be the
+    /// caller's ORIGINAL row indices.
+    ///
+    /// This is load-bearing far outside this crate. The Python binding maps a `SearchResult` back
+    /// to a row of the `X` numpy handed us by parsing `r.id` as an integer — so if the shuffle
+    /// leaked, every recall number the binding reported would be scored against the wrong
+    /// ground-truth rows. It would not crash. It would not look wrong. It would be fiction, and we
+    /// would publish it. The binding asserted this in a doc comment, and a doc comment cannot fail.
+    ///
+    /// It asserts the MAPPING, not the search. The first version of this test queried each row
+    /// with its own vector and demanded itself back at k=1 — and failed, on a correct index, at
+    /// the default `ef_search`, because an approximate index is allowed to miss. Which is to say
+    /// it was testing recall while claiming to test identity. The direct check below cannot be
+    /// confused by search quality: node `j` stores the vector of the row whose id it claims.
+    #[test]
+    fn build_parallel_returns_original_row_indices_despite_its_shuffle() {
+        let n = 300;
+        let base: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let mut v = vec![0.0f32; 32];
+                v[i % 32] = 1.0 + i as f32;
+                v[(i * 7 + 3) % 32] = 0.5 + (i % 13) as f32;
+                v
+            })
+            .collect();
+
+        let mut ix = HNSWIndex::build(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                seed: Some(4),
+                build_strategy: BuildStrategy::Parallel,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ix.len(), n, "the build dropped or duplicated rows");
+
+        for j in 0..ix.len() {
+            let claimed: usize = ix.ids[j]
+                .parse()
+                .expect("build_parallel labels every node with its original row index");
+            assert_eq!(
+                ix.get_embedding(j),
+                base[claimed].as_slice(),
+                "node {j} claims to be row {claimed}, but the vector it stores is not row \
+                 {claimed}'s. build_parallel's insertion shuffle has leaked into the ids it \
+                 returns, so every id this index reports is a permutation of the caller's rows."
+            );
+        }
+
+        // And end to end, through the public API, at an `ef` large enough that a miss means a bug
+        // and not merely an approximate index doing its job.
+        ix.set_ef_search(300);
+        for i in [0, 7, 42, 199, 292, n - 1] {
+            assert_eq!(
+                ix.search(&base[i], 1).unwrap()[0].id,
+                i.to_string(),
+                "row {i} queried with its own vector did not come back as itself"
+            );
+        }
+    }
+
     /// The two builders must produce the SAME GRAPH, to within the parallel builder's thread noise.
     ///
     /// This is the guard on the bug class, rather than on any one bug. Both builders now call one
