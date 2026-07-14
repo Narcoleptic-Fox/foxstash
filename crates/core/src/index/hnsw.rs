@@ -5072,7 +5072,7 @@ mod tests {
             })
             .collect();
 
-        let mut ix = HNSWIndex::build(
+        let ix = HNSWIndex::build(
             base.clone(),
             HNSWConfig {
                 metric: DistanceMetric::L2,
@@ -5108,7 +5108,7 @@ mod tests {
         //
         // An exact assertion needs a deterministic build. The mapping claim itself is already
         // proven exhaustively above, for all n nodes, without going through search at all.
-        let mut seq = HNSWIndex::build(
+        let seq = HNSWIndex::build(
             base.clone(),
             HNSWConfig {
                 metric: DistanceMetric::L2,
