@@ -237,7 +237,6 @@ The honest list. Each of these is a place the code and the intent still diverge.
 | **`crates/python`** | **does not compile** — PyO3 0.29 `allow_threads` + a borrow error. Breaks `cargo test --workspace`. | compiles, and is the entry ticket to VIBE |
 | **python index mapping** | unverified claim that `build_parallel` returns original row indices despite its internal shuffle | a test. **If this is wrong, every recall number the binding reports is fiction.** |
 | **`crates/native`** | mobile C ABI cannot set `M` or `ef` | reaches the one config |
-| **SIFT1M M-sweep** | not regenerated since the degree retraction | regenerated (GIST1M is done) |
 
 ### The benchmark that is not ann-benchmarks
 

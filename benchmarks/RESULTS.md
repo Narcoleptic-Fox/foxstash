@@ -317,6 +317,49 @@ Two things measured and **not** kept, which matter as much as what was:
 So the remaining ~10% against hnswlib is **not** layout and **not** bounds checking. It is
 not yet explained, and it will be profiled rather than guessed at.
 
+
+## Graph degree at 1M: `M=32/m0=64` is right, and the crossover is RECALL
+
+Swept on **both** corpora now, because the last time this was measured at 200k it produced a
+conclusion that was published and then retracted. SIFT1M, 128-d, read at **matched recall**:
+
+| recall@10 | F32 `M=16` | F32 `M=32` | SQ8 `M=16` | SQ8 `M=32` |
+|---|---|---|---|---|
+| ~95% | **8,866** | ~8,384 | — | — |
+| ~98.3% | 5,263 | **5,479** | 6,687 | **7,128** |
+| ~99.5% | 3,048 | **3,279** | 3,968 | **4,229** |
+| ~99.9% | 1,418 | **1,920** (+35%) | 1,900 | **2,520** (+33%) |
+
+Build: `M=16` 81 s / `M=32` 165–170 s. Index: `M=16` 794 MB / `M=32` 948 MB (F32).
+
+**The crossover is recall, not merely corpus size.** Below ~96% recall the sparser graph wins —
+it visits fewer nodes and that is all that matters when you are stopping early anyway. Above ~98%
+the denser graph wins, and **the gap widens as recall rises**, reaching +35% at 99.9%. A sparse
+graph has to explore much harder to find the last percent, because the neighbours that would have
+taken it there were pruned at build time.
+
+RAG runs at high recall. `M=32/m0=64` stays the default, now confirmed on a second dataset at a
+second dimensionality.
+
+> The retracted claim ("our default degree was wrong, m0=32 dominates") was a **200k artifact**,
+> and it is now falsified at 1M on GIST *and* SIFT. Two datasets, same answer. That is what the
+> original claim needed and did not have.
+
+### SQ8 wins at 128-d; RaBitQ cannot even finish the race
+
+At matched recall SQ8 delivers **1.27x** F32's QPS (6,687 vs 5,263 at 98.4%), off 71.9 vs 91.4
+ns/dist — the latency saving is fixed while the dequant cost is small at 128-d, exactly as the
+dimensional rule predicts.
+
+RaBitQ, on the same corpus, **ceilings at 93.17% recall — at ef=500, with reranking enabled.** It
+cannot reach the operating points the other two run at. This is not slowness, it is blindness, and
+it is the identical failure that killed `PQHNSWIndex`: when the graph is traversed on a metric too
+coarse to rank, the true neighbours never enter the candidate pool, and **reranking cannot rescue
+what the walk never retrieved.** At 128-d, 1 bit per dimension is that metric.
+
+The same code gets 97.98% on 960-d GIST. Nothing about it changed. The dimension did.
+
+
 ## Build time and memory
 
 | | foxstash | hnswlib | faiss |
