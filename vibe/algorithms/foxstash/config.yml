@@ -28,7 +28,7 @@ float:
       f32:
         args:
           m: [16, 32]
-          ef_construction: [100, 200, 500]
+          ef_construction: [100, 200]
           storage: [f32]
           rerank_candidates: [0]
         query_args:
@@ -36,7 +36,7 @@ float:
       sq8:
         args:
           m: [16, 32]
-          ef_construction: [100, 200, 500]
+          ef_construction: [100, 200]
           storage: [sq8]
           rerank_candidates: [500]
         query_args:
@@ -45,7 +45,7 @@ float:
       rabitq:
         args:
           m: [16, 32]
-          ef_construction: [100, 200, 500]
+          ef_construction: [100, 200]
           storage: [rabitq]
           rerank_candidates: [500]
         query_args:
