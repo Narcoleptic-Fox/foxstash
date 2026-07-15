@@ -1051,6 +1051,10 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             keep_pruned_connections: wrapper.keep_pruned_connections,
             storage: wrapper.storage,
             rerank_candidates: wrapper.rerank_candidates,
+            // NOT persisted by the wrapper yet — TurboQuant save/load is out of scope for the
+            // current in-memory VIBE experiment. Defaulted so a reloaded config is valid; wire
+            // into HNSWConfigWrapper before relying on TurboQuant across a save/load.
+            turbo_bits: crate::index::HNSWConfig::default().turbo_bits,
             seed: wrapper.seed,
             // NOT persisted, and that is deliberate rather than an oversight: `to_index`
             // rebuilds the graph by looping `add()`, which never consults `build_strategy`.

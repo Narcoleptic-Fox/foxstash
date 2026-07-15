@@ -121,6 +121,7 @@ impl BitsetVisited {
 struct QueryPrep<'a> {
     norm: f32,
     rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
+    turboquant: Option<&'a crate::vector::turboquant::PreparedQuery>,
 }
 
 /// Per-query scratch space: the visited bitset and the two heaps.
@@ -389,6 +390,11 @@ pub struct HNSWConfig {
     /// It costs whatever recall the approximate ranking loses, which is a real trade and
     /// should be measured on your data, not assumed.
     pub rerank_candidates: usize,
+
+    /// Total bits per dimension for [`Storage::TurboQuant`] (`b`): `b−1` MSE bits + 1 QJL bit.
+    /// Ignored by every other storage mode. `b = 2` (≈2.5 bits/dim, between RaBitQ and SQ8) is a
+    /// sensible default; sweep `{2, 3, 4}` to trade memory for recall. Must be ≥ 1.
+    pub turbo_bits: usize,
 }
 
 /// Distance metric for [`HNSWIndex`]. **Every** storage mode honours it.
@@ -535,6 +541,14 @@ pub enum Storage {
     /// neighbours before the exact rescore sees them. If recall goes down when you search
     /// harder, raise [`HNSWConfig::rerank_candidates`] before suspecting the quantizer.
     RaBitQ,
+    /// Data-oblivious multi-bit TurboQuant codes (see [`crate::vector::turboquant`]).
+    ///
+    /// A separate, self-contained alternative to [`Storage::RaBitQ`]: `b−1` MSE bits per
+    /// coordinate plus a 1-bit QJL residual, with an unbiased inner-product estimator and a
+    /// codebook **derived** from the known post-rotation Gaussian (no k-means on the data). The
+    /// bit budget `b` is set by [`HNSWConfig::turbo_bits`]. Correctness-first integration stores
+    /// codes in a parallel array; arena-packing is a later QPS optimization.
+    TurboQuant,
 }
 
 impl Default for HNSWConfig {
@@ -554,6 +568,7 @@ impl Default for HNSWConfig {
             seed: None,
             storage: Storage::default(),
             rerank_candidates: 100,
+            turbo_bits: 2,
         }
     }
 }
@@ -666,6 +681,8 @@ const fn vec_words(storage: Storage, dim: usize) -> usize {
         Storage::F32 => dim,
         Storage::SQ8 => dim.div_ceil(4),
         Storage::RaBitQ => 2 + rabitq_bit_words(dim),
+        // Codes live in a parallel `turbo_codes` array, not the arena (correctness-first).
+        Storage::TurboQuant => 0,
     }
 }
 
@@ -743,6 +760,14 @@ pub struct HNSWIndex {
     /// at build time and `prepare_query`s each query once per search
     /// (not once per node visit — see [`Self::distance_to_node`]).
     rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
+
+    // === TurboQuant storage (empty unless Storage::TurboQuant) ===
+    /// Data-oblivious multi-bit quantizer (rotation + Gaussian sketch + derived codebook).
+    turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
+    /// TurboQuant codes, indexed parallel to `node_id`. Correctness-first: not yet arena-packed,
+    /// so a node visit under this mode chases a separate heap allocation (a QPS cost we pay only
+    /// after recall is proven).
+    turbo_codes: Vec<crate::vector::turboquant::TurboCode>,
 
     // === GRAPH STRUCTURE (layers >= 1 only) ===
     /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
@@ -876,6 +901,8 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
+            turboquant: None,
+            turbo_codes: Vec::new(),
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -932,6 +959,13 @@ impl HNSWIndex {
                     self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(embeddings));
                 }
             }
+            // Data-oblivious: needs only `dim` and the bit budget, never the data itself.
+            Storage::TurboQuant => {
+                self.turboquant = Some(crate::vector::turboquant::TurboQuantizer::new(
+                    self.embedding_dim,
+                    self.config.turbo_bits.max(1),
+                ));
+            }
         }
     }
 
@@ -972,6 +1006,7 @@ impl HNSWIndex {
             Storage::F32 => true,
             Storage::SQ8 => !self.q_scale.is_empty(),
             Storage::RaBitQ => self.rabitq.is_some(),
+            Storage::TurboQuant => self.turboquant.is_some(),
         }
     }
 
@@ -1288,7 +1323,7 @@ impl HNSWIndex {
                 let start = node_id * self.stride + self.hdr;
                 bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
             }
-            Storage::SQ8 | Storage::RaBitQ => {
+            Storage::SQ8 | Storage::RaBitQ | Storage::TurboQuant => {
                 debug_assert!(
                     !self.full.is_empty(),
                     "full-precision vectors were dropped (rerank_candidates = 0); \
@@ -1417,6 +1452,22 @@ impl HNSWIndex {
                 let bytes: &mut [u8] =
                     bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + bit_words]);
                 bytes[..code.bits.len()].copy_from_slice(&code.bits);
+                if self.config.rerank_candidates > 0 {
+                    self.full.extend_from_slice(embedding);
+                }
+            }
+            Storage::TurboQuant => {
+                // TurboQuant assumes unit-norm input (its codebook is derived for N(0,1/d) on the
+                // sphere), so encode a normalized copy unconditionally. The cold `full` array
+                // keeps the ORIGINAL for exact rerank. Code goes in the parallel array, aligned
+                // to `node_id` because `push_node` is called once per node in id order.
+                let tq = self
+                    .turboquant
+                    .as_ref()
+                    .expect("TurboQuant storage requires fit_codebook to run before push_node");
+                let mut unit = embedding.to_vec();
+                crate::vector::ops::normalize(&mut unit);
+                self.turbo_codes.push(tq.encode(&unit));
                 if self.config.rerank_candidates > 0 {
                     self.full.extend_from_slice(embedding);
                 }
@@ -1646,9 +1697,11 @@ impl HNSWIndex {
         // `Storage::RaBitQ` exists to avoid.
         let query_norm = crate::vector::simd::norm_simd(query);
         let rq_prepared = self.prepare_rabitq_query(query);
+        let tq_prepared = self.prepare_turboquant_query(query);
         let qprep = QueryPrep {
             norm: query_norm,
             rabitq: rq_prepared.as_ref(),
+            turboquant: tq_prepared.as_ref(),
         };
 
         let entry_point = self.entry_point.unwrap();
@@ -1880,9 +1933,11 @@ impl HNSWIndex {
         let query_norm = crate::vector::simd::norm_simd(&node_embedding);
         // See `search_inner`: prepared once per inserted node, not once per distance call.
         let rq_prepared = self.prepare_rabitq_query(&node_embedding);
+        let tq_prepared = self.prepare_turboquant_query(&node_embedding);
         let qprep = QueryPrep {
             norm: query_norm,
             rabitq: rq_prepared.as_ref(),
+            turboquant: tq_prepared.as_ref(),
         };
         let mut ctx = SearchContext::new(self.len());
 
@@ -2208,6 +2263,25 @@ impl HNSWIndex {
         Some(rq.prepare_query(&query))
     }
 
+    /// Prepare a query for [`Storage::TurboQuant`] traversal: rotate + sketch a unit-normalized
+    /// copy so both sides of the estimator share the same (unit-sphere) geometry the codes use.
+    /// `None` under any other storage.
+    fn prepare_turboquant_query(
+        &self,
+        query: &[f32],
+    ) -> Option<crate::vector::turboquant::PreparedQuery> {
+        if self.config.storage != Storage::TurboQuant {
+            return None;
+        }
+        let tq = self
+            .turboquant
+            .as_ref()
+            .expect("TurboQuant storage requires fit_codebook to run before any query");
+        let mut unit = query.to_vec();
+        crate::vector::ops::normalize(&mut unit);
+        Some(tq.prepare_query(&unit))
+    }
+
     /// Fused distance from query to a stored node.
     ///
     /// Cosine uses the precomputed norms for a single SIMD dispatch and a single pass.
@@ -2278,6 +2352,27 @@ impl HNSWIndex {
                 // defensively — cosine distance is bounded to [0, 2] by definition, and the
                 // estimator's own `.max(0.0)` only guards the lower bound.
                 DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
+            };
+        }
+
+        // Under TurboQuant the walk reads the code from the parallel `turbo_codes` array (not the
+        // arena yet) and combines it with the query prepared once in `qprep.turboquant`. Codes
+        // were encoded from unit-normalized vectors, so the estimate is of cosine similarity.
+        if self.config.storage == Storage::TurboQuant {
+            let prepared = qprep.turboquant.expect(
+                "Storage::TurboQuant traversal requires a query prepared via prepare_turboquant_query",
+            );
+            let tq = self
+                .turboquant
+                .as_ref()
+                .expect("TurboQuant codebook missing during traversal");
+            let ip = tq.estimate_ip(prepared, &self.turbo_codes[node_id]);
+            return match self.config.metric {
+                // Cosine distance in [0, 2]; the estimate is unbiased but noisy, so clamp.
+                DistanceMetric::Cosine => (1.0 - ip).clamp(0.0, 2.0),
+                // TODO: norm-aware L2 encoding. For now a monotone-in-cosine proxy — TurboQuant is
+                // exercised under cosine in the VIBE sweep, so this path is not on the hot road yet.
+                DistanceMetric::L2 => (2.0 * (1.0 - ip)).clamp(0.0, 4.0),
             };
         }
 
@@ -2796,6 +2891,8 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
+            turboquant: None,
+            turbo_codes: Vec::new(),
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
@@ -3324,6 +3421,7 @@ mod tests {
         let qprep = QueryPrep {
             norm: 1.0,
             rabitq: None,
+            turboquant: None,
         };
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, &qprep);
         assert!(
@@ -4193,6 +4291,85 @@ mod tests {
     /// clustered, not uniform-random, for the same reason every other recall test here is:
     /// uniform-random vectors have no structure to lose and every ANN scores ~60% on them
     /// regardless of whether the graph or the metric is correct.
+    /// End-to-end recall through the real index under [`Storage::TurboQuant`] + cosine — a public
+    /// storage variant with no integration test is a shipped bug (`lesson_untested_public_options`).
+    /// Held-out queries only (never self-retrieval), clustered data, and a discriminating-power
+    /// floor: with the estimator sabotaged this recall collapses (verified separately). Also checks
+    /// that more bits ⇒ at least as much recall, end to end.
+    #[test]
+    fn turboquant_recall_on_clustered_data_with_held_out_queries() {
+        let mut rng = StdRng::seed_from_u64(2025);
+        let dim = 96;
+        let n_clusters = 16;
+        let per_cluster = 40;
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let jitter = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
+            c.iter().map(|x| x + rng.random::<f32>() * 0.5 - 0.25).collect()
+        };
+        let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
+            .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..60)
+            .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
+            .collect();
+
+        let k = 10;
+        // Cosine ground truth (TurboQuant estimates cosine similarity).
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt()).max(1e-9)
+        };
+        let truth: Vec<HashSet<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut s: Vec<(f32, usize)> =
+                    base.iter().enumerate().map(|(i, v)| (cos(v, q), i)).collect();
+                s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                s.into_iter().take(k).map(|(_, i)| i).collect()
+            })
+            .collect();
+
+        let recall_for = |bits: usize| -> f32 {
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 16,
+                m0: 32,
+                ef_construction: 200,
+                ef_search: 200,
+                storage: Storage::TurboQuant,
+                turbo_bits: bits,
+                rerank_candidates: 50,
+                seed: Some(9),
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(base.clone(), config);
+            let mut total = 0.0f32;
+            for (q, gt) in queries.iter().zip(&truth) {
+                let got: HashSet<usize> = index
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                total += gt.intersection(&got).count() as f32 / k as f32;
+            }
+            total / queries.len() as f32
+        };
+
+        let r2 = recall_for(2);
+        let r4 = recall_for(4);
+        // Non-vacuous floor (sabotaging the estimator collapses this), and more bits never hurt.
+        assert!(r2 > 0.6, "TurboQuant b=2 recall too low end-to-end: {r2}");
+        assert!(r4 >= r2 - 0.05, "b=4 ({r4}) unexpectedly far below b=2 ({r2})");
+    }
+
     #[test]
     fn rabitq_recall_on_clustered_data_with_held_out_queries() {
         let mut rng = StdRng::seed_from_u64(2024);

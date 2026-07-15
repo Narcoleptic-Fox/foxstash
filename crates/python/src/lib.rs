@@ -28,13 +28,25 @@ fn parse_metric(s: &str) -> PyResult<DistanceMetric> {
     }
 }
 
-fn parse_storage(s: &str) -> PyResult<Storage> {
+/// Parse a storage string into `(mode, turbo_bits)`. `turbo_bits` is meaningful only for
+/// TurboQuant; `"turboquant"` defaults to 2 bits, `"turboquant3"` requests 3, etc. Encoding the
+/// bit budget in the string keeps the positional constructor (and VIBE's caller) unchanged.
+fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
     match s {
-        "f32" => Ok(Storage::F32),
-        "sq8" => Ok(Storage::SQ8),
-        "rabitq" => Ok(Storage::RaBitQ),
+        "f32" => Ok((Storage::F32, 0)),
+        "sq8" => Ok((Storage::SQ8, 0)),
+        "rabitq" => Ok((Storage::RaBitQ, 0)),
+        other if other.starts_with("turboquant") => {
+            let bits = other["turboquant".len()..].parse::<usize>().unwrap_or(2);
+            if bits < 1 {
+                return Err(PyValueError::new_err(
+                    "foxstash: turboquant bit budget must be >= 1 (e.g. \"turboquant2\").",
+                ));
+            }
+            Ok((Storage::TurboQuant, bits))
+        }
         other => Err(PyValueError::new_err(format!(
-            "foxstash: unsupported storage {other:?}. Expected one of \"f32\", \"sq8\", \"rabitq\"."
+            "foxstash: unsupported storage {other:?}. Expected \"f32\", \"sq8\", \"rabitq\", or \"turboquant[N]\"."
         ))),
     }
 }
@@ -51,6 +63,7 @@ struct Foxstash {
     ef_construction: usize,
     storage: Storage,
     storage_arg: String,
+    turbo_bits: usize,
     rerank_candidates: usize,
     ef_query: usize,
 }
@@ -81,7 +94,7 @@ impl Foxstash {
         rerank_candidates: usize,
     ) -> PyResult<Self> {
         let metric_enum = parse_metric(metric)?;
-        let storage_enum = parse_storage(storage)?;
+        let (storage_enum, turbo_bits) = parse_storage(storage)?;
         Ok(Self {
             index: None,
             metric: metric_enum,
@@ -91,6 +104,7 @@ impl Foxstash {
             ef_construction,
             storage: storage_enum,
             storage_arg: storage.to_string(),
+            turbo_bits,
             rerank_candidates,
             ef_query: ef_construction,
         })
@@ -132,6 +146,7 @@ impl Foxstash {
             seed: None,
             storage: self.storage,
             rerank_candidates: self.rerank_candidates,
+            turbo_bits: self.turbo_bits,
         };
 
         // `embeddings` is plain owned Rust data (no Py<T>/Bound<T> inside it), so it's safe
