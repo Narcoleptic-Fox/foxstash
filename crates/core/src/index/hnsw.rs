@@ -2538,8 +2538,18 @@ impl HNSWIndex {
                 }
                 // If snapshot doesn't exist, just continue descent
             } else {
-                // At or below target layer: search zero layer and BREAK
-                search.search_zero(point, zero, points, m0);
+                // At or below target layer: search zero layer and BREAK.
+                //
+                // Keep the FULL `ef_construction`-wide beam here — do NOT truncate to `m0`. The
+                // diversity heuristic below can only bridge clusters if it is handed the whole
+                // candidate pool to choose from; feeding it the `m0` nearest leaves it nothing to
+                // diversify (it picks `m0` from `m0`), so every node connects to its closest
+                // same-cluster neighbours and the graph has no long-range edges. That was the
+                // parallel builder's ~15-recall-point deficit vs the sequential path, which feeds
+                // its heuristic all `ef_construction` candidates. It was also why more
+                // `ef_construction` never helped: the pool was truncated to `m0` before selection
+                // regardless of how wide the beam explored.
+                search.search_zero(point, zero, points, ef_construction);
                 break; // Key fix: don't keep searching!
             }
         }
@@ -5197,6 +5207,125 @@ mod tests {
                  an option or computing a distance against the wrong point."
             );
         }
+    }
+
+    /// Degree equivalence (above) is a PROXY for graph quality; recall at fixed `ef_search` IS the
+    /// quality. The two builders once matched on layer-0 degree (64 vs 64) while the parallel graph
+    /// recalled ~15 points BELOW the sequential one — because `par_insert` truncated the candidate
+    /// beam to `m0` before the diversity heuristic, so the heuristic picked `m0` from `m0` and could
+    /// not bridge clusters. The degree test could never see it. This one measures the output.
+    ///
+    /// If the parallel builder ever again feeds its heuristic a truncated pool (or otherwise builds
+    /// a worse graph), parallel recall drops below sequential and the parity assertion fails. The
+    /// floor assertion keeps it from passing vacuously by comparing two equally-broken indexes.
+    #[test]
+    fn both_builders_reach_similar_recall() {
+        // Fixture chosen to EXPOSE the failure mode, not merely to run: UNIT-NORMALISED vectors
+        // with gaussian noise, so the clusters sit close on the sphere and a query's true top-10
+        // spans cluster boundaries — which the diversity heuristic must bridge. Queried at a modest
+        // ef_search where a bridge-poor graph visibly loses recall. Verified by sabotage: truncating
+        // the candidate pool to m0 before the heuristic drops parallel recall ~15 points here and
+        // fails the parity assertion below. Well-separated clusters (uniform centers, tiny noise)
+        // give BOTH builders 100% and hide the gap — the classic wrong fixture (benchmarking-traps /
+        // fixture-per-failure-mode lessons).
+        let mut rng = StdRng::seed_from_u64(0xEF54);
+        let dim = 128;
+        let norm = |v: &mut Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 0.0 {
+                v.iter_mut().for_each(|x| *x /= n);
+            }
+        };
+        // Box-Muller standard normal from the StdRng uniform stream.
+        let mut gauss = |rng: &mut StdRng| -> f32 {
+            let u1 = (rng.random::<f32>()).max(1e-7);
+            let u2 = rng.random::<f32>();
+            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+        };
+        let unit = |rng: &mut StdRng| -> Vec<f32> {
+            let mut v: Vec<f32> = (0..dim).map(|_| gauss(rng)).collect();
+            norm(&mut v);
+            v
+        };
+        let sample_from = |rng: &mut StdRng, centers: &[Vec<f32>], gauss: &mut dyn FnMut(&mut StdRng) -> f32| -> Vec<f32> {
+            let c = &centers[rng.random::<u64>() as usize % centers.len()];
+            let mut v: Vec<f32> = c.iter().map(|x| x + 0.05 * gauss(rng)).collect();
+            norm(&mut v);
+            v
+        };
+        // Base and queries are drawn from INDEPENDENT centre sets, so a query's true top-10 is not
+        // trivially its own dense cluster — it requires real cross-cluster search, which is what
+        // stresses the graph's long-range bridges. (Queries from the SAME centres as the base give
+        // both builders ~100% and hide the gap.)
+        let base_centers: Vec<Vec<f32>> = (0..100).map(|_| unit(&mut rng)).collect();
+        let query_centers: Vec<Vec<f32>> = (0..100).map(|_| unit(&mut rng)).collect();
+        let base: Vec<Vec<f32>> =
+            (0..10_000).map(|_| sample_from(&mut rng, &base_centers, &mut gauss)).collect();
+        let queries: Vec<Vec<f32>> =
+            (0..200).map(|_| sample_from(&mut rng, &query_centers, &mut gauss)).collect();
+
+        const K: usize = 10;
+        let truth: Vec<Vec<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut d: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(j, v)| {
+                        (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j)
+                    })
+                    .collect();
+                d.sort_by(|a, b| a.0.total_cmp(&b.0));
+                d.iter().take(K).map(|(_, j)| *j).collect()
+            })
+            .collect();
+
+        let recall_of = |strategy: BuildStrategy| -> f32 {
+            let mut ix = HNSWIndex::build(
+                base.clone(),
+                HNSWConfig {
+                    metric: DistanceMetric::L2,
+                    m: 32,
+                    m0: 64,
+                    ef_construction: 200,
+                    ef_search: 40,
+                    seed: Some(7),
+                    build_strategy: strategy,
+                    ..Default::default()
+                },
+            );
+            ix.set_ef_search(40);
+            let mut hit = 0.0f32;
+            for (qi, q) in queries.iter().enumerate() {
+                let got: std::collections::HashSet<usize> = ix
+                    .search(q, K)
+                    .unwrap()
+                    .iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                hit += truth[qi].iter().filter(|t| got.contains(t)).count() as f32 / K as f32;
+            }
+            hit / queries.len() as f32
+        };
+
+        let seq = recall_of(BuildStrategy::Sequential);
+        let par = recall_of(BuildStrategy::Parallel);
+
+        // Non-vacuous: both builders must actually work on this clustered data.
+        assert!(
+            seq > 0.65 && par > 0.55,
+            "recall floor not met (seq={seq:.3}, par={par:.3}) — the test is comparing broken \
+             indexes and would pass vacuously"
+        );
+        // The point of the test: the default (parallel) builder must not ship a materially worse
+        // graph than the sequential one. 5 points covers the parallel builder's non-reproducibility.
+        assert!(
+            seq - par < 0.05,
+            "parallel recall {par:.3} trails sequential {seq:.3} by {:.3} at equal ef_search — the \
+             parallel builder is producing a worse graph (last time: it truncated the candidate \
+             pool to m0 before the diversity heuristic).",
+            seq - par
+        );
     }
 
     #[test]
