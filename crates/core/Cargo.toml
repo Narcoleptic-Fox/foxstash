@@ -27,6 +27,8 @@ parking_lot = "0.12"
 
 # SIMD dependencies
 pulp = "0.22"
+# Safe u32 <-> f32 slice casts for the interleaved node arena (no unsafe on our side)
+bytemuck = "1.19"
 
 # Compression dependencies
 flate2 = "1.0"
@@ -51,6 +53,3 @@ tempfile = "3.8"
 name = "vector_simd"
 harness = false
 
-[[bench]]
-name = "quantization"
-harness = false

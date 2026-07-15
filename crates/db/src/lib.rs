@@ -43,8 +43,9 @@ pub mod store;
 // ── Desktop-only imports and types ──
 
 #[cfg(not(target_arch = "wasm32"))]
-use foxstash_core::index::HNSWConfig;
+use foxstash_core::index::{HNSWConfig, Storage};
 #[cfg(not(target_arch = "wasm32"))]
+use crate::inverted_index::BM25Config;
 use foxstash_core::storage::IncrementalConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use thiserror::Error;
@@ -79,6 +80,20 @@ pub enum DbError {
 
     #[error("validation error: {0}")]
     Validation(String),
+
+    /// `Collection` ingests documents one at a time. Quantized storage needs a codebook
+    /// (`SQ8`'s per-dimension min/scale, or RaBitQ's rotation) fitted on a corpus sample
+    /// *before* the first vector is encoded — `HNSWIndex::build`/`build_parallel` do that,
+    /// `HNSWIndex::new` does not. A `Collection` backed by an untrained quantized index
+    /// panics on its first insert, so this is rejected up front instead.
+    #[error(
+        "collection storage must be Storage::F32: {storage:?} requires a codebook trained on \
+         a corpus sample before any vector can be encoded, but a collection ingests documents \
+         incrementally and has no such sample at construction time. For quantized storage, \
+         build the index once via foxstash_core::index::HNSWIndex::build_parallel over the \
+         full corpus instead of through Collection::insert."
+    )]
+    UnsupportedIncrementalStorage { storage: Storage },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -92,6 +107,13 @@ pub struct DbConfig {
     pub hnsw: HNSWConfig,
     /// Incremental storage configuration.
     pub storage: IncrementalConfig,
+    /// BM25 scoring parameters for the keyword half of hybrid search.
+    ///
+    /// `BM25Config` was public, and `InvertedIndex::with_config` was public, and there was no path
+    /// between them: every construction site in `Collection` and `recovery` called
+    /// `InvertedIndex::new()`, so `k1` and `b` were unreachable from any public API. A knob you
+    /// cannot turn is not a knob. This field is the path.
+    pub bm25: BM25Config,
     /// Embedding dimensionality shared by every collection in this store.
     ///
     /// All documents inserted into any collection must have embeddings of
@@ -111,6 +133,7 @@ impl Default for DbConfig {
         Self {
             hnsw: HNSWConfig::default(),
             storage: IncrementalConfig::default(),
+            bm25: BM25Config::default(),
             embedding_dim: 384,
             auto_checkpoint: true,
             hybrid: HybridConfig::default(),

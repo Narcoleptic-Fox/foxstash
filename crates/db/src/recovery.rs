@@ -76,7 +76,7 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
 
     // Phase 3: Rebuild inverted index from live documents.
     let tokenizer = SimpleTokenizer::new();
-    let mut text_index = InvertedIndex::new();
+    let mut text_index = InvertedIndex::with_config(config.bm25.clone());
     for id in id_map.live_ids() {
         let pos = id_map.get(id).ok_or_else(|| {
             DbError::Recovery(format!("live ID '{id}' has no position in id_map"))

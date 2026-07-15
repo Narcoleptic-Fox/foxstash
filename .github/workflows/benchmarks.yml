@@ -9,7 +9,8 @@ name: Benchmarks
 #   1. Restore the baseline cache (results from the last push to main)
 #   2. Run benchmarks on the PR branch, saving results under the "pr-branch" label
 #   3. Run critcmp to compare "ci-baseline" vs "pr-branch" and post as a PR comment
-#   4. Fail the step (warning only) if any benchmark regressed by more than 10%
+#   4. Fail the job (hard fail, not just an annotation — see the "Fail on
+#      regressions" step) if any benchmark regressed by more than 10%
 #
 # Flow for main push:
 #   1. Run benchmarks and save results under the "ci-baseline" label
@@ -23,6 +24,17 @@ name: Benchmarks
 #
 # Hardware consistency: ubuntu-latest only. Mixing OS runners introduces
 # measurement noise that makes regression detection meaningless.
+#
+# Relationship to benchmark-gate.yml: this job and that one check different
+# things and both are worth keeping. This one catches op-level timing
+# regressions in vector_simd/quantization/embedding — e.g. losing a SIMD fast
+# path or adding an allocation to a hot loop — none of which move recall.
+# benchmark-gate.yml catches the opposite class: a graph that is fast, builds,
+# passes 247 unit tests, and returns wrong answers (RaBitQ at 1.1% recall,
+# BuildStrategy::Sequential panicking on all input). Neither subsumes the
+# other. If this job becomes a maintenance burden, narrow it rather than drop
+# it — timing regressions are real and recall-gate.yml has no visibility into
+# them at all.
 
 on:
   push:

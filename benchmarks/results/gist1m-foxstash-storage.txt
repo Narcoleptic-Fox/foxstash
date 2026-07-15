@@ -1,0 +1,33 @@
+gist1m — 1000000 base x 960d, 1000 queries, k=10, M=32/m0=64, ef_c=200
+exact control: 99.90%  PASS
+
+node block at 960d:  F32 4112 B   SQ8 1232 B   RaBitQ 400 B
+------------------------------------------------------------------------------
+
+=== F32 (control) ===  build 1141s, 4276 MB
+    ef   recall@10        QPS   dist/query   ns/dist
+    20      72.59%       2614         1591     240.4
+    50      86.97%       1358         2900     253.9
+   100      93.79%        789         4900     258.8
+   200      97.65%        446         8450     265.1
+   500      99.32%        209        17245     277.1
+
+=== SQ8 + rerank ===  build 1145s, 5236 MB
+    ef   recall@10        QPS   dist/query   ns/dist
+    20      73.24%       2485         1609     250.2
+    50      86.80%       1316         2910     261.1
+   100      93.75%        761         4907     267.7
+   200      97.67%        443         8458     266.6
+   500      99.45%        215        17266     268.8
+
+=== RaBitQ + rerank ===  build 1209s, 4404 MB
+    ef   recall@10        QPS   dist/query   ns/dist
+    20      61.49%       3928         1619     157.3
+    50      81.69%       2361         2952     143.5
+   100      90.97%       1452         4974     138.5
+   200      96.42%        842         8583     138.4
+   500      99.02%        410        17583     138.7
+
+Read this at MATCHED RECALL, not matched ef. And read `dist/query` next to `ns/dist`:
+they separate the two ways a mode can lose — doing more work (a coarse metric misleads
+the walk) from doing the same work more slowly (a worse kernel). QPS alone cannot.

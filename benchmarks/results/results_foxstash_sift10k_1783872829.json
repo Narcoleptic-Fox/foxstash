@@ -1,0 +1,162 @@
+[
+  {
+    "algorithm": "flat",
+    "build_time_sec": 1.529628196,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Brute force control (must be 100% recall)",
+    "parameters": {
+      "k": 10
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 1309.8110136559324,
+    "recall_at_10": 1.0,
+    "recall_at_100": 1.0
+  },
+  {
+    "algorithm": "hnsw-l2 (ef=100)",
+    "build_time_sec": 1.106580426,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Full precision, L2 metric. Directly comparable to faiss/hnswlib on SIFT's L2 ground truth.",
+    "parameters": {
+      "build": "parallel",
+      "ef_construction": 200,
+      "ef_search": 100,
+      "m": 32,
+      "metric": "L2"
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 8731.621138102202,
+    "recall_at_10": 0.9689016938209534,
+    "recall_at_100": 0.9258695840835571
+  },
+  {
+    "algorithm": "hnsw-l2 (ef=200)",
+    "build_time_sec": 1.101756904,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Full precision, L2 metric. Directly comparable to faiss/hnswlib on SIFT's L2 ground truth.",
+    "parameters": {
+      "build": "parallel",
+      "ef_construction": 200,
+      "ef_search": 200,
+      "m": 32,
+      "metric": "L2"
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 5463.758284819622,
+    "recall_at_10": 0.9959004521369934,
+    "recall_at_100": 0.9842449426651001
+  },
+  {
+    "algorithm": "hnsw-l2 (ef=500)",
+    "build_time_sec": 1.106180116,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Full precision, L2 metric. Directly comparable to faiss/hnswlib on SIFT's L2 ground truth.",
+    "parameters": {
+      "build": "parallel",
+      "ef_construction": 200,
+      "ef_search": 500,
+      "m": 32,
+      "metric": "L2"
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 2863.8697763129835,
+    "recall_at_10": 0.9994000196456909,
+    "recall_at_100": 0.9991794228553772
+  },
+  {
+    "algorithm": "hnsw-incremental",
+    "build_time_sec": 14.560095068,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Full precision (f32), cosine metric. recall_at_* are vs COSINE ground truth; recall_vs_l2_truth shows what it scores against SIFT's L2 key (metric mismatch, not an index defect).",
+    "parameters": {
+      "ef_construction": 200,
+      "ef_search": 100,
+      "m": 32,
+      "metric": "cosine",
+      "recall_vs_l2_truth": 0.5505008101463318
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 8405.958785802628,
+    "recall_at_10": 0.9765016436576843,
+    "recall_at_100": 0.9327498078346252
+  },
+  {
+    "algorithm": "hnsw-sequential",
+    "build_time_sec": 13.999555865,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Full precision (f32), cosine metric. recall_at_* are vs COSINE ground truth; recall_vs_l2_truth shows what it scores against SIFT's L2 key (metric mismatch, not an index defect).",
+    "parameters": {
+      "ef_construction": 200,
+      "ef_search": 100,
+      "m": 32,
+      "metric": "cosine",
+      "recall_vs_l2_truth": 0.5516007542610168
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 8992.045393859367,
+    "recall_at_10": 0.9768016338348389,
+    "recall_at_100": 0.9333901405334473
+  },
+  {
+    "algorithm": "hnsw-parallel",
+    "build_time_sec": 1.8839006569999999,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Full precision (f32), cosine metric. recall_at_* are vs COSINE ground truth; recall_vs_l2_truth shows what it scores against SIFT's L2 key (metric mismatch, not an index defect).",
+    "parameters": {
+      "ef_construction": 200,
+      "ef_search": 100,
+      "m": 32,
+      "metric": "cosine",
+      "recall_vs_l2_truth": 0.5494006872177124
+    },
+    "peak_memory_mb": 5.12,
+    "qps": 8605.004068015674,
+    "recall_at_10": 0.9756014943122864,
+    "recall_at_100": 0.9279993772506714
+  },
+  {
+    "algorithm": "sq8-hnsw",
+    "build_time_sec": 2.671826044,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "Scalar int8 quantization, asymmetric distance",
+    "parameters": {
+      "compression": "4x"
+    },
+    "peak_memory_mb": 2.28,
+    "qps": 11165.664313815552,
+    "recall_at_10": 0.71399986743927,
+    "recall_at_100": 0.7587788701057434
+  },
+  {
+    "algorithm": "rabitq-hnsw",
+    "build_time_sec": 17.226125934,
+    "dataset": "sift10k",
+    "index_size": 10000,
+    "library": "foxstash",
+    "notes": "1-bit RaBitQ first stage + exact rerank. Supersedes BinaryHNSW, which degenerates on non-negative data (1.1% recall@10 here).",
+    "parameters": {
+      "compression": "32x",
+      "rerank_pool": 100
+    },
+    "peak_memory_mb": 6.28,
+    "qps": 894.1404443581332,
+    "recall_at_10": 0.6253001093864441,
+    "recall_at_100": 0.532519519329071
+  }
+]

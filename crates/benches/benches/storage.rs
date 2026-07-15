@@ -36,7 +36,8 @@
 //! cargo bench -p foxstash-benches file_storage
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
 use foxstash_core::storage::file::{FlatIndexWrapper, HNSWIndexWrapper};

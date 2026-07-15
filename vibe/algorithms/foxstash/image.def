@@ -1,0 +1,27 @@
+Bootstrap: localimage
+From: base.sif
+
+%post
+  # base.sif (vibe/algorithms/base/image.def) provides build-essential, git, curl and the
+  # micromamba env with python/pip already active for %post in a derived build — see
+  # hnswlib/flatnav/svs's image.def, which all `pip install` directly with no re-activation
+  # step. It does NOT provide a Rust toolchain, which every other algorithm here is spared
+  # from needing.
+  export RUSTUP_HOME=/opt/rust
+  export CARGO_HOME=/opt/rust
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  export PATH="/opt/rust/bin:$PATH"
+
+  pip install --no-cache-dir maturin
+
+  # ASSUMPTION, not verified against a real tag: pins `main` because foxstash has no release
+  # tag as of writing. Replace with a pinned tag/commit before this image is built for a real
+  # benchmark run, the same way every other image.def here pins an exact version
+  # (hnswlib==0.8.0, flatnav==0.1.2, pyglass's commit hash) — floating on `main` would make
+  # results silently non-reproducible.
+  git clone --depth 1 --branch main https://github.com/Narcoleptic-Fox/foxstash.git /opt/foxstash
+
+  cd /opt/foxstash/crates/python
+  maturin build --release --interpreter python3 --out /tmp/foxstash-wheels
+  pip install --no-cache-dir /tmp/foxstash-wheels/foxstash-*.whl
+  rm -rf /opt/foxstash /tmp/foxstash-wheels /opt/rust

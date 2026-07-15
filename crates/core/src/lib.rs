@@ -46,6 +46,19 @@ pub enum RagError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Index not trained: {0}")]
+    NotTrained(String),
+
+    /// Raised when a caller asks a quantized index to rerank against full-precision vectors it
+    /// no longer has. `rerank_candidates: 0` *discards* the f32 vectors at build time — that is
+    /// the point of it, and the smallest index foxstash can build — so the pool cannot be
+    /// raised afterwards. See [`index::HNSWIndex::set_rerank_candidates`].
+    #[error(
+        "cannot rerank: this index was built with rerank_candidates = 0, which drops the \
+         full-precision vectors. Rebuild with rerank_candidates > 0 to enable reranking."
+    )]
+    FullPrecisionDropped,
 }
 
 /// Document with embedding
@@ -64,30 +77,6 @@ pub struct SearchResult {
     pub content: String,
     pub score: f32,
     pub metadata: Option<serde_json::Value>,
-}
-
-/// Configuration for RAG system
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RagConfig {
-    pub embedding_dim: usize,
-    pub max_documents: usize,
-    pub index_type: IndexType,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub enum IndexType {
-    Flat,
-    HNSW,
-}
-
-impl Default for RagConfig {
-    fn default() -> Self {
-        Self {
-            embedding_dim: 384, // MiniLM-L6-v2
-            max_documents: 10_000,
-            index_type: IndexType::HNSW,
-        }
-    }
 }
 
 // Re-export commonly used items

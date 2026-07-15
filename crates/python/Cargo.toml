@@ -1,18 +1,22 @@
 [package]
 name = "foxstash-python"
-version = "0.3.1"
-edition = "2021"
-description = "Python bindings for Foxstash vector search"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Python bindings (PyO3) for the foxstash HNSW index, for ANN benchmark harnesses such as VIBE"
+repository = "https://github.com/Narcoleptic-Fox/foxstash"
+license = "MIT"
+publish = false
 
+# Importable as `import foxstash` regardless of the crate's cargo name.
 [lib]
 name = "foxstash"
 crate-type = ["cdylib"]
 
 [dependencies]
 foxstash-core = { path = "../core" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
-numpy = "0.22"
-
-[features]
-default = []
+# abi3-py39: one compiled wheel works on any CPython >= 3.9, which is what makes a single
+# `maturin build` produce something installable across the range of interpreters a benchmark
+# harness might run under, at the cost of not exposing anything Python-version-specific.
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+numpy = "0.29"

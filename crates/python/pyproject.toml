@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "foxstash"
+version = "0.5.0"
+description = "Python bindings for the foxstash HNSW vector index"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = ["numpy>=1.21"]
+
+[tool.maturin]
+# Builds the crate whose Cargo.toml is a sibling of this file (the workspace member
+# `foxstash-python`, [lib] name "foxstash") rather than requiring a separate
+# python-source/ layout.
+features = ["pyo3/extension-module"]
+module-name = "foxstash"

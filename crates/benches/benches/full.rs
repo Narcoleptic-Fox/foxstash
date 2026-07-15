@@ -26,7 +26,8 @@
 //! cargo bench -p foxstash-benches --bench full -- storage
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::index::{FlatIndex, HNSWConfig, HNSWIndex};
 use foxstash_core::storage::{Codec, FileStorage};
 use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};

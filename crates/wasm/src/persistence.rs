@@ -31,6 +31,7 @@
 //! await store.clear();
 //! ```
 
+use foxstash_core::index::hnsw::{DistanceMetric, Storage};
 use foxstash_core::Document;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -75,6 +76,26 @@ pub struct SerializedHNSWConfig {
     pub extend_candidates: bool,
     #[serde(default = "default_keep_pruned")]
     pub keep_pruned_connections: bool,
+
+    // These four were MISSING, and their absence was silent. A round-trip through
+    // `to_json`/`from_json` rebuilt the index from `HNSWConfig::default()`, so an index saved with
+    // `Storage::SQ8` under `L2` came back as F32 under Cosine -- different metric, different
+    // storage, no error, no warning, wrong answers.
+    //
+    // `storage/file.rs` had the identical bug with `seed` and fixed it; the fix never reached
+    // here, because this is a second implementation of the same serialization. That is the whole
+    // bug class: one copy patched, the other silently not.
+    //
+    // `#[serde(default)]` on each, so blobs written before this commit still load -- they simply
+    // carry the defaults they were effectively already getting.
+    #[serde(default)]
+    pub metric: DistanceMetric,
+    #[serde(default)]
+    pub storage: Storage,
+    #[serde(default)]
+    pub rerank_candidates: usize,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 fn default_use_heuristic() -> bool {
@@ -535,36 +556,6 @@ pub fn create_flat_index(embedding_dim: usize, documents: Vec<Document>) -> Seri
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Creates a SerializedIndex from HNSW index components
-pub fn create_hnsw_index(
-    embedding_dim: usize,
-    m: usize,
-    m0: usize,
-    ef_construction: usize,
-    ef_search: usize,
-    ml: f32,
-    nodes: Vec<SerializedHNSWNode>,
-    entry_point: Option<usize>,
-    max_layer: usize,
-) -> SerializedIndex {
-    SerializedIndex::Hnsw(SerializedHNSWIndex {
-        embedding_dim,
-        config: SerializedHNSWConfig {
-            m,
-            m0,
-            ef_construction,
-            ef_search,
-            ml,
-            use_heuristic: true,
-            extend_candidates: false,
-            keep_pruned_connections: true,
-        },
-        nodes,
-        entry_point,
-        max_layer,
-    })
-}
 
 /// Serializes a FlatIndex to SerializedFlatIndex
 pub fn serialize_flat_index(
@@ -611,6 +602,10 @@ pub fn serialize_hnsw_index(
             use_heuristic: config.use_heuristic,
             extend_candidates: config.extend_candidates,
             keep_pruned_connections: config.keep_pruned_connections,
+            metric: config.metric,
+            storage: config.storage,
+            rerank_candidates: config.rerank_candidates,
+            seed: config.seed,
         },
         nodes,
         entry_point: index.entry_point(),
@@ -636,7 +631,7 @@ pub fn deserialize_hnsw_index(
     data: SerializedHNSWIndex,
 ) -> Result<foxstash_core::index::HNSWIndex, String> {
     use foxstash_core::index::HNSWConfig;
-    use foxstash_core::Document;
+use foxstash_core::Document;
 
     if data.config.m == 0 || data.config.m > 127 {
         return Err(format!(
@@ -663,10 +658,36 @@ pub fn deserialize_hnsw_index(
     }
     config.keep_pruned_connections = data.config.keep_pruned_connections;
 
+    // AFTER `with_m`, which recomputes `m0 = m * 2` and `ml = 1 / ln(m)` and would otherwise
+    // discard both. They were serialized, read back, and then overwritten -- write-only fields.
+    config.m0 = data.config.m0;
+    config.ml = data.config.ml;
+
+    config.metric = data.config.metric;
+    config.storage = data.config.storage;
+    config.rerank_candidates = data.config.rerank_candidates;
+    config.seed = data.config.seed;
+
     let mut index = foxstash_core::index::HNSWIndex::new(data.embedding_dim, config);
 
-    // Re-add all documents from nodes
-    // This rebuilds the HNSW graph rather than restoring it exactly
+    // Fit the codebook BEFORE re-adding anything.
+    //
+    // Under `Storage::SQ8` or `Storage::RaBitQ`, `add()` needs a trained codebook to encode a
+    // vector, and a freshly `new()`-ed index has none -- so this loop used to fail outright on any
+    // quantized index. It never surfaced, because `storage` was not serialized at all (see
+    // `every_config_field_survives_the_round_trip`): every index came back as F32, which needs no
+    // codebook. WASM HAS THEREFORE NEVER BEEN ABLE TO RESTORE A QUANTIZED INDEX, and the config
+    // bug was what hid it. Fixing the leak is what made this one fail loudly enough to find.
+    //
+    // The codebook is refitted from the restored corpus rather than serialized. It is a
+    // deterministic function of the vectors (SQ8: per-dimension min/scale; RaBitQ: corpus centroid
+    // plus a seeded rotation), so refitting reproduces it, at the cost of one pass over the data.
+    let embeddings: Vec<Vec<f32>> = data.nodes.iter().map(|n| n.embedding.clone()).collect();
+    if !embeddings.is_empty() {
+        index.train(&embeddings).map_err(|e| e.to_string())?;
+    }
+
+    // Re-add all documents. This rebuilds the HNSW graph rather than restoring it exactly.
     for node in &data.nodes {
         let doc = Document {
             id: node.id.clone(),
@@ -687,6 +708,70 @@ pub fn deserialize_hnsw_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every field of `HNSWConfig` must survive a save/load round-trip.
+    ///
+    /// Four of them did not, and the loss was silent. `SerializedHNSWConfig` had no `metric`, no
+    /// `storage`, no `rerank_candidates` and no `seed`, and `deserialize_hnsw_index` rebuilt from
+    /// `HNSWConfig::default()` -- so an index saved as SQ8-under-L2 came back as F32-under-Cosine.
+    /// No error. No warning. Different distances, wrong answers, and nothing to indicate why.
+    ///
+    /// Two more were write-only: `m0` and `ml` were serialized, read back, and then discarded by
+    /// `with_m`, which recomputes both from `m`.
+    ///
+    /// `storage/file.rs` had this exact bug with `seed`, fixed it, and left a comment about it.
+    /// The fix never arrived here because this is a SECOND implementation of the same
+    /// serialization. One copy patched, the other silently not -- the bug class in one sentence.
+    ///
+    /// Asserts field by field, deliberately: a test that only checked "it loads" is what let this
+    /// survive, since a wrong-but-valid config loads perfectly well.
+    #[test]
+    fn every_config_field_survives_the_round_trip() {
+        use foxstash_core::index::hnsw::{BuildStrategy, HNSWConfig, HNSWIndex};
+
+        // Deliberately NON-DEFAULT in every field, so that "we silently fell back to the default"
+        // is distinguishable from "we round-tripped correctly". A fixture equal to the default
+        // cannot tell those apart, which is exactly how this shipped.
+        let config = HNSWConfig {
+            metric: DistanceMetric::L2,          // default is Cosine
+            m: 12,
+            m0: 40,                              // NOT m * 2, so `with_m` overwriting it is caught
+            ef_construction: 111,
+            ef_search: 77,
+            ml: 0.9,                             // NOT 1/ln(m)
+            use_heuristic: false,                // default is true
+            extend_candidates: true,             // default is false
+            keep_pruned_connections: false,      // default is true
+            storage: Storage::SQ8,               // default is F32
+            rerank_candidates: 33,               // default is 0
+            seed: Some(4242),                    // default is None
+            build_strategy: BuildStrategy::Sequential,
+        };
+
+        let base: Vec<Vec<f32>> = (0..60)
+            .map(|i| (0..8).map(|d| ((i * 3 + d) % 17) as f32 * 0.25).collect())
+            .collect();
+        // via `build`, which trains the SQ8 codebook from the corpus. (`new` + `add_embedding`
+        // correctly refuses under a quantized storage until `train` has run.)
+        let index = HNSWIndex::build(base.clone(), config.clone());
+
+        let blob = serialize_hnsw_index(&index, 8).expect("serialize");
+        let restored = deserialize_hnsw_index(blob).expect("deserialize");
+        let got = restored.config();
+
+        assert_eq!(got.metric, config.metric, "metric was lost in the round-trip");
+        assert_eq!(got.storage, config.storage, "storage was lost -- the index changed quantization mode");
+        assert_eq!(got.rerank_candidates, config.rerank_candidates, "rerank_candidates was lost");
+        assert_eq!(got.seed, config.seed, "seed was lost -- reproducibility silently gone");
+        assert_eq!(got.m0, config.m0, "m0 was overwritten by with_m's `m * 2`");
+        assert_eq!(got.ml, config.ml, "ml was overwritten by with_m's `1 / ln(m)`");
+        assert_eq!(got.m, config.m);
+        assert_eq!(got.ef_construction, config.ef_construction);
+        assert_eq!(got.ef_search, config.ef_search);
+        assert_eq!(got.use_heuristic, config.use_heuristic);
+        assert_eq!(got.extend_candidates, config.extend_candidates);
+        assert_eq!(got.keep_pruned_connections, config.keep_pruned_connections);
+    }
 
     #[test]
     fn test_create_flat_index() {
@@ -753,6 +838,10 @@ mod tests {
                 use_heuristic: true,
                 extend_candidates: false,
                 keep_pruned_connections: true,
+                metric: DistanceMetric::Cosine,
+                storage: Storage::F32,
+                rerank_candidates: 0,
+                seed: None,
             },
             nodes: vec![],
             entry_point: None,
@@ -778,6 +867,10 @@ mod tests {
                 use_heuristic: true,
                 extend_candidates: false,
                 keep_pruned_connections: true,
+                metric: DistanceMetric::Cosine,
+                storage: Storage::F32,
+                rerank_candidates: 0,
+                seed: None,
             },
             nodes: vec![SerializedHNSWNode {
                 id: "doc1".to_string(),

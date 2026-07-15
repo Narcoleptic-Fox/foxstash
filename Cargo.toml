@@ -4,6 +4,7 @@ members = [
     "crates/db",
     "crates/wasm",
     "crates/native",
+    "crates/python",
     "crates/benches",
 ]
 resolver = "2"

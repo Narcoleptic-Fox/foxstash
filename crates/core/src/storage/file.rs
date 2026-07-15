@@ -975,6 +975,16 @@ pub struct HNSWIndexWrapper {
 /// Serializable wrapper for HNSWConfig
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HNSWConfigWrapper {
+    /// Absent in indexes written before the metric was configurable; those were all
+    /// cosine, which is what `DistanceMetric::default()` yields — so they load correctly.
+    #[serde(default)]
+    pub metric: crate::index::hnsw::DistanceMetric,
+    /// Absent from indexes persisted before this field existed; `serde(default)` gives them
+    /// `Storage::F32`, which is what they were.
+    #[serde(default)]
+    pub storage: crate::index::hnsw::Storage,
+    #[serde(default = "default_rerank_candidates")]
+    pub rerank_candidates: usize,
     pub m: usize,
     pub m0: usize,
     pub ef_construction: usize,
@@ -986,6 +996,15 @@ pub struct HNSWConfigWrapper {
     pub extend_candidates: bool,
     #[serde(default = "default_keep_pruned")]
     pub keep_pruned_connections: bool,
+    /// Absent from indexes persisted before this field existed; `serde(default)` gives them
+    /// `None`, which is what they had.
+    ///
+    /// This used to be dropped on deserialize — hardcoded to `None` no matter what was
+    /// written. `seed` drives `random_level()` on every `add()`, so a reloaded index assigned
+    /// its nodes to *different layers* than the original: a save/load round-trip silently
+    /// destroyed reproducibility for anyone who had explicitly asked for it.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 fn default_use_heuristic() -> bool {
@@ -1006,13 +1025,22 @@ impl From<&crate::index::HNSWConfig> for HNSWConfigWrapper {
             use_heuristic: config.use_heuristic,
             extend_candidates: config.extend_candidates,
             keep_pruned_connections: config.keep_pruned_connections,
+            metric: config.metric,
+            storage: config.storage,
+            rerank_candidates: config.rerank_candidates,
+            seed: config.seed,
         }
     }
+}
+
+fn default_rerank_candidates() -> usize {
+    100
 }
 
 impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
     fn from(wrapper: HNSWConfigWrapper) -> Self {
         Self {
+            metric: wrapper.metric,
             m: wrapper.m,
             m0: wrapper.m0,
             ef_construction: wrapper.ef_construction,
@@ -1021,8 +1049,16 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             use_heuristic: wrapper.use_heuristic,
             extend_candidates: wrapper.extend_candidates,
             keep_pruned_connections: wrapper.keep_pruned_connections,
+            storage: wrapper.storage,
+            rerank_candidates: wrapper.rerank_candidates,
+            seed: wrapper.seed,
+            // NOT persisted, and that is deliberate rather than an oversight: `to_index`
+            // rebuilds the graph by looping `add()`, which never consults `build_strategy`.
+            // Persisting it would record a value that had no bearing on the index being
+            // loaded. (`seed` above IS persisted — it drives `random_level()` on every
+            // `add()`, so dropping it silently changed which layer each node landed on and
+            // destroyed reproducibility across a save/load.)
             build_strategy: crate::index::BuildStrategy::default(),
-            seed: None,
         }
     }
 }
@@ -1040,7 +1076,25 @@ impl HNSWIndexWrapper {
     /// Convert wrapper to HNSWIndex
     pub fn to_index(&self) -> Result<crate::index::HNSWIndex> {
         let config: crate::index::HNSWConfig = self.config.clone().into();
+        let quantized = config.storage != crate::index::Storage::F32;
         let mut index = crate::index::HNSWIndex::new(self.embedding_dim, config);
+
+        // A quantized storage mode cannot encode a vector before it knows the data
+        // distribution, so `add()` on an untrained index is an error. `new()` does not train —
+        // only `build`/`build_parallel` do, and this path uses neither. So a `Storage::SQ8`
+        // index could be *saved* and never *loaded*: reload used to panic, and after the
+        // `train()` contract landed it returned `NotTrained` instead. Round-tripping quantized
+        // storage has in fact never worked, and nothing tested it.
+        //
+        // The corpus we are about to insert IS the training sample, so fit the codebook from
+        // it first. Skipped entirely for F32 — `train()` is a no-op there, and the clone is
+        // not free.
+        if quantized {
+            let sample: Vec<Vec<f32>> =
+                self.documents.iter().map(|d| d.embedding.clone()).collect();
+            index.train(&sample)?;
+        }
+
         for doc in &self.documents {
             index.add(doc.clone())?;
         }
@@ -1427,6 +1481,119 @@ mod tests {
         let query = vec![0.1, 0.2, 0.3, 0.4, 0.5];
         let results = restored.search(&query, 2).unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn quantized_index_survives_a_save_load_roundtrip() {
+        // An SQ8 index could be saved and never loaded. `to_index()` rebuilds by calling
+        // `HNSWIndex::new()` (which does not fit a codebook) and then looping `add()` — which
+        // for quantized storage panicked, and later returned `NotTrained`. The round-trip has
+        // never worked, and the existing roundtrip test used the default F32 storage, so it
+        // could not fail on this.
+        //
+        // Asserting `len()` and "search returns 2 results" is NOT enough here: a reload that
+        // silently reinterpreted 8-bit codes as f32 would still return the right *count* of
+        // results, all of them wrong.
+        //
+        // This used to assert the restored index returns the exact SAME top-5 IDs, in the same
+        // order, as the original. That is the wrong property: `to_index()` rebuilds the graph
+        // via `train()` + a loop of `add()` (`insert_node`, quantized distances mid-construction),
+        // while the original was built via `build()` (exact-f32 construction). Those are two
+        // legitimately different HNSW graphs, and near-tie candidates can — and did, observed
+        // directly — swap order between them with no bug involved. The property that actually
+        // matters, and that a genuinely broken round-trip (wrong codebook, reinterpreted bytes)
+        // cannot pass, is recall against brute-force ground truth on HELD-OUT queries.
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+        let dim = 16;
+        let mut rng = StdRng::seed_from_u64(77);
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 10.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..200)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..30)
+            .map(|i| {
+                let c = &centers[i % 8];
+                c.iter().map(|x| x + rng.random::<f32>() * 0.5).collect()
+            })
+            .collect();
+        let docs: Vec<Document> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Document {
+                id: i.to_string(),
+                content: String::new(),
+                embedding: v.clone(),
+                metadata: None,
+            })
+            .collect();
+
+        let index = crate::index::HNSWIndex::build(
+            docs.iter().map(|d| d.embedding.clone()).collect(),
+            crate::index::HNSWConfig {
+                storage: crate::index::Storage::SQ8,
+                rerank_candidates: 100,
+                metric: crate::index::DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+
+        let wrapper = HNSWIndexWrapper::from_index(&index);
+        let restored = wrapper
+            .to_index()
+            .expect("a quantized index must survive a save/load roundtrip");
+
+        assert_eq!(restored.len(), index.len());
+        assert_eq!(
+            restored.config().storage,
+            crate::index::Storage::SQ8,
+            "storage mode must persist — reloading SQ8 as F32 would reinterpret 8-bit codes \
+             as f32 and return garbage"
+        );
+
+        let k = 10;
+        let mut total_recall = 0.0f32;
+        for q in &queries {
+            let mut exact: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = v.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum();
+                    (d, i)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: std::collections::HashSet<usize> =
+                exact.iter().take(k).map(|(_, i)| *i).collect();
+
+            let got: std::collections::HashSet<usize> = restored
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+
+            total_recall += truth.intersection(&got).count() as f32 / k as f32;
+        }
+        let recall = total_recall / queries.len() as f32;
+
+        // Measured on this exact seed/config: 100%, stable across repeated runs (unlike the
+        // exact-order assertion this replaced). The floor is set well below that for margin,
+        // not at the measurement. Verified discriminating: temporarily disabling the
+        // `train()` call in `to_index()` (above) makes this test fail outright — `to_index()`
+        // returns `Err(NotTrained(_))`, which the `.expect()` a few lines up panics on, before
+        // this assertion is ever reached.
+        assert!(
+            recall > 0.7,
+            "restored SQ8 index recall@{k} against brute-force ground truth = {:.1}% — \
+             the save/load roundtrip corrupted the codebook or the codes",
+            recall * 100.0
+        );
     }
 
     #[test]

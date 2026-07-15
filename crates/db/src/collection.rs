@@ -11,7 +11,6 @@ use crate::inverted_index::InvertedIndex;
 use crate::recovery;
 use crate::tokenizer::{SimpleTokenizer, Tokenizer};
 use crate::{DbConfig, DbError, Result};
-use foxstash_core::index::hnsw::SearchContext;
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::storage::incremental::{IncrementalStorage, IndexMetadata};
 use foxstash_core::{Document, SearchResult};
@@ -43,6 +42,8 @@ pub struct Collection {
 impl Collection {
     /// Open or create a collection at the given path.
     pub fn open(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
+        Self::reject_incremental_quantized_storage(&config)?;
+
         let storage =
             IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
@@ -75,6 +76,8 @@ impl Collection {
     /// Returns an error if the path already contains checkpoint or WAL data.
     /// Use [`open`](Self::open) to recover an existing collection.
     pub fn create(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
+        Self::reject_incremental_quantized_storage(&config)?;
+
         // Guard: refuse to create over existing data.
         if path.join("manifest.json").exists() {
             return Err(DbError::Validation(format!(
@@ -92,7 +95,7 @@ impl Collection {
                 index: HNSWIndex::new(config.embedding_dim, config.hnsw.clone()),
                 id_map: IdMap::new(),
                 documents: Vec::new(),
-                text_index: InvertedIndex::new(),
+                text_index: InvertedIndex::with_config(config.bm25.clone()),
                 tokenizer: SimpleTokenizer::new(),
             }),
             config,
@@ -249,7 +252,7 @@ impl Collection {
                 let fetch = self.unfiltered_fetch_count(&inner, k);
                 let raw_batch = inner
                     .index
-                    .search_batch_fast(queries, fetch)
+                    .search_batch(queries, fetch)
                     .map_err(DbError::Core)?;
 
                 Ok(raw_batch
@@ -264,49 +267,6 @@ impl Collection {
             }
             Some(filter) => self.search_batch_filtered_impl(&inner, queries, k, filter),
         }
-    }
-
-    /// Create a reusable search context for repeated unfiltered searches.
-    pub fn create_search_context(&self) -> SearchContext {
-        self.inner.read().index.create_search_context()
-    }
-
-    /// Search with a reusable context (unfiltered).
-    ///
-    /// Use this in tight query loops to reduce allocation overhead.
-    pub fn search_with_context(
-        &self,
-        query: &[f32],
-        k: usize,
-        ctx: &mut SearchContext,
-    ) -> Result<Vec<SearchResult>> {
-        if query.len() != self.config.embedding_dim {
-            return Err(DbError::DimensionMismatch {
-                expected: self.config.embedding_dim,
-                actual: query.len(),
-            });
-        }
-
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-
-        let inner = self.inner.read();
-        if inner.index.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let fetch = self.unfiltered_fetch_count(&inner, k);
-        let raw = inner
-            .index
-            .search_with_context(query, fetch, ctx)
-            .map_err(DbError::Core)?;
-
-        Ok(raw
-            .into_iter()
-            .filter(|r| inner.id_map.is_live(&r.id))
-            .take(k)
-            .collect())
     }
 
     /// Get a document by ID.
@@ -339,7 +299,7 @@ impl Collection {
 
         let mut new_index = HNSWIndex::new(self.config.embedding_dim, self.config.hnsw.clone());
         let mut new_id_map = IdMap::new();
-        let mut new_text_index = InvertedIndex::new();
+        let mut new_text_index = InvertedIndex::with_config(self.config.bm25.clone());
 
         for doc in &live_docs {
             new_index.add(doc.clone()).map_err(DbError::Core)?;
@@ -469,8 +429,12 @@ impl Collection {
             return Ok(Vec::new());
         }
 
-        let default_config = HybridConfig::default();
-        let config = config.unwrap_or(&default_config);
+        // Fall back to the collection's CONFIGURED hybrid settings, not a fresh default. This
+        // used to build a throwaway `HybridConfig::default()` and defer to that, which made
+        // `DbConfig::hybrid` — a public field with a public `with_hybrid()` builder — dead:
+        // nothing in the workspace ever read it. A caller who configured custom weights and
+        // then made the documented call (`search_hybrid(.., None)`) silently got the defaults.
+        let config = config.unwrap_or(&self.config.hybrid);
 
         let inner = self.inner.read();
 
@@ -544,6 +508,34 @@ impl Collection {
 
     // ── private helpers ─────────────────────────────────────────────
 
+    /// Reject configs whose HNSW storage needs a codebook that `Collection` cannot supply.
+    ///
+    /// `Storage::SQ8` and `Storage::RaBitQ` both require a codebook fitted on a corpus
+    /// sample before the first vector is encoded — `HNSWIndex::build`/`build_parallel` fit
+    /// it up front from the whole corpus; `HNSWIndex::new` (what `Collection` uses, since it
+    /// ingests one document at a time via `insert`) leaves it empty. Encoding the first
+    /// vector against an empty codebook panics (`hnsw.rs`: `q_scale[d]` / `q_min[d]` index
+    /// out of bounds for SQ8, or an explicit `.expect()` for RaBitQ) — this turns that panic
+    /// into a constructor-time `Err` instead.
+    ///
+    /// Called from both `create` and `open`, before either touches the filesystem, so a bad
+    /// config fails immediately with no partial state left behind. `config.hnsw` is never
+    /// mutated after construction (it isn't exposed), so a `Collection` that passes this
+    /// check can never end up with quantized storage later — including in `compact()`, which
+    /// rebuilds the index via this same `HNSWIndex::new` path.
+    ///
+    /// TODO: once `HNSWIndex::train(&mut self, sample)` lands (fits a codebook from a
+    /// calibration sample instead of requiring the full corpus up front), `Collection` can
+    /// train from an initial batch and this restriction can be lifted for that case.
+    fn reject_incremental_quantized_storage(config: &DbConfig) -> Result<()> {
+        if config.hnsw.storage != foxstash_core::index::Storage::F32 {
+            return Err(DbError::UnsupportedIncrementalStorage {
+                storage: config.hnsw.storage,
+            });
+        }
+        Ok(())
+    }
+
     #[inline]
     fn unfiltered_fetch_count(&self, inner: &CollectionInner, k: usize) -> usize {
         k.saturating_add(inner.id_map.tombstone_count())
@@ -605,7 +597,7 @@ impl Collection {
 
             let raw_batch = inner
                 .index
-                .search_batch_fast(&pending_queries, fetch)
+                .search_batch(&pending_queries, fetch)
                 .map_err(DbError::Core)?;
 
             let mut next_pending = Vec::new();
@@ -756,6 +748,58 @@ mod tests {
         col.insert("a".into(), "hello".into(), vec![1.0, 0.0, 0.0, 0.0], None)
             .unwrap();
         assert_eq!(col.len(), 1);
+    }
+
+    // Reproduces https://github.com/foxstash/foxstash (internal): a Collection configured
+    // with Storage::SQ8 used to panic on its first insert (HNSWIndex::new leaves the SQ8
+    // codebook untrained; push_node indexes into it unconditionally). Confirmed via
+    // `cargo test -p foxstash-db repro_sq8_storage_panics_on_insert -- --nocapture` before
+    // the guard existed:
+    //   thread '...' panicked at crates/core/src/index/hnsw.rs:978:41:
+    //   index out of bounds: the len is 0 but the index is 0
+    // `Collection::create`/`open` now reject non-F32 storage up front, so this asserts the
+    // clean `Err` instead.
+    #[test]
+    fn sq8_storage_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hnsw.storage = foxstash_core::index::Storage::SQ8;
+
+        match Collection::create("test", dir.path(), config) {
+            Err(DbError::UnsupportedIncrementalStorage {
+                storage: foxstash_core::index::Storage::SQ8,
+            }) => {}
+            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
+        }
+    }
+
+    #[test]
+    fn rabitq_storage_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hnsw.storage = foxstash_core::index::Storage::RaBitQ;
+
+        match Collection::create("test", dir.path(), config) {
+            Err(DbError::UnsupportedIncrementalStorage {
+                storage: foxstash_core::index::Storage::RaBitQ,
+            }) => {}
+            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
+        }
+    }
+
+    #[test]
+    fn sq8_storage_rejected_at_open() {
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hnsw.storage = foxstash_core::index::Storage::SQ8;
+
+        match Collection::open("test", dir.path(), config) {
+            Err(DbError::UnsupportedIncrementalStorage { .. }) => {}
+            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
+        }
     }
 
     #[test]
@@ -1092,6 +1136,181 @@ mod tests {
         assert_eq!(results.len(), 3);
         // "both" appears in both signals → should be ranked first.
         assert_eq!(results[0].id, "both");
+    }
+
+    // `DbConfig::hybrid` was dead code. `search_hybrid` built a throwaway
+    // `HybridConfig::default()` and deferred to *that*, so the collection's configured merge
+    // settings were silently discarded on the documented call. `with_hybrid()` was a public
+    // builder wired to nothing — `grep -rn 'config\.hybrid' crates/` returned zero hits, and
+    // no test called it. Same shape as every other bug this repo has shipped: a public knob
+    // whose tests exercise it without being able to tell whether it does anything.
+    //
+    // The fixture is chosen to DISCRIMINATE. The two strategies put the top score two orders
+    // of magnitude apart: `WeightedSum` with `vector_weight = 1.0` min-max normalizes the best
+    // vector hit to exactly 1.0, while the default `Rrf` scores it 0.7/(60 + 0 + 1) ≈ 0.0115.
+    // The first assertion below proves that gap is real on THIS data before the second one
+    // relies on it — otherwise the test would be as vacuous as the ones it replaces.
+    /// `DbConfig::bm25` must actually reach the `InvertedIndex`.
+    ///
+    /// `BM25Config` was public and `InvertedIndex::with_config` was public and NOTHING CONNECTED
+    /// THEM: every construction site -- `Collection::create`, `Collection::compact`,
+    /// `recovery::recover` -- called `InvertedIndex::new()`, so `k1` and `b` were unreachable from
+    /// any public API. Same shape as `DbConfig::hybrid`, which was dead for a release, and same
+    /// shape as four options the parallel index builder ignored. A knob you cannot turn is not a
+    /// knob, and its passing test (`with_config` round-trips a struct) could never say so.
+    ///
+    /// Discriminates on `k1`, the term-frequency saturation parameter. At `k1 = 0` BM25 ignores
+    /// term frequency entirely -- a document containing a term ten times scores exactly as a
+    /// document containing it once. At a high `k1` the repetition is rewarded. So the same corpus
+    /// and the same query must produce a different ranking, and if they do not, the config never
+    /// arrived.
+    #[test]
+    fn a_collections_configured_bm25_config_reaches_the_text_index() {
+        let scores_with = |k1: f32| -> Vec<(String, f32)> {
+            let dir = TempDir::new().unwrap();
+            let mut config = cfg(3);
+            config.bm25 = crate::inverted_index::BM25Config { k1, b: 0.75 };
+            let col = Collection::create("test", dir.path(), config).unwrap();
+
+            // `rare` appears once in `once` and five times in `often`. Under k1 = 0 the two are
+            // indistinguishable to BM25; under a large k1, `often` pulls ahead.
+            col.insert("once".into(), "rare filler filler filler filler".into(),
+                       vec![1.0, 0.0, 0.0], None).unwrap();
+            col.insert("often".into(), "rare rare rare rare rare".into(),
+                       vec![1.0, 0.0, 0.0], None).unwrap();
+
+            let hits = col.search_text("rare", 2, None).unwrap();
+            hits.into_iter().map(|h| (h.id, h.score)).collect()
+        };
+
+        let flat = scores_with(0.0);
+        let saturating = scores_with(4.0);
+
+        let get = |v: &[(String, f32)], id: &str| -> f32 {
+            v.iter().find(|(i, _)| i == id).map(|(_, s)| *s).unwrap()
+        };
+
+        // Control: the fixture discriminates. With k1 = 0, term frequency is ignored, so the
+        // doc containing `rare` five times must score the SAME as the one containing it once.
+        // If this control fails the fixture is not exercising k1 at all and the assertion below
+        // would be meaningless.
+        assert!(
+            (get(&flat, "once") - get(&flat, "often")).abs() < 1e-4,
+            "control failed: at k1 = 0, BM25 must ignore term frequency, so `once` ({:.4}) and \
+             `often` ({:.4}) should score identically. They do not, so this fixture is not \
+             measuring k1 and the real assertion below proves nothing.",
+            get(&flat, "once"), get(&flat, "often")
+        );
+
+        // The real assertion: raising k1 must reward the repeated term.
+        assert!(
+            get(&saturating, "often") > get(&saturating, "once") * 1.2,
+            "at k1 = 4.0 the document repeating `rare` five times ({:.4}) must outscore the one \
+             containing it once ({:.4}). It does not, so `DbConfig::bm25` never reached the \
+             InvertedIndex -- it is going into the struct and quietly nowhere.",
+            get(&saturating, "often"), get(&saturating, "once")
+        );
+    }
+
+    #[test]
+    fn a_collections_configured_hybrid_config_is_used_when_none_is_passed() {
+        let weighted = HybridConfig::default()
+            .with_strategy(crate::hybrid::MergeStrategy::WeightedSum)
+            .with_weights(1.0, 0.0);
+
+        let dir = TempDir::new().unwrap();
+        let mut config = cfg(3);
+        config.hybrid = weighted.clone();
+        let col = Collection::create("test", dir.path(), config).unwrap();
+
+        col.insert("a".into(), "gateway service".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        col.insert("b".into(), "gateway timeout".into(), vec![0.0, 0.0, 1.0], None)
+            .unwrap();
+
+        // Control: the fixture discriminates. Forcing the DEFAULT (Rrf) via an explicit
+        // override must score the top hit far below what WeightedSum gives it. If this fails,
+        // the two configs are indistinguishable here and the real assertion proves nothing.
+        let rrf = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, Some(&HybridConfig::default()))
+            .unwrap();
+        assert!(
+            rrf[0].score < 0.1,
+            "fixture does not discriminate: Rrf top score {} is not clearly below WeightedSum's 1.0",
+            rrf[0].score
+        );
+
+        // The real assertion: passing `None` must use the COLLECTION's config (WeightedSum),
+        // not a fresh default. Before the fix this returned the ~0.0115 Rrf score above.
+        let got = col
+            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, None)
+            .unwrap();
+        assert!(
+            got[0].score > 0.9,
+            "search_hybrid(.., None) ignored the collection's configured HybridConfig: \
+             top score {} looks like Rrf, not WeightedSum",
+            got[0].score
+        );
+    }
+
+    // `DbConfig.auto_checkpoint`, flagged VACUOUS in the public-option audit: the only prior
+    // test, `concurrent_inserts_with_auto_checkpoint_persist_after_reopen`, calls `col.flush()`
+    // before dropping the collection and then reopens it — WAL replay on reopen recovers every
+    // document regardless of whether any checkpoint ever fired, so that test cannot distinguish
+    // "checkpoint fired automatically" from "checkpoint never fired, WAL replay did all the
+    // work". This test never calls `flush()` or reopens: it checks for a checkpoint FILE on disk
+    // immediately after a single insert, which only `maybe_auto_checkpoint_locked` can produce.
+    //
+    // NOT COMPILED — the team lead will compile and sabotage-verify this directly.
+    //
+    // Sabotage this catches: hardcode `maybe_auto_checkpoint_locked` to always return early (as
+    // if `auto_checkpoint` were always `false`) — the `true` config below would then also leave
+    // no `checkpoint_*.bin` file on disk after the insert.
+    #[test]
+    fn auto_checkpoint_true_writes_a_checkpoint_file_without_flush_or_reopen() {
+        let has_checkpoint_file = |dir: &std::path::Path| -> bool {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("checkpoint_") && name.ends_with(".bin")
+                })
+        };
+
+        let dir_on = TempDir::new().unwrap();
+        let config_on = DbConfig {
+            embedding_dim: 3,
+            auto_checkpoint: true,
+            storage: IncrementalConfig::default().with_checkpoint_threshold(1),
+            ..Default::default()
+        };
+        let col_on = Collection::create("test", dir_on.path(), config_on).unwrap();
+        col_on
+            .insert("a".into(), "content".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        assert!(
+            has_checkpoint_file(dir_on.path()),
+            "auto_checkpoint: true with checkpoint_threshold: 1 should have written a \
+             checkpoint file after a single insert, and none was found"
+        );
+
+        let dir_off = TempDir::new().unwrap();
+        let config_off = DbConfig {
+            embedding_dim: 3,
+            auto_checkpoint: false,
+            storage: IncrementalConfig::default().with_checkpoint_threshold(1),
+            ..Default::default()
+        };
+        let col_off = Collection::create("test", dir_off.path(), config_off).unwrap();
+        col_off
+            .insert("a".into(), "content".into(), vec![1.0, 0.0, 0.0], None)
+            .unwrap();
+        assert!(
+            !has_checkpoint_file(dir_off.path()),
+            "auto_checkpoint: false must not write a checkpoint file on insert, but one was \
+             found — auto_checkpoint is being ignored"
+        );
     }
 
     #[test]
@@ -1697,35 +1916,7 @@ mod tests {
     }
 
     #[test]
-    fn search_with_context_matches_search() {
-        let dir = TempDir::new().unwrap();
-        let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
-
-        col.insert("a".into(), "alpha".into(), vec![1.0, 0.0, 0.0], None)
-            .unwrap();
-        col.insert("b".into(), "beta".into(), vec![0.0, 1.0, 0.0], None)
-            .unwrap();
-        col.insert("c".into(), "gamma".into(), vec![0.0, 0.0, 1.0], None)
-            .unwrap();
-        col.insert("d".into(), "delta".into(), vec![0.7, 0.3, 0.0], None)
-            .unwrap();
-
-        let mut ctx = col.create_search_context();
-        for query in [
-            vec![1.0, 0.0, 0.0],
-            vec![0.0, 1.0, 0.0],
-            vec![0.0, 0.0, 1.0],
-        ] {
-            let regular = col.search(&query, 3, None).unwrap();
-            let with_ctx = col.search_with_context(&query, 3, &mut ctx).unwrap();
-            let regular_ids: Vec<&str> = regular.iter().map(|r| r.id.as_str()).collect();
-            let ctx_ids: Vec<&str> = with_ctx.iter().map(|r| r.id.as_str()).collect();
-            assert_eq!(ctx_ids, regular_ids);
-        }
-    }
-
-    #[test]
-    fn parallel_paths_exclude_tombstones() {
+    fn search_batch_excludes_tombstones() {
         let dir = TempDir::new().unwrap();
         let col = Collection::create("test", dir.path(), cfg(3)).unwrap();
 
@@ -1739,13 +1930,8 @@ mod tests {
 
         let queries = vec![vec![0.0, 1.0, 0.0], vec![1.0, 0.0, 0.0]];
         let batch = col.search_batch(&queries, 3, None).unwrap();
-        let mut ctx = col.create_search_context();
-        let with_ctx = col
-            .search_with_context(&[0.0, 1.0, 0.0], 3, &mut ctx)
-            .unwrap();
 
         assert!(batch.iter().flatten().all(|r| r.id != "b"));
-        assert!(with_ctx.iter().all(|r| r.id != "b"));
     }
 
     // ── P2.2: Create guard ──────────────────────────────────────────

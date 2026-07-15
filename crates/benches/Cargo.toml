@@ -10,11 +10,13 @@ foxstash-core = { path = "../core" }
 bincode.workspace = true
 criterion.workspace = true
 rand.workspace = true
+rayon = "1.10"
 serde_json.workspace = true
 tempfile = "3.8"
 
 # Comparison benchmarks
 instant-distance = "0.6"
+pulp = "0.22"
 
 [features]
 default = []
@@ -35,6 +37,3 @@ harness = false
 name = "full"
 harness = false
 
-[[bench]]
-name = "comparison"
-harness = false

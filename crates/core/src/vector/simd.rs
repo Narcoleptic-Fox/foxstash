@@ -6,8 +6,8 @@
 //!
 //! # Performance
 //!
-//! SIMD implementations provide 3-4x speedup over scalar operations for typical
-//! embedding dimensions (384, 768, 1024). The exact speedup depends on:
+//! SIMD implementations use AVX2, SSE, or NEON vector instructions depending on
+//! platform and runtime CPU detection. Performance depends on:
 //! - Vector length (longer vectors benefit more)
 //! - CPU architecture and SIMD support
 //! - Memory alignment and cache behavior
@@ -103,6 +103,33 @@ pub fn l2_distance_simd(a: &[f32], b: &[f32]) -> f32 {
     let simd = pulp::Arch::new();
 
     simd.dispatch(|| l2_distance_simd_impl(simd, a, b))
+}
+
+/// Squared L2 distance — the same kernel as [`l2_distance_simd`] without the final `sqrt`.
+///
+/// `sqrt` is monotonic, so squared L2 induces exactly the same *ordering* as L2. Nearest-
+/// neighbour search only ever compares distances, so the square root is pure overhead in
+/// the inner loop: a SIFT query at `ef_search=500` computes ~8,500 distances, and every
+/// one of those was paying for a root nobody reads.
+///
+/// Use this for ranking; take the root only on the handful of results you return.
+///
+/// # Examples
+///
+/// ```
+/// use foxstash_core::vector::simd::l2_squared_distance_simd;
+///
+/// let a = vec![0.0, 0.0];
+/// let b = vec![3.0, 4.0];
+/// assert!((l2_squared_distance_simd(&a, &b) - 25.0).abs() < 1e-5); // 5^2
+/// ```
+#[inline]
+pub fn l2_squared_distance_simd(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "Vector dimensions must match");
+
+    let simd = pulp::Arch::new();
+
+    simd.dispatch(|| l2_squared_distance_simd_impl(simd, a, b))
 }
 
 /// Computes cosine similarity using SIMD acceleration.
@@ -310,6 +337,43 @@ fn l2_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
     }
 
     simd.dispatch(L2Distance { a, b })
+}
+
+#[inline(always)]
+fn l2_squared_distance_simd_impl(simd: pulp::Arch, a: &[f32], b: &[f32]) -> f32 {
+    struct L2Squared<'a> {
+        a: &'a [f32],
+        b: &'a [f32],
+    }
+
+    impl pulp::WithSimd for L2Squared<'_> {
+        type Output = f32;
+
+        #[inline(always)]
+        fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
+            let a = self.a;
+            let b = self.b;
+            let (a_chunks, a_tail) = S::as_simd_f32s(a);
+            let (b_chunks, b_tail) = S::as_simd_f32s(b);
+
+            let mut sum_squares = simd.splat_f32s(0.0);
+            for (&a_vec, &b_vec) in a_chunks.iter().zip(b_chunks.iter()) {
+                let diff = simd.sub_f32s(a_vec, b_vec);
+                sum_squares = simd.mul_add_e_f32s(diff, diff, sum_squares);
+            }
+
+            let mut result = simd.reduce_sum_f32s(sum_squares);
+            debug_assert_eq!(a_tail.len(), b_tail.len());
+            for (&a_scalar, &b_scalar) in a_tail.iter().zip(b_tail.iter()) {
+                let diff = a_scalar - b_scalar;
+                result += diff * diff;
+            }
+
+            result // no sqrt: monotonic in L2, and callers only compare
+        }
+    }
+
+    simd.dispatch(L2Squared { a, b })
 }
 
 /// Vector magnitude WithSimd impl — used by both `magnitude_simd_impl` and `norm_simd`.
@@ -712,6 +776,381 @@ mod tests {
             (dist - 2.0).abs() < EPSILON,
             "Opposite vectors should have distance ~2, got {}",
             dist
+        );
+    }
+}
+
+/// Asymmetric squared-L2 between an `f32` query and a node's 8-bit SQ8 codes.
+///
+/// "Asymmetric" means the query is **not** quantized: each database value is dequantized on
+/// the fly (`min[d] + code * scale[d]`) and compared against the exact query component, so
+/// quantization error enters on one side only. Quantizing both sides is cheaper per call and
+/// strictly less accurate.
+///
+/// `min` and `scale` are **per dimension**, and must be. A single shared scale would let a
+/// near-constant dimension's full 0-255 code swing weigh as much as a high-variance
+/// dimension's — the bug that cost `SQ8HNSWIndex` 28 points of recall (commit 1df91b6).
+///
+/// The `u8 -> f32` widening is the entire cost of this kernel, and it is why the portable
+/// `pulp` path is not used here: `pulp` operates on `f32` slices and cannot express the
+/// widening, so a scalar version of this loop runs at ~124 ns per call against the f32 SIMD
+/// path's ~87 ns — turning a bandwidth *saving* into a compute *regression*. AVX2 does the
+/// widening in one instruction (`cvtepu8_epi32`), which is the only reason SQ8 traversal can
+/// pay for itself at all.
+#[inline]
+pub fn sq8_asymmetric_l2_simd(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    debug_assert_eq!(query.len(), codes.len());
+    debug_assert_eq!(query.len(), min.len());
+    debug_assert_eq!(query.len(), scale.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection; all four slices are the same
+            // length (checked above) and the loop never reads past `n - n % 8`.
+            return unsafe { sq8_asymmetric_l2_avx2(query, codes, min, scale) };
+        }
+    }
+    sq8_asymmetric_l2_scalar(query, codes, min, scale)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sq8_asymmetric_l2_avx2(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = codes.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+
+    while i + 8 <= n {
+        // Widen 8 u8 codes to 8 f32 lanes — one instruction, and the reason this kernel
+        // exists rather than a portable one.
+        let c8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+        let c32 = _mm256_cvtepu8_epi32(c8);
+        let cf = _mm256_cvtepi32_ps(c32);
+
+        let s = _mm256_loadu_ps(scale.as_ptr().add(i));
+        let m = _mm256_loadu_ps(min.as_ptr().add(i));
+        let q = _mm256_loadu_ps(query.as_ptr().add(i));
+
+        // deq = min + code * scale;  d = q - deq;  acc += d * d
+        let deq = _mm256_fmadd_ps(cf, s, m);
+        let d = _mm256_sub_ps(q, deq);
+        acc = _mm256_fmadd_ps(d, d, acc);
+
+        i += 8;
+    }
+
+    // Horizontal sum of the 8 lanes.
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let deq = min[j] + codes[j] as f32 * scale[j];
+        let d = query[j] - deq;
+        total += d * d;
+    }
+    total
+}
+
+fn sq8_asymmetric_l2_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..codes.len() {
+        let deq = min[i] + codes[i] as f32 * scale[i];
+        let d = query[i] - deq;
+        acc += d * d;
+    }
+    acc
+}
+
+/// Asymmetric dot product between an `f32` query and a node's 8-bit SQ8 codes.
+///
+/// Same shape as [`sq8_asymmetric_l2_simd`] — the query stays `f32`, each database value is
+/// dequantized on the fly (`min[d] + code * scale[d]`) — but accumulates a product instead of
+/// a squared difference. This is the building block for SQ8's cosine distance: the codes are
+/// a metric-agnostic reconstruction of the original values (unlike RaBitQ's estimator, which
+/// is folded specifically around squared L2 — see [`rabitq_asymmetric_l2_simd`]), so cosine
+/// under SQ8 is just this dot product composed with the query's and the stored vector's norms
+/// — both already available for free at the call site (the query's once per search, the
+/// stored vector's from the node's own block, already read this visit) — rather than a new
+/// per-vector encoding.
+#[inline]
+pub fn sq8_asymmetric_dot_simd(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    debug_assert_eq!(query.len(), codes.len());
+    debug_assert_eq!(query.len(), min.len());
+    debug_assert_eq!(query.len(), scale.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection; all four slices are the same
+            // length (checked above) and the loop never reads past `n - n % 8`.
+            return unsafe { sq8_asymmetric_dot_avx2(query, codes, min, scale) };
+        }
+    }
+    sq8_asymmetric_dot_scalar(query, codes, min, scale)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sq8_asymmetric_dot_avx2(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = codes.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+
+    while i + 8 <= n {
+        let c8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+        let c32 = _mm256_cvtepu8_epi32(c8);
+        let cf = _mm256_cvtepi32_ps(c32);
+
+        let s = _mm256_loadu_ps(scale.as_ptr().add(i));
+        let m = _mm256_loadu_ps(min.as_ptr().add(i));
+        let q = _mm256_loadu_ps(query.as_ptr().add(i));
+
+        // deq = min + code * scale;  acc += q * deq
+        let deq = _mm256_fmadd_ps(cf, s, m);
+        acc = _mm256_fmadd_ps(q, deq, acc);
+
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let deq = min[j] + codes[j] as f32 * scale[j];
+        total += query[j] * deq;
+    }
+    total
+}
+
+fn sq8_asymmetric_dot_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..codes.len() {
+        let deq = min[i] + codes[i] as f32 * scale[i];
+        acc += query[i] * deq;
+    }
+    acc
+}
+
+/// Asymmetric RaBitQ estimate of squared L2 between a prepared query and a node's 1-bit code.
+///
+/// "Asymmetric" in the same sense as [`sq8_asymmetric_l2_simd`]: the query stays `f32`
+/// (already rotated into RaBitQ space by the caller — see
+/// [`crate::vector::rabitq::RaBitQuantizer::prepare_query`]) and only the *database* side is
+/// compressed, to 1 bit/dim.
+///
+/// This is the folded estimator from `crate::vector::rabitq` (Gao & Long, RaBitQ, SIGMOD
+/// 2024), not Hamming distance: `S = Σ (2·bit − 1) · rq[i]`, then
+/// `‖o − q‖² ≈ dtc_sq + qn_sq − 2 · est_factor · S`. `dtc_sq` (the vector's squared distance
+/// to the corpus centroid) and `est_factor` (`dtc_sq / L1` of its rotated residual) are
+/// per-vector scalars computed once at index-build time by
+/// [`RaBitQuantizer::encode`](crate::vector::rabitq::RaBitQuantizer::encode); `rq` and
+/// `qn_sq` are computed once per *query*, not per candidate — recomputing the rotation
+/// (an O(dim²) matvec) on every node visit would turn an O(dim) distance into the very
+/// cost this storage mode exists to avoid.
+///
+/// `bits` is packed 1 bit/dim, `bits[i/8]` bit `i%8`, matching
+/// [`RaBitCode::bits`](crate::vector::rabitq::RaBitCode::bits)'s convention exactly — this
+/// kernel does not call into `rabitq.rs` itself, so any packing mismatch here would silently
+/// disagree with the derivation it claims to implement.
+#[inline]
+pub fn rabitq_asymmetric_l2_simd(
+    rq: &[f32],
+    bits: &[u8],
+    dtc_sq: f32,
+    est_factor: f32,
+    qn_sq: f32,
+) -> f32 {
+    debug_assert_eq!(bits.len(), rq.len().div_ceil(8));
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by runtime feature detection; the loop never reads past
+            // `rq.len() - rq.len() % 8`, and `bits` has at least `rq.len().div_ceil(8)`
+            // bytes (checked above), which covers every byte index the loop computes.
+            let s = unsafe { rabitq_signed_sum_avx2(rq, bits) };
+            return (dtc_sq + qn_sq - 2.0 * est_factor * s).max(0.0);
+        }
+    }
+    let s = rabitq_signed_sum_scalar(rq, bits);
+    (dtc_sq + qn_sq - 2.0 * est_factor * s).max(0.0)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn rabitq_signed_sum_avx2(rq: &[f32], bits: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = rq.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+
+    // Bit weights in lane order: lane 0 <-> bit 0 (value 1) .. lane 7 <-> bit 7 (value 128),
+    // matching `bits[i/8] & (1 << (i % 8))`.
+    let bit_masks = _mm256_set_epi32(128, 64, 32, 16, 8, 4, 2, 1);
+    let zero = _mm256_setzero_si256();
+    let ones = _mm256_set1_ps(1.0);
+    let neg_ones = _mm256_set1_ps(-1.0);
+
+    while i + 8 <= n {
+        // One input byte covers exactly 8 dims — the same width as an AVX2 f32 lane.
+        let byte = bits[i / 8] as i32;
+        let byte_bcast = _mm256_set1_epi32(byte);
+        let anded = _mm256_and_si256(byte_bcast, bit_masks);
+        let is_set = _mm256_cmpgt_epi32(anded, zero);
+        let signs = _mm256_blendv_ps(neg_ones, ones, _mm256_castsi256_ps(is_set));
+
+        let rq_vec = _mm256_loadu_ps(rq.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(rq_vec, signs, acc);
+
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let bit = (bits[j / 8] >> (j % 8)) & 1;
+        total += if bit == 1 { rq[j] } else { -rq[j] };
+    }
+    total
+}
+
+fn rabitq_signed_sum_scalar(rq: &[f32], bits: &[u8]) -> f32 {
+    let mut s = 0.0f32;
+    for (i, &rqi) in rq.iter().enumerate() {
+        let bit = (bits[i / 8] >> (i % 8)) & 1;
+        s += if bit == 1 { rqi } else { -rqi };
+    }
+    s
+}
+
+#[cfg(test)]
+mod rabitq_asymmetric_tests {
+    use super::*;
+
+    /// The AVX2 path and the scalar path must agree. A dim that is NOT a multiple of the
+    /// 8-lane width exercises the tail loop, and NOT a multiple of 8 bits also forces a
+    /// partial final byte in `bits`.
+    #[test]
+    fn avx2_matches_scalar() {
+        let dim: usize = 131; // not a multiple of 8: exercises both the SIMD tail and a partial byte
+        let rq: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.29).cos() * 7.0).collect();
+        let n_bytes = dim.div_ceil(8);
+        let bits: Vec<u8> = (0..n_bytes).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let dtc_sq = 4.5f32;
+        let est_factor = 0.83f32;
+        let qn_sq = 6.1f32;
+
+        let dispatched = rabitq_asymmetric_l2_simd(&rq, &bits, dtc_sq, est_factor, qn_sq);
+
+        let s = rabitq_signed_sum_scalar(&rq, &bits);
+        let scalar = (dtc_sq + qn_sq - 2.0 * est_factor * s).max(0.0);
+
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "AVX2 kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
+        );
+    }
+
+    /// Cross-check against `crate::vector::rabitq`'s own (allocating, reference)
+    /// `estimate_dist_sq` — the kernel above reimplements that math without going through
+    /// `RaBitCode`/`PreparedQuery`, so this is the check that the reimplementation didn't
+    /// silently drift from the derivation it claims to match.
+    #[test]
+    fn matches_rabitq_module_reference_estimator() {
+        use crate::vector::rabitq::RaBitQuantizer;
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(21);
+        let dim = 97; // also not a multiple of 8
+        let train: Vec<Vec<f32>> = (0..300)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let q = RaBitQuantizer::fit(&train);
+
+        let o: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+        let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        let code = q.encode(&o);
+        let prepared = q.prepare_query(&query);
+        let reference = q.estimate_dist_sq(&prepared, &code);
+
+        let kernel = rabitq_asymmetric_l2_simd(
+            prepared.rq(),
+            &code.bits,
+            code.dtc_sq,
+            code.est_factor,
+            prepared.qn_sq(),
+        );
+
+        let rel = (kernel - reference).abs() / reference.abs().max(1e-6);
+        assert!(
+            rel < 1e-4,
+            "kernel disagrees with rabitq.rs reference estimator: {kernel} vs {reference} (rel {rel:.2e})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sq8_asymmetric_tests {
+    use super::*;
+
+    /// The AVX2 path and the scalar path must agree. A SIMD kernel that silently disagrees
+    /// with its fallback produces results that depend on which machine you ran on.
+    #[test]
+    fn avx2_matches_scalar() {
+        let dim = 131; // deliberately not a multiple of 8, to exercise the tail
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 12.0).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let min: Vec<f32> = (0..dim).map(|i| -(i as f32) * 0.11).collect();
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i % 5) as f32 * 0.03).collect();
+
+        let dispatched = sq8_asymmetric_l2_simd(&query, &codes, &min, &scale);
+        let scalar = sq8_asymmetric_l2_scalar(&query, &codes, &min, &scale);
+
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "AVX2 kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
+        );
+    }
+
+    /// Same check for the dot-product kernel (SQ8's cosine building block), at a dim that is
+    /// NOT a multiple of the 8-lane width.
+    #[test]
+    fn dot_avx2_matches_scalar() {
+        let dim = 131;
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 12.0).collect();
+        let codes: Vec<u8> = (0..dim).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+        let min: Vec<f32> = (0..dim).map(|i| -(i as f32) * 0.11).collect();
+        let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i % 5) as f32 * 0.03).collect();
+
+        let dispatched = sq8_asymmetric_dot_simd(&query, &codes, &min, &scale);
+        let scalar = sq8_asymmetric_dot_scalar(&query, &codes, &min, &scale);
+
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "AVX2 dot kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
         );
     }
 }

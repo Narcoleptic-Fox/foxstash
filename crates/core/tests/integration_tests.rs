@@ -3,23 +3,20 @@
 //! These tests exercise full end-to-end pipelines across foxstash-core subsystems:
 //! - Document lifecycle (create, add, search, verify metadata)
 //! - Index persistence and recovery via FileStorage
-//! - Quantized index accuracy comparison (HNSW, SQ8, Binary, PQ)
+//! - Quantized index accuracy comparison (HNSW, SQ8, PQ)
 //! - Incremental persistence (WAL logging, checkpoint, recovery)
 //! - Compression round-trip for all available codecs
-//! - Batch operations and streaming search
 //! - Edge cases (empty index, single doc, zero vectors, k > n)
 //! - Concurrent parallel search
 
 use foxstash_core::index::{
-    BatchBuilder, BatchConfig, BinaryHNSWIndex, FilteredSearchBuilder, FlatIndex, HNSWIndex,
-    PQHNSWConfig, PQHNSWIndex, QuantizedHNSWConfig, SQ8HNSWIndex, SearchPage, SearchResultIterator,
+    DistanceMetric, FlatIndex, HNSWConfig, HNSWIndex, Storage,
 };
 use foxstash_core::storage::compression::{self, Codec};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::storage::incremental::{
     IncrementalConfig, IncrementalStorage, IndexMetadata, RecoveryHelper, WalOperation,
 };
-use foxstash_core::vector::product_quantize::PQConfig;
 use foxstash_core::{Document, SearchResult};
 
 use std::collections::HashSet;
@@ -409,40 +406,37 @@ mod quantized_accuracy {
             hnsw.add(doc.clone()).unwrap();
         }
 
-        // SQ8
-        let mut sq8 = SQ8HNSWIndex::for_normalized(dim, QuantizedHNSWConfig::default());
+        // SQ8 (as a storage mode on the main index, not a standalone type -
+        // see foxstash_core::index module docs)
+        let mut sq8 = HNSWIndex::new(
+            dim,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
+        // Quantized storages need a fitted codebook before the first `add()` — see
+        // `HNSWIndex::train`. `build()`/`build_parallel()` do this internally from the full
+        // corpus; incremental construction via `add()` must do it explicitly.
+        let sample: Vec<Vec<f32>> = documents.iter().map(|d| d.embedding.clone()).collect();
+        sq8.train(&sample).unwrap();
         for doc in &documents {
             sq8.add(doc.clone()).unwrap();
-        }
-
-        // Binary
-        let mut binary = BinaryHNSWIndex::new(dim, QuantizedHNSWConfig::default());
-        for doc in &documents {
-            binary.add(doc.clone()).unwrap();
         }
 
         let query = deterministic_embedding(dim, 9999);
 
         let hnsw_results = hnsw.search(&query, k).unwrap();
         let sq8_results = sq8.search(&query, k).unwrap();
-        let binary_results = binary.search(&query, k).unwrap();
 
         // All should return k results
         assert_eq!(hnsw_results.len(), k, "HNSW should return {} results", k);
         assert_eq!(sq8_results.len(), k, "SQ8 should return {} results", k);
-        assert_eq!(
-            binary_results.len(),
-            k,
-            "Binary should return {} results",
-            k
-        );
 
         // All results should be sorted by score descending
-        for (name, results) in [
-            ("HNSW", &hnsw_results),
-            ("SQ8", &sq8_results),
-            ("Binary", &binary_results),
-        ] {
+        for (name, results) in [("HNSW", &hnsw_results), ("SQ8", &sq8_results)] {
             for window in results.windows(2) {
                 assert!(
                     window[0].score >= window[1].score,
@@ -453,69 +447,70 @@ mod quantized_accuracy {
         }
     }
 
+    /// Replaces `pq_index_returns_results`. `PQHNSWIndex` was deleted (dominated: a ~62% recall
+    /// ceiling, because the graph is traversed on PQ codes so the candidate pool never contains
+    /// the true neighbours). RaBitQ is the surviving 1-bit path.
+    ///
+    /// The old test asserted only "returns k results, in sorted order". That is the vacuous shape
+    /// this codebase keeps getting burned by — an index that returned the k *worst* matches, or
+    /// the same node k times, would pass it. Sorted-ness is a property of the output formatter,
+    /// not of the search. So this one asserts RETRIEVAL: the index must actually find the true
+    /// nearest neighbours, scored against brute force.
     #[test]
-    fn pq_index_returns_results() {
+    fn rabitq_storage_actually_retrieves_nearest_neighbours() {
         let dim = 64;
-        let n = 80;
+        let n = 200;
         let k = 5;
 
-        // Generate training data and documents
-        let training_data: Vec<Vec<f32>> = (0..200)
-            .map(|i| deterministic_embedding(dim, i + 10000))
-            .collect();
-
-        let pq_config = PQConfig::new(dim, 8, 8)
-            .with_seed(42)
-            .with_kmeans_iterations(5);
-
-        let mut pq_index =
-            PQHNSWIndex::train(pq_config, &training_data, PQHNSWConfig::default()).unwrap();
-
-        for i in 0..n {
-            let doc = make_doc(&format!("doc_{}", i), dim, i);
-            pq_index.add(doc).unwrap();
-        }
+        let base: Vec<Vec<f32>> = (0..n).map(|i| deterministic_embedding(dim, i)).collect();
+        let index = HNSWIndex::build_parallel(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                storage: Storage::RaBitQ,
+                rerank_candidates: 50,
+                seed: Some(7),
+                ..Default::default()
+            },
+        );
 
         let query = deterministic_embedding(dim, 9999);
-        let results = pq_index.search(&query, k).unwrap();
 
-        assert_eq!(results.len(), k, "PQ should return {} results", k);
+        // The oracle.
+        let mut exact: Vec<(f32, usize)> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                (
+                    v.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum(),
+                    i,
+                )
+            })
+            .collect();
+        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let truth: Vec<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
 
-        // Results should be sorted by score descending
+        let results = index.search(&query, k).unwrap();
+        assert_eq!(results.len(), k);
+
+        let got: Vec<usize> = results
+            .iter()
+            .filter_map(|r| r.id.parse::<usize>().ok())
+            .collect();
+        let hits = got.iter().filter(|i| truth.contains(i)).count();
+
+        // With an exact rerank pool of 50 over 200 vectors, this should be near-perfect. The
+        // point is that it must RETRIEVE, not merely return something sorted.
+        assert!(
+            hits >= 4,
+            "RaBitQ + rerank found only {hits}/{k} true nearest neighbours (got {got:?},              truth {truth:?}) — the index returns results but is not searching"
+        );
+
         for window in results.windows(2) {
-            assert!(window[0].score >= window[1].score, "PQ results not sorted");
-        }
-    }
-
-    #[test]
-    fn binary_rerank_improves_over_binary_only() {
-        let dim = 64;
-        let n = 80;
-        let k = 10;
-
-        let documents: Vec<Document> = (0..n)
-            .map(|i| make_doc(&format!("doc_{}", i), dim, i))
-            .collect();
-
-        let mut binary = BinaryHNSWIndex::with_full_precision(dim, QuantizedHNSWConfig::default());
-        for doc in &documents {
-            binary.add_with_full_precision(doc.clone()).unwrap();
-        }
-
-        let query = deterministic_embedding(dim, 9999);
-
-        // Binary-only search
-        let binary_results = binary.search(&query, k).unwrap();
-
-        // Binary + full-precision rerank
-        let rerank_results = binary.search_and_rerank(&query, 50, k).unwrap();
-
-        assert_eq!(binary_results.len(), k);
-        assert_eq!(rerank_results.len(), k);
-
-        // Both should return sorted results
-        for window in rerank_results.windows(2) {
-            assert!(window[0].score >= window[1].score);
+            assert!(
+                window[0].score >= window[1].score,
+                "results not sorted by score"
+            );
         }
     }
 }
@@ -808,187 +803,6 @@ mod compression_roundtrip {
 // (f) Batch Operations & Streaming
 // ============================================================================
 
-mod batch_and_streaming {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    #[test]
-    fn batch_builder_ingests_many_documents() {
-        let dim = 32;
-        let n = 50;
-        let mut index = HNSWIndex::with_defaults(dim);
-
-        let config = BatchConfig::default().with_batch_size(10).with_total(n);
-
-        let mut builder = BatchBuilder::new(&mut index, config);
-        for i in 0..n {
-            let doc = make_doc(&format!("doc_{}", i), dim, i);
-            builder.add(doc).unwrap();
-        }
-        let result = builder.finish();
-
-        assert_eq!(result.documents_indexed, n);
-        assert!(!result.has_errors());
-        assert_eq!(index.len(), n);
-
-        // Verify search works after batch ingestion
-        let query = deterministic_embedding(dim, 0);
-        let results = index.search(&query, 10).unwrap();
-        assert_eq!(results.len(), 10);
-        assert_eq!(results[0].id, "doc_0");
-    }
-
-    #[test]
-    fn batch_builder_fires_progress_callback() {
-        let dim = 16;
-        let mut index = HNSWIndex::with_defaults(dim);
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let cc = callback_count.clone();
-
-        let config = BatchConfig::default()
-            .with_batch_size(5)
-            .with_progress(move |_progress| {
-                cc.fetch_add(1, Ordering::SeqCst);
-            });
-
-        let mut builder = BatchBuilder::new(&mut index, config);
-        for i in 0..17 {
-            builder.add(make_doc(&format!("d{}", i), dim, i)).unwrap();
-        }
-        let _result = builder.finish();
-
-        // Should fire at: 5, 10, 15, and 17 (finish)
-        let count = callback_count.load(Ordering::SeqCst);
-        assert_eq!(count, 4, "Expected 4 progress callbacks, got {}", count);
-    }
-
-    #[test]
-    fn batch_builder_continue_on_error_skips_bad_docs() {
-        let dim = 16;
-        let mut index = HNSWIndex::with_defaults(dim);
-        let config = BatchConfig::default().continue_on_error(true);
-
-        let mut builder = BatchBuilder::new(&mut index, config);
-
-        // Good doc
-        builder.add(make_doc("good_1", dim, 0)).unwrap();
-
-        // Bad doc (wrong dimension)
-        let bad_doc = Document {
-            id: "bad_1".to_string(),
-            content: "Bad".to_string(),
-            embedding: vec![0.0; dim / 2], // Wrong dimension
-            metadata: None,
-        };
-        builder.add(bad_doc).unwrap(); // Should not error because continue_on_error
-
-        // Good doc
-        builder.add(make_doc("good_2", dim, 1)).unwrap();
-
-        let result = builder.finish();
-        assert_eq!(
-            result.documents_indexed, 2,
-            "Only 2 good docs should be indexed"
-        );
-        assert!(result.has_errors(), "Should have 1 error");
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].0, "bad_1");
-    }
-
-    #[test]
-    fn search_result_iterator_works() {
-        let results = vec![
-            SearchResult {
-                id: "a".to_string(),
-                content: "A".to_string(),
-                score: 0.9,
-                metadata: None,
-            },
-            SearchResult {
-                id: "b".to_string(),
-                content: "B".to_string(),
-                score: 0.8,
-                metadata: None,
-            },
-            SearchResult {
-                id: "c".to_string(),
-                content: "C".to_string(),
-                score: 0.7,
-                metadata: None,
-            },
-        ];
-
-        let mut iter = SearchResultIterator::new(results);
-        assert_eq!(iter.total(), 3);
-        assert_eq!(iter.peek().unwrap().id, "a");
-
-        let first = iter.next().unwrap();
-        assert_eq!(first.id, "a");
-
-        let remaining = iter.collect_remaining();
-        assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].id, "b");
-        assert_eq!(remaining[1].id, "c");
-    }
-
-    #[test]
-    fn search_page_pagination() {
-        let results: Vec<SearchResult> = (0..23)
-            .map(|i| SearchResult {
-                id: format!("doc_{}", i),
-                content: format!("Content {}", i),
-                score: 1.0 - (i as f32 * 0.01),
-                metadata: None,
-            })
-            .collect();
-
-        let page0 = SearchPage::from_results(results.clone(), 0, 10);
-        assert_eq!(page0.results.len(), 10);
-        assert_eq!(page0.total_pages, 3);
-        assert!(page0.has_next);
-        assert!(!page0.has_prev);
-
-        let page2 = SearchPage::from_results(results.clone(), 2, 10);
-        assert_eq!(page2.results.len(), 3); // 23 - 20 = 3
-        assert!(!page2.has_next);
-        assert!(page2.has_prev);
-
-        // Beyond range
-        let page_oob = SearchPage::from_results(results, 5, 10);
-        assert!(page_oob.results.is_empty());
-    }
-
-    #[test]
-    fn filtered_search_applies_min_score_and_metadata_filters() {
-        let dim = 32;
-        let mut index = HNSWIndex::with_defaults(dim);
-
-        for i in 0..20 {
-            let meta = serde_json::json!({"category": if i % 2 == 0 { "even" } else { "odd" }});
-            let doc = make_doc_with_metadata(&format!("doc_{}", i), dim, i, meta);
-            index.add(doc).unwrap();
-        }
-
-        let query = deterministic_embedding(dim, 0);
-        let all_results = index.search(&query, 20).unwrap();
-
-        // Filter to only "even" category with min score > 0.0
-        let filtered = FilteredSearchBuilder::new()
-            .min_score(0.0)
-            .metadata_equals("category", serde_json::json!("even"))
-            .max_results(5)
-            .apply(all_results);
-
-        assert!(filtered.len() <= 5);
-        for result in &filtered {
-            let meta = result.metadata.as_ref().unwrap();
-            assert_eq!(meta["category"], "even");
-            assert!(result.score >= 0.0);
-        }
-    }
-}
-
 // ============================================================================
 // (g) Edge Cases
 // ============================================================================
@@ -1201,15 +1015,15 @@ mod edge_cases {
 
     #[test]
     fn sq8_empty_search() {
-        let index = SQ8HNSWIndex::for_normalized(16, QuantizedHNSWConfig::default());
-        let query = vec![0.5; 16];
-        let results = index.search(&query, 10).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn binary_empty_search() {
-        let index = BinaryHNSWIndex::new(16, QuantizedHNSWConfig::default());
+        let index = HNSWIndex::new(
+            16,
+            HNSWConfig {
+                storage: Storage::SQ8,
+                rerank_candidates: 100,
+                metric: DistanceMetric::L2,
+                ..Default::default()
+            },
+        );
         let query = vec![0.5; 16];
         let results = index.search(&query, 10).unwrap();
         assert!(results.is_empty());
@@ -1297,7 +1111,7 @@ mod concurrent_access {
     }
 
     #[test]
-    fn search_batch_fast_produces_correct_count() {
+    fn search_batch_matches_search_query_for_query() {
         let dim = 32;
         let mut index = HNSWIndex::with_defaults(dim);
 
@@ -1309,21 +1123,25 @@ mod concurrent_access {
             .map(|i| deterministic_embedding(dim, i + 5000))
             .collect();
 
-        let batch_results = index.search_batch_fast(&queries, 5).unwrap();
+        let batch = index.search_batch(&queries, 5).unwrap();
+        assert_eq!(batch.len(), queries.len());
 
-        assert_eq!(batch_results.len(), 10);
-        for (i, results) in batch_results.iter().enumerate() {
+        // The parallel path must agree with the serial one exactly. Counting results (the
+        // old assertion) proves nothing: a batch search that shuffled its per-query scratch
+        // between rayon workers would still return 10 lists of 5, all of them wrong.
+        for (i, query) in queries.iter().enumerate() {
+            let serial = index.search(query, 5).unwrap();
+            let ids: Vec<&str> = batch[i].iter().map(|r| r.id.as_str()).collect();
+            let expected: Vec<&str> = serial.iter().map(|r| r.id.as_str()).collect();
             assert_eq!(
-                results.len(),
-                5,
-                "Fast batch query {} should return 5 results",
-                i
+                ids, expected,
+                "search_batch disagrees with search on query {i}"
             );
         }
     }
 
     #[test]
-    fn search_with_context_matches_regular_search() {
+    fn a_reused_searcher_returns_identical_results_to_a_fresh_search() {
         let dim = 32;
         let mut index = HNSWIndex::with_defaults(dim);
 
@@ -1331,26 +1149,53 @@ mod concurrent_access {
             index.add(make_doc(&format!("doc_{}", i), dim, i)).unwrap();
         }
 
-        let query = deterministic_embedding(dim, 999);
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|i| deterministic_embedding(dim, i + 999))
+            .collect();
         let k = 5;
 
-        let regular_results = index.search(&query, k).unwrap();
-        let mut ctx = index.create_search_context();
-        let ctx_results = index.search_with_context(&query, k, &mut ctx).unwrap();
+        // The point of a Searcher is that it carries scratch (a visited bitset and two heaps)
+        // across queries. If `reset()` ever failed to clear that scratch, query N+1 would see
+        // query N's nodes already marked visited, skip them, and quietly return a worse
+        // result — a bug that degrades recall without ever erroring.
+        //
+        // So the assertion is EQUALITY, not overlap. The predecessor of this test asserted
+        // `overlap >= 3` of 5, which a fully broken bitset would still have passed.
+        let fresh: Vec<Vec<String>> = queries
+            .iter()
+            .map(|q| {
+                index
+                    .search(q, k)
+                    .unwrap()
+                    .iter()
+                    .map(|r| r.id.clone())
+                    .collect()
+            })
+            .collect();
 
-        assert_eq!(regular_results.len(), ctx_results.len());
+        let mut searcher = index.searcher();
+        for (i, query) in queries.iter().enumerate() {
+            let reused: Vec<String> = searcher
+                .search(query, k)
+                .unwrap()
+                .iter()
+                .map(|r| r.id.clone())
+                .collect();
+            assert_eq!(
+                reused, fresh[i],
+                "reused searcher diverged from a fresh search on query {i} — stale scratch"
+            );
+        }
 
-        // Results should overlap substantially (both find top matches)
-        let regular_ids: HashSet<&str> = regular_results.iter().map(|r| r.id.as_str()).collect();
-        let ctx_ids: HashSet<&str> = ctx_results.iter().map(|r| r.id.as_str()).collect();
-        let overlap = regular_ids.intersection(&ctx_ids).count();
-
+        // And it counts the work it did.
         assert!(
-            overlap >= 3,
-            "Regular and context search should substantially overlap, got {}/{}",
-            overlap,
-            k
+            searcher.distance_calls() > 0,
+            "searcher performed {} distance computations across {} queries",
+            searcher.distance_calls(),
+            queries.len()
         );
+        searcher.reset_stats();
+        assert_eq!(searcher.distance_calls(), 0);
     }
 }
 
