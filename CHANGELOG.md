@@ -7,9 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-15
+
+The "1.0 audit" release: one index, one config, one metric; −5,380 lines.
+
+### Changed
+
+- **One `HNSWIndex`, quantization is a `Storage` mode** (`F32` / `SQ8` / `RaBitQ`), and every storage mode honours every metric. Replaces the separate `PQHNSWIndex` / `RaBitQHNSWIndex` / `SQ8HNSWIndex` / `BinaryHNSWIndex` types. **Breaking.**
+- **Parallel builder recall fixed**: `par_insert` truncated the zero-layer candidate beam to `m0` before the Algorithm-4 diversity heuristic, so it could not diversify and the graph had no long-range bridges — ~15 recall points below the sequential builder at equal `ef_search` on clustered data (+0.5–2 on SIFT1M, which understates it). Now feeds the full `ef_construction` beam. Guarded by `both_builders_reach_similar_recall`, a recall-parity equivalence test.
+- Node layout changed from struct-of-arrays to an interleaved arena, fixing a two-random-DRAM-reads-per-node-visit regression that lost to hnswlib at 1M.
+
+### Added
+
+- **RaBitQ storage** (1-bit quantization): wins at ≥768-d, where SQ8's per-node dequant cost dominates and RaBitQ's block is far smaller. SQ8 still wins ≤384-d.
+- **Python binding** (`crates/python`, PyO3): `Foxstash(metric, dim, m, ef_construction, storage, rerank_candidates)` with `fit` / `set_query_arguments` / `query`, validated against numpy brute-force ground truth; CI-gated.
+- CI gates: clippy `--all-targets` (was not linting tests, where the bugs hid), a generated config×code-path matrix, and the Python recall suite.
+
 ### Removed
 
-- **Reusable search context** (`Collection::create_search_context`, `Collection::search_with_context`), added below in 0.5.0 on the promise of reduced per-query allocation overhead. Measured on SIFT1M: 4,118 QPS via `search()` vs 4,121 QPS reused — **1.00x**, no measurable difference. The search is memory-latency bound, not allocation bound, so there was nothing for a reused scratch buffer to save. The underlying `HNSWIndex::search_with_context`/`create_search_context` and `search_batch_fast` (measured 0.97x `search_batch` — slower) were deleted for the same reason; see `crates/core/src/index/hnsw.rs`'s `Searcher` doc and `cargo run --release -p foxstash-benches --example search_api_cost` to reproduce. `Collection::search_batch` (also added in 0.5.0, below) is unaffected — it doesn't carry this claim and remains.
+- **Per-quantizer index types** and ~5,380 lines of dead/duplicate code: a second SQ8 implementation the index never called, an unused streaming module, product-quantize scaffolding, and uniform-random benchmarks (which mask graph-connectivity bugs).
+- **Reusable search context** (`Collection::create_search_context`, `Collection::search_with_context`), added in 0.5.0 on the promise of reduced per-query allocation overhead. Measured on SIFT1M: 4,118 QPS via `search()` vs 4,121 QPS reused — **1.00x**, no measurable difference. Search is memory-latency bound, not allocation bound, so there was nothing for a reused scratch buffer to save. `search_batch_fast` (measured 0.97x `search_batch` — slower) deleted for the same reason. `Collection::search_batch` is unaffected and remains.
 
 ## [0.5.0] - 2026-03-01
 
@@ -86,7 +103,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ONNX embedding support available but may have platform-specific limitations on Windows
 - WASM support is experimental
 
-[Unreleased]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.0...v0.4.1
 [0.1.0]: https://github.com/Narcoleptic-Fox/foxstash/releases/tag/v0.1.0
