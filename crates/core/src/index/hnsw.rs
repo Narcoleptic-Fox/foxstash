@@ -303,7 +303,7 @@ pub enum BuildStrategy {
 }
 
 /// Configuration for HNSW index
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HNSWConfig {
     /// Distance metric used for both construction and search.
     ///
@@ -1815,8 +1815,19 @@ impl HNSWIndex {
     /// RNG is reseeded from `config.seed` (a later incremental `add()` draws a fresh seeded
     /// stream rather than continuing the original one — same caveat as the JSON path).
     pub fn snapshot_from_file(path: &std::path::Path) -> Result<HNSWIndex> {
+        use bincode::Options;
         let file = std::fs::File::open(path)?;
-        let snap: HNSWSnapshot = bincode::deserialize_from(std::io::BufReader::new(file))?;
+        // Limit = the file's own size. Without it, a corrupt/foreign file's garbage length
+        // prefix makes bincode try to allocate whatever number it read — found as a hard
+        // ABORT (allocation failure), not a catchable error, when fed a non-snapshot file.
+        // `fixint + allow_trailing_bytes` is the exact config `bincode::serialize` writes;
+        // the bare `options()` default is varint and would misread our own files.
+        let limit = file.metadata()?.len();
+        let snap: HNSWSnapshot = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(limit)
+            .deserialize_from(std::io::BufReader::new(file))?;
         if snap.format_version != SNAPSHOT_FORMAT_VERSION
             || snap.crate_version != env!("CARGO_PKG_VERSION")
         {

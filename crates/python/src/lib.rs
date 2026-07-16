@@ -93,6 +93,62 @@ impl Foxstash {
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("foxstash: call fit() before set_query_arguments()"))
     }
+
+    /// The full `HNSWConfig` this instance's constructor args imply — what `fit()` builds.
+    fn target_config(&self) -> HNSWConfig {
+        HNSWConfig {
+            metric: self.metric,
+            m: self.m,
+            m0: self.m * 2,
+            ef_construction: self.ef_construction,
+            ef_search: self.ef_construction,
+            ml: 1.0 / (self.m as f32).ln(),
+            use_heuristic: true,
+            extend_candidates: false,
+            keep_pruned_connections: true,
+            build_strategy: BuildStrategy::Parallel,
+            seed: None,
+            storage: self.storage,
+            rerank_candidates: self.rerank_candidates,
+            // `self.turbo_bits` holds whichever budget the storage string encoded; route it
+            // to the field its storage mode reads and leave the other at its default.
+            turbo_bits: if self.storage == Storage::TurboQuant {
+                self.turbo_bits
+            } else {
+                HNSWConfig::default().turbo_bits
+            },
+            rabit_bits: if self.storage == Storage::TurboRabit {
+                self.turbo_bits
+            } else {
+                HNSWConfig::default().rabit_bits
+            },
+        }
+    }
+
+    /// Same graph knobs, F32 storage — the shared build every storage arm requantizes from.
+    /// The quantizer fields are pinned to their defaults so the cached snapshot's config is
+    /// identical no matter which storage arm happened to build it first.
+    fn f32_config(&self) -> HNSWConfig {
+        HNSWConfig {
+            storage: Storage::F32,
+            rerank_candidates: 0,
+            turbo_bits: HNSWConfig::default().turbo_bits,
+            rabit_bits: HNSWConfig::default().rabit_bits,
+            ..self.target_config()
+        }
+    }
+
+    fn copy_rows(&self, x: &PyReadonlyArray2<'_, f32>) -> PyResult<Vec<Vec<f32>>> {
+        let view = x.as_array();
+        let dim = view.shape()[1];
+        if dim != self.dim {
+            return Err(PyValueError::new_err(format!(
+                "foxstash: fit() received {dim}-d vectors but this index was constructed with dim={}",
+                self.dim
+            )));
+        }
+        Ok((0..view.shape()[0]).map(|i| view.row(i).to_vec()).collect())
+    }
 }
 
 #[pymethods]
@@ -133,45 +189,8 @@ impl Foxstash {
     /// f32 copy inside the index for reranking — that is a real, documented, benchmarked part
     /// of the index's footprint, not this array surviving by accident.)
     fn fit(&mut self, py: Python<'_>, x: PyReadonlyArray2<'_, f32>) -> PyResult<()> {
-        let view = x.as_array();
-        let n = view.shape()[0];
-        let dim = view.shape()[1];
-        if dim != self.dim {
-            return Err(PyValueError::new_err(format!(
-                "foxstash: fit() received {dim}-d vectors but this index was constructed with dim={}",
-                self.dim
-            )));
-        }
-
-        let embeddings: Vec<Vec<f32>> = (0..n).map(|i| view.row(i).to_vec()).collect();
-
-        let config = HNSWConfig {
-            metric: self.metric,
-            m: self.m,
-            m0: self.m * 2,
-            ef_construction: self.ef_construction,
-            ef_search: self.ef_construction,
-            ml: 1.0 / (self.m as f32).ln(),
-            use_heuristic: true,
-            extend_candidates: false,
-            keep_pruned_connections: true,
-            build_strategy: BuildStrategy::Parallel,
-            seed: None,
-            storage: self.storage,
-            rerank_candidates: self.rerank_candidates,
-            // `self.turbo_bits` holds whichever budget the storage string encoded; route it
-            // to the field its storage mode reads and leave the other at its default.
-            turbo_bits: if self.storage == Storage::TurboQuant {
-                self.turbo_bits
-            } else {
-                HNSWConfig::default().turbo_bits
-            },
-            rabit_bits: if self.storage == Storage::TurboRabit {
-                self.turbo_bits
-            } else {
-                HNSWConfig::default().rabit_bits
-            },
-        };
+        let embeddings = self.copy_rows(&x)?;
+        let config = self.target_config();
 
         // `embeddings` is plain owned Rust data (no Py<T>/Bound<T> inside it), so it's safe
         // to move into a GIL-released closure. VIBE times query latency single-threaded, but
@@ -181,6 +200,76 @@ impl Foxstash {
         // Python 3.13 free-threading made "the GIL" the wrong noun for what is really an
         // attach/detach of this thread from the interpreter.
         let index = py.detach(move || HNSWIndex::build_parallel(embeddings, config));
+        self.index = Some(index);
+        Ok(())
+    }
+
+    /// [`Foxstash::fit`] with a build-once cache: the expensive part of `fit` is HNSW graph
+    /// construction, and the graph is storage-independent (built in exact f32, quantized
+    /// after) — so one F32 build can serve every storage arm of a benchmark sweep.
+    ///
+    /// If `cache_path` exists it is loaded as an F32 snapshot and requantized into this
+    /// instance's storage; otherwise the index is built in F32 from `x`, snapshotted to
+    /// `cache_path` (write-to-temp + rename, so a crash mid-write never publishes a torn
+    /// file), then requantized. Graph-shaping knobs (metric/m/ef_construction) must match
+    /// the cached build — the caller keys `cache_path` on them, and `requantize` re-checks
+    /// and errors loudly rather than trusting the key.
+    ///
+    /// Caveats, deliberate:
+    /// - The snapshot is a same-version cache (`snapshot_from_file` rejects other foxstash
+    ///   versions), so a stale cache dir after a rebuild fails loudly instead of silently
+    ///   benchmarking old code. Delete the dir and rerun.
+    /// - On a cache hit `x` is never copied; on a miss (and on every requantize) the F32
+    ///   source index is dropped before this returns, but the allocator may not hand that
+    ///   memory back to the OS — an RSS-based index-size metric can read high on cached
+    ///   runs. Cached runs are for recall/QPS iteration; take size numbers from a cold run.
+    #[pyo3(signature = (x, cache_path))]
+    fn fit_cached(
+        &mut self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        cache_path: &str,
+    ) -> PyResult<()> {
+        let path = std::path::PathBuf::from(cache_path);
+        let target = self.target_config();
+        let f32_config = self.f32_config();
+        let target_is_the_cached_build = target == f32_config;
+
+        let src = if path.exists() {
+            let loaded = py
+                .detach(|| HNSWIndex::snapshot_from_file(&path))
+                .map_err(|e| PyValueError::new_err(format!("foxstash: cache load failed: {e}")))?;
+            if loaded.embedding_dim() != self.dim {
+                return Err(PyValueError::new_err(format!(
+                    "foxstash: cache at {cache_path} holds {}-d vectors, this index wants {}-d \
+                     — the cache key must include the dataset",
+                    loaded.embedding_dim(),
+                    self.dim
+                )));
+            }
+            loaded
+        } else {
+            let embeddings = self.copy_rows(&x)?;
+            py.detach(move || -> foxstash_core::Result<HNSWIndex> {
+                let idx = HNSWIndex::build_parallel(embeddings, f32_config);
+                // Publish atomically: a concurrent process either sees the whole snapshot or
+                // none of it. PID-suffixed temp so two concurrent misses don't clobber each
+                // other's half-written file (they'll race the rename; last one wins, both
+                // renames are of complete files).
+                let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+                idx.snapshot_to_file(&tmp)?;
+                std::fs::rename(&tmp, &path)?;
+                Ok(idx)
+            })
+            .map_err(|e| PyValueError::new_err(format!("foxstash: cache build failed: {e}")))?
+        };
+
+        let index = if target_is_the_cached_build {
+            src // the cached build *is* the target; requantizing would only copy it
+        } else {
+            py.detach(move || src.requantize(target))
+                .map_err(|e| PyValueError::new_err(format!("foxstash: requantize failed: {e}")))?
+        };
         self.index = Some(index);
         Ok(())
     }
