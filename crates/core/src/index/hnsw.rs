@@ -287,7 +287,7 @@ impl Searcher<'_> {
 /// builds with `Parallel` at 1M and reports 99.5% recall), which means the evidence refuting the
 /// caveat was sitting in the README the whole time. A stale warning is not free: it keeps costing
 /// you until someone measures it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BuildStrategy {
     /// Rayon-parallel build. **The default.** 5.2x faster than `Sequential` at 1M vectors, for a
     /// recall cost of 0.02–0.31 points (see the table above).
@@ -303,7 +303,7 @@ pub enum BuildStrategy {
 }
 
 /// Configuration for HNSW index
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HNSWConfig {
     /// Distance metric used for both construction and search.
     ///
@@ -858,6 +858,40 @@ pub struct HNSWIndex {
     /// `Sequential`) while an index grown by `add()` never was, at any seed. The bug survived
     /// because its test, `random_level_never_panics`, asserted only that the call did not panic.
     level_rng: StdRng,
+}
+
+/// Bump when the meaning of any [`HNSWSnapshot`] field changes. Belt-and-braces on top of the
+/// crate-version check: two builds of the *same* crate version can still disagree if a field is
+/// reinterpreted on a dev branch.
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// The verbatim on-disk image behind [`HNSWIndex::snapshot_to_file`]. Every field is a direct
+/// clone of the corresponding `HNSWIndex` field except the two version stamps; `stride`, `hdr`
+/// and `level_rng` are derived from `config` on load rather than stored.
+///
+/// Same-version cache format only — see `snapshot_to_file` for why this is not the portable path.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HNSWSnapshot {
+    format_version: u32,
+    crate_version: String,
+    embedding_dim: usize,
+    config: HNSWConfig,
+    nodes: Vec<u32>,
+    connections: Vec<Vec<Vec<u32>>>,
+    q_min: Vec<f32>,
+    q_scale: Vec<f32>,
+    full: Vec<f32>,
+    rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
+    turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
+    turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
+    ids: Vec<String>,
+    contents: Vec<String>,
+    /// `serde_json::Value` cannot ride bincode (its `Deserialize` is self-describing —
+    /// `deserialize_any` — which a non-self-describing format rejects at runtime, not compile
+    /// time). Stored as JSON text and re-parsed on load.
+    metadata: Vec<Option<String>>,
+    entry_point: Option<usize>,
+    max_layer: usize,
 }
 
 /// **The** neighbour-selection algorithm. HNSW paper, Algorithm 4 (SELECT-NEIGHBORS-HEURISTIC).
@@ -1633,6 +1667,224 @@ impl HNSWIndex {
                 self.l0_replace(i, &neighbors);
             }
         }
+    }
+
+    /// Re-encode this index's vectors into a different storage mode, **reusing the graph**.
+    ///
+    /// The graph is storage-independent by construction — `build_parallel` selects edges with
+    /// exact f32 distances and only quantizes the traversal storage afterwards — so building
+    /// the same corpus once per storage mode repeats identical (and expensive) graph work to
+    /// reach an identical graph. `requantize` extracts this index's vectors and links, fits
+    /// the target storage's codebook, and re-encodes: minutes of encode instead of a rebuild.
+    ///
+    /// It is also the *cleaner experiment*: two direct builds never share a graph (the
+    /// parallel builder is non-reproducible even at a fixed seed), so storage comparisons
+    /// between them carry graph noise. Requantized siblings share the graph exactly — any
+    /// recall difference is the quantizer's alone.
+    ///
+    /// # Contract
+    /// - The source must be `Storage::F32` — the arena then holds exact vectors to re-encode.
+    ///   (A quantized source would re-encode its own reconstruction error.)
+    /// - `new_config` may change `storage`, the bit budgets, `rerank_candidates` and
+    ///   `ef_search`. It must NOT change `m`, `m0`, `metric` or `ef_construction`: the graph
+    ///   was built under those, and silently relabeling them would misdescribe the index
+    ///   (the same footgun class as the wasm config round-trip bug).
+    ///
+    /// # Errors
+    /// Returns [`RagError::InvalidInput`](crate::RagError::InvalidInput) on a non-F32 source
+    /// or a graph-relevant config mismatch.
+    pub fn requantize(&self, new_config: HNSWConfig) -> Result<HNSWIndex> {
+        if self.config.storage != Storage::F32 {
+            return Err(crate::RagError::InvalidInput(format!(
+                "requantize requires a Storage::F32 source (got {:?}) — a quantized source \
+                 would re-encode its own reconstruction error",
+                self.config.storage
+            )));
+        }
+        if new_config.m != self.config.m
+            || new_config.m0 != self.config.m0
+            || new_config.metric != self.config.metric
+            || new_config.ef_construction != self.config.ef_construction
+        {
+            return Err(crate::RagError::InvalidInput(
+                "requantize cannot change m, m0, metric or ef_construction — the graph was \
+                 built under them; build a fresh index instead"
+                    .into(),
+            ));
+        }
+
+        let n = self.len();
+        let points: Vec<Vec<f32>> = (0..n).map(|i| self.get_embedding(i).to_vec()).collect();
+
+        // Reassemble the nested per-layer links: upper layers are still nested; layer 0
+        // lives in the arena (post-`migrate_l0_into_arena`), so put it back into slot 0
+        // for the new index's own migrate pass.
+        let mut connections = self.connections.clone();
+        for (i, c) in connections.iter_mut().enumerate() {
+            let l0 = self.get_neighbors_l0(i).to_vec();
+            if c.is_empty() {
+                c.push(l0);
+            } else {
+                c[0] = l0;
+            }
+        }
+
+        // Same assembly as `build_parallel`'s finale: fit the codebook from the exact
+        // vectors, push every node in id order (id order is what aligns arena blocks with
+        // `ids`/`contents`/`metadata`), then hand layer 0 to the arena.
+        let mut index = Self {
+            level_rng: StdRng::seed_from_u64(new_config.seed.unwrap_or_else(rand::random)),
+            embedding_dim: self.embedding_dim,
+            stride: node_stride(
+                new_config.m0,
+                self.embedding_dim,
+                new_config.storage,
+                new_config.quant_bits(),
+            ),
+            hdr: node_hdr_len(new_config.m0),
+            config: new_config,
+            nodes: Vec::new(),
+            connections,
+            q_min: Vec::new(),
+            q_scale: Vec::new(),
+            full: Vec::new(),
+            rabitq: None,
+            turboquant: None,
+            turborabit: None,
+            ids: self.ids.clone(),
+            contents: self.contents.clone(),
+            metadata: self.metadata.clone(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+        };
+        index.fit_codebook(&points);
+        index.nodes.reserve(n * index.stride);
+        if index.config.storage != Storage::F32 && index.config.rerank_candidates > 0 {
+            index.full.reserve(n * self.embedding_dim);
+        }
+        for p in &points {
+            index.push_node(p);
+        }
+        index.migrate_l0_into_arena();
+        index.shrink_to_fit();
+        Ok(index)
+    }
+
+    /// Write a **verbatim binary snapshot**: arena words, links, codebooks, docs — the graph
+    /// comes back *identical*, not rebuilt.
+    ///
+    /// This exists because the JSON save/load path (`storage/file.rs`) deliberately
+    /// re-inserts documents through `add()` on load — which re-runs graph construction
+    /// (O(build) load time) and, the parallel builder being non-reproducible, returns a
+    /// *different graph* than was saved. Fine for portability; wrong for caching a build.
+    ///
+    /// **This is a same-version cache format, not an archival format**: it is raw bincode of
+    /// the in-memory layout, guarded by a version stamp — a snapshot written by a different
+    /// foxstash version refuses to load (with a clear error) instead of misreading. Use the
+    /// JSON path for anything that must outlive a version bump.
+    pub fn snapshot_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let snap = HNSWSnapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            embedding_dim: self.embedding_dim,
+            config: self.config.clone(),
+            nodes: self.nodes.clone(),
+            connections: self.connections.clone(),
+            q_min: self.q_min.clone(),
+            q_scale: self.q_scale.clone(),
+            full: self.full.clone(),
+            rabitq: self.rabitq.clone(),
+            turboquant: self.turboquant.clone(),
+            turborabit: self.turborabit.clone(),
+            ids: self.ids.clone(),
+            contents: self.contents.clone(),
+            metadata: self
+                .metadata
+                .iter()
+                .map(|m| m.as_ref().map(|v| v.to_string()))
+                .collect(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+        };
+        let file = std::fs::File::create(path)?;
+        bincode::serialize_into(std::io::BufWriter::new(file), &snap)?;
+        Ok(())
+    }
+
+    /// Load a [`Self::snapshot_to_file`] snapshot. The graph is restored verbatim; the level
+    /// RNG is reseeded from `config.seed` (a later incremental `add()` draws a fresh seeded
+    /// stream rather than continuing the original one — same caveat as the JSON path).
+    pub fn snapshot_from_file(path: &std::path::Path) -> Result<HNSWIndex> {
+        let file = std::fs::File::open(path)?;
+        let snap: HNSWSnapshot = bincode::deserialize_from(std::io::BufReader::new(file))?;
+        if snap.format_version != SNAPSHOT_FORMAT_VERSION
+            || snap.crate_version != env!("CARGO_PKG_VERSION")
+        {
+            return Err(crate::RagError::InvalidInput(format!(
+                "snapshot was written by foxstash {} (format v{}), this is {} (format v{}) — \
+                 snapshots are a same-version cache, rebuild the index",
+                snap.crate_version,
+                snap.format_version,
+                env!("CARGO_PKG_VERSION"),
+                SNAPSHOT_FORMAT_VERSION,
+            )));
+        }
+        let stride = node_stride(
+            snap.config.m0,
+            snap.embedding_dim,
+            snap.config.storage,
+            snap.config.quant_bits(),
+        );
+        if !snap.nodes.len().is_multiple_of(stride) {
+            return Err(crate::RagError::InvalidInput(format!(
+                "snapshot arena length {} is not a multiple of the node stride {} its config \
+                 implies — corrupt or mismatched snapshot",
+                snap.nodes.len(),
+                stride
+            )));
+        }
+        let n = snap.nodes.len() / stride;
+        if snap.ids.len() != n || snap.contents.len() != n || snap.metadata.len() != n {
+            return Err(crate::RagError::InvalidInput(format!(
+                "snapshot document arrays ({} ids) do not match its {} arena nodes",
+                snap.ids.len(),
+                n
+            )));
+        }
+        let metadata: Vec<Option<serde_json::Value>> = snap
+            .metadata
+            .into_iter()
+            .map(|m| {
+                m.map(|s| {
+                    serde_json::from_str(&s).map_err(|e| {
+                        crate::RagError::InvalidInput(format!(
+                            "snapshot metadata is not valid JSON: {e}"
+                        ))
+                    })
+                })
+                .transpose()
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            level_rng: StdRng::seed_from_u64(snap.config.seed.unwrap_or_else(rand::random)),
+            embedding_dim: snap.embedding_dim,
+            stride,
+            hdr: node_hdr_len(snap.config.m0),
+            config: snap.config,
+            nodes: snap.nodes,
+            connections: snap.connections,
+            q_min: snap.q_min,
+            q_scale: snap.q_scale,
+            full: snap.full,
+            rabitq: snap.rabitq,
+            turboquant: snap.turboquant,
+            turborabit: snap.turborabit,
+            ids: snap.ids,
+            contents: snap.contents,
+            metadata,
+            entry_point: snap.entry_point,
+            max_layer: snap.max_layer,
+        })
     }
 
     /// Adds a document to the index
@@ -4798,6 +5050,295 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `requantize` must preserve the graph EXACTLY (that is its whole claim) and produce a
+    /// working index in every target storage. Graph identity is asserted structurally —
+    /// layer-0 neighbour lists, upper layers, entry point — not via a recall proxy
+    /// (measure-the-output applies to the *quantizer*; the graph has an exact answer).
+    #[test]
+    fn requantize_preserves_graph_and_searches_in_every_storage() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let dim = 96;
+        let centers: Vec<Vec<f32>> = (0..12)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..600)
+            .map(|i| {
+                centers[i % 12]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|i| {
+                centers[i % 12]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+
+        let src_config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 16,
+            m0: 32,
+            ef_construction: 200,
+            ef_search: 100,
+            storage: Storage::F32,
+            rerank_candidates: 0,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let src = HNSWIndex::build_parallel(base.clone(), src_config.clone());
+
+        // Exact cosine ground truth for a recall floor per target.
+        let k = 10;
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt()).max(1e-9)
+        };
+        let truth: Vec<HashSet<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut s: Vec<(f32, usize)> =
+                    base.iter().enumerate().map(|(i, v)| (cos(v, q), i)).collect();
+                s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                s.into_iter().take(k).map(|(_, i)| i).collect()
+            })
+            .collect();
+
+        for (storage, tb, rb, floor) in [
+            (Storage::SQ8, 2, 3, 0.85),
+            (Storage::RaBitQ, 2, 3, 0.35), // 1-bit is legitimately coarse; floor is non-vacuous
+            (Storage::TurboQuant, 3, 3, 0.55),
+            (Storage::TurboRabit, 2, 3, 0.80),
+        ] {
+            let new_config = HNSWConfig {
+                storage,
+                turbo_bits: tb,
+                rabit_bits: rb,
+                rerank_candidates: 50,
+                ..src_config.clone()
+            };
+            let re = src.requantize(new_config).expect("requantize");
+
+            // Graph identity — exact, node by node.
+            assert_eq!(re.len(), src.len());
+            assert_eq!(re.entry_point, src.entry_point, "{storage:?}: entry point moved");
+            assert_eq!(re.max_layer, src.max_layer, "{storage:?}: max layer moved");
+            for i in 0..src.len() {
+                assert_eq!(
+                    re.get_neighbors_l0(i),
+                    src.get_neighbors_l0(i),
+                    "{storage:?}: node {i} layer-0 links differ"
+                );
+            }
+            assert_eq!(re.connections, src.connections, "{storage:?}: upper layers differ");
+
+            // And it actually searches.
+            let mut hits = 0usize;
+            for (q, gt) in queries.iter().zip(&truth) {
+                let got: HashSet<usize> = re
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                hits += gt.intersection(&got).count();
+            }
+            let recall = hits as f32 / (queries.len() * k) as f32;
+            assert!(
+                recall > floor,
+                "{storage:?}: requantized recall {recall} below floor {floor}"
+            );
+        }
+    }
+
+    /// The contract errors: quantized source, and graph-relevant config changes.
+    #[test]
+    fn requantize_rejects_bad_inputs() {
+        let mut rng = StdRng::seed_from_u64(32);
+        let base: Vec<Vec<f32>> = (0..200)
+            .map(|_| (0..32).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let config = HNSWConfig {
+            m: 8,
+            m0: 16,
+            seed: Some(1),
+            ..Default::default()
+        };
+        let f32_idx = HNSWIndex::build_parallel(base.clone(), config.clone());
+
+        // Non-F32 source.
+        let sq8 = f32_idx
+            .requantize(HNSWConfig {
+                storage: Storage::SQ8,
+                ..config.clone()
+            })
+            .expect("f32 -> sq8");
+        assert!(
+            sq8.requantize(HNSWConfig {
+                storage: Storage::RaBitQ,
+                ..config.clone()
+            })
+            .is_err(),
+            "requantizing a quantized source must be rejected"
+        );
+
+        // Graph-relevant change.
+        assert!(
+            f32_idx
+                .requantize(HNSWConfig {
+                    m: 12,
+                    storage: Storage::SQ8,
+                    ..config.clone()
+                })
+                .is_err(),
+            "changing m must be rejected"
+        );
+    }
+
+    /// The snapshot's whole claim is *verbatim*: the loaded index is bit-identical where the
+    /// JSON path is merely equivalent-ish (file.rs re-inserts through `add()`, so the parallel
+    /// builder hands back a different graph). Every config field is set off its default —
+    /// the save/load bug-class this guards against is a field silently dropped on one side
+    /// (the wasm path shipped exactly that: `turbo_bits` was never serialized).
+    #[test]
+    fn snapshot_round_trip_is_verbatim_in_every_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rng = StdRng::seed_from_u64(77);
+        let dim = 48;
+        let base: Vec<Vec<f32>> = (0..400)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+
+        for (label, storage) in [
+            ("f32", Storage::F32),
+            ("sq8", Storage::SQ8),
+            ("rabitq", Storage::RaBitQ),
+            ("turboquant", Storage::TurboQuant),
+            ("turborabit", Storage::TurboRabit),
+        ] {
+            // Every field non-default, so a dropped field cannot hide behind its default.
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 12,
+                m0: 24,
+                ef_construction: 150,
+                ef_search: 80,
+                storage,
+                turbo_bits: 4,
+                rabit_bits: 2,
+                rerank_candidates: if storage == Storage::F32 { 0 } else { 40 },
+                seed: Some(9),
+                ..Default::default()
+            };
+            let mut src = HNSWIndex::build_parallel(base.clone(), config);
+            // One incremental add with metadata, so `metadata` round-trips something real.
+            src.add(crate::Document {
+                id: "meta-doc".into(),
+                content: "has metadata".into(),
+                embedding: base[0].clone(),
+                metadata: Some(serde_json::json!({"k": 1})),
+            })
+            .expect("add");
+
+            let path = dir.path().join(format!("{label}.snap"));
+            src.snapshot_to_file(&path).expect("snapshot");
+            let re = HNSWIndex::snapshot_from_file(&path).expect("load");
+
+            // Verbatim: the arena and every sibling structure, bit for bit.
+            assert_eq!(re.nodes, src.nodes, "{label}: arena differs");
+            assert_eq!(re.connections, src.connections, "{label}: upper layers differ");
+            assert_eq!(re.stride, src.stride, "{label}: derived stride differs");
+            assert_eq!(re.hdr, src.hdr, "{label}: derived hdr differs");
+            assert_eq!(re.entry_point, src.entry_point, "{label}: entry point differs");
+            assert_eq!(re.max_layer, src.max_layer, "{label}: max layer differs");
+            assert_eq!(re.q_min, src.q_min, "{label}: q_min differs");
+            assert_eq!(re.q_scale, src.q_scale, "{label}: q_scale differs");
+            assert_eq!(re.full, src.full, "{label}: full vectors differ");
+            assert_eq!(re.ids, src.ids, "{label}: ids differ");
+            assert_eq!(re.contents, src.contents, "{label}: contents differ");
+            assert_eq!(re.metadata, src.metadata, "{label}: metadata differs");
+            assert_eq!(re.embedding_dim, src.embedding_dim);
+
+            // And behaviourally: identical results, scores included (same arena, same
+            // codebooks, same kernels — any difference is a load bug, not noise).
+            for q in &queries {
+                let a = src.search(q, 10).expect("src search");
+                let b = re.search(q, 10).expect("re search");
+                let a: Vec<(String, u32)> =
+                    a.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                let b: Vec<(String, u32)> =
+                    b.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                assert_eq!(a, b, "{label}: search results differ after load");
+            }
+        }
+    }
+
+    /// A snapshot is a same-version cache: a stamp from any other version (or a truncated
+    /// arena) must refuse to load with a clear error, never misread.
+    #[test]
+    fn snapshot_rejects_version_mismatch_and_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rng = StdRng::seed_from_u64(78);
+        let base: Vec<Vec<f32>> = (0..100)
+            .map(|_| (0..16).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let src = HNSWIndex::build_parallel(
+            base,
+            HNSWConfig {
+                m: 8,
+                m0: 16,
+                seed: Some(1),
+                ..Default::default()
+            },
+        );
+        let path = dir.path().join("good.snap");
+        src.snapshot_to_file(&path).expect("snapshot");
+
+        let good = std::fs::read(&path).expect("read");
+        let mut snap: HNSWSnapshot = bincode::deserialize(&good).expect("decode");
+
+        // Wrong crate version.
+        snap.crate_version = "0.0.0-other".into();
+        let bad = dir.path().join("bad-version.snap");
+        std::fs::write(&bad, bincode::serialize(&snap).unwrap()).unwrap();
+        match HNSWIndex::snapshot_from_file(&bad) {
+            Err(err) => assert!(
+                err.to_string().contains("0.0.0-other"),
+                "error should name the offending version, got: {err}"
+            ),
+            Ok(_) => panic!("wrong crate version must be rejected"),
+        }
+
+        // Wrong format version.
+        snap.crate_version = env!("CARGO_PKG_VERSION").into();
+        snap.format_version = SNAPSHOT_FORMAT_VERSION + 1;
+        std::fs::write(&bad, bincode::serialize(&snap).unwrap()).unwrap();
+        assert!(HNSWIndex::snapshot_from_file(&bad).is_err());
+
+        // Truncated arena (valid bincode, wrong length for the config's stride).
+        snap.format_version = SNAPSHOT_FORMAT_VERSION;
+        snap.nodes.pop();
+        std::fs::write(&bad, bincode::serialize(&snap).unwrap()).unwrap();
+        assert!(
+            HNSWIndex::snapshot_from_file(&bad).is_err(),
+            "arena not a multiple of stride must be rejected"
+        );
+
+        // The untampered file still loads.
+        assert!(HNSWIndex::snapshot_from_file(&path).is_ok());
     }
 
     #[test]
