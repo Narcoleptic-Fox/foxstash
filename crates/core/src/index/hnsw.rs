@@ -1873,8 +1873,29 @@ impl HNSWIndex {
         if self.config.storage != Storage::F32 && self.config.rerank_candidates > 0 {
             let pool = self.config.rerank_candidates.max(k).min(found.len());
             found.truncate(pool);
-            for entry in found.iter_mut() {
-                entry.0 = self.exact_distance(query, entry.1);
+            // Software-pipeline the pool reads. Each `exact_distance` gathers a
+            // `dim×4`-byte vector from the cold `full` array at an effectively random
+            // offset; unprefetched, every iteration serializes a full DRAM round-trip
+            // before the next can start. Prefetching a few entries ahead overlaps the
+            // fetch with the current entry's scoring — the same trick the walk uses at
+            // `search_layer` — and at rerank=500 this loop reads ~1.5 MB/query at 768-d,
+            // which dominates the high-recall operating points. Only the head lines are
+            // issued; `exact_distance` reads the vector sequentially, so the hardware
+            // streamer covers the tail (same rationale as VECTOR_LINES above).
+            const RERANK_PREFETCH_AHEAD: usize = 4;
+            const RERANK_HEAD_LINES: usize = 8; // 512 B of a 3 KB vector at 768-d
+            let dim = self.embedding_dim;
+            for i in 0..found.len() {
+                let ahead = i + RERANK_PREFETCH_AHEAD;
+                if ahead < found.len() {
+                    // SAFETY: prefetch is a hint — `wrapping_add` cannot leave the
+                    // allocation for a valid node id, and a stale line costs nothing.
+                    unsafe {
+                        let p = self.full.as_ptr().wrapping_add(found[ahead].1 * dim) as *const u8;
+                        prefetch_embedding(p, RERANK_HEAD_LINES);
+                    }
+                }
+                found[i].0 = self.exact_distance(query, found[i].1);
             }
             found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         }

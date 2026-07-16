@@ -22,8 +22,11 @@ const K: usize = 10;
 const CLUSTERS: usize = 200;
 const SIGMA: f32 = 0.05;
 const DIM: usize = 768;
-const EF: usize = 100;
-const RERANK: usize = 100;
+// Override via SMOKE_EF / SMOKE_RERANK to probe other operating points
+// (the frontier's max-recall configs run ef=500/rerank=500).
+fn env_or(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 
 struct Rng(u64);
 impl Rng {
@@ -70,6 +73,9 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() {
+    let ef = env_or("SMOKE_EF", 100);
+    let rerank = env_or("SMOKE_RERANK", 100);
+    println!("ef={ef} rerank={rerank}");
     let mut rng = Rng::new(42);
     let base = make_clustered(&mut rng, N);
     let queries = make_clustered(&mut rng, NQ);
@@ -106,11 +112,11 @@ fn main() {
             m: 16,
             m0: 32,
             ef_construction: 200,
-            ef_search: EF,
+            ef_search: ef,
             storage,
             turbo_bits: tb,
             rabit_bits: rb,
-            rerank_candidates: if storage == Storage::F32 { 0 } else { RERANK },
+            rerank_candidates: if storage == Storage::F32 { 0 } else { rerank },
             seed: Some(7),
             ..Default::default()
         };
