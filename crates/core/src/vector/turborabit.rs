@@ -202,7 +202,11 @@ impl TurboRabitQuantizer {
 
         // Fold signs back in: sign bit (MSB) = (r[i] >= 0), magnitude
         // bit-flipped for negative coordinates. Grid value = u + c_B.
-        let mask = if ex_bits == 0 { 0 } else { (1u8 << ex_bits) - 1 };
+        let mask = if ex_bits == 0 {
+            0
+        } else {
+            (1u8 << ex_bits) - 1
+        };
         let mut codes = vec![0u8; d];
         for (i, (&ri, &mi)) in r.iter().zip(&m_pos).enumerate() {
             codes[i] = if ri >= 0.0 {
@@ -460,8 +464,7 @@ mod tests {
                     let got = objective(&a, ex_bits, t_star);
 
                     let max_a = a.iter().cloned().fold(0.0f64, f64::max);
-                    let t_end =
-                        (((1u64 << ex_bits) - 1) + N_ENUM as u64) as f64 / max_a;
+                    let t_end = (((1u64 << ex_bits) - 1) + N_ENUM as u64) as f64 / max_a;
                     let mut best_grid = 0.0f64;
                     for k in 1..=4000 {
                         let t = t_end * k as f64 / 4000.0;
@@ -516,8 +519,7 @@ mod tests {
             let n = 200;
             let mut acc = 0.0f64;
             for s in 0..n {
-                let quant =
-                    TurboRabitQuantizer::fit_with_seed(&train, bits, 1000 + s as u64);
+                let quant = TurboRabitQuantizer::fit_with_seed(&train, bits, 1000 + s as u64);
                 let est = quant.estimate_dist_sq(&quant.prepare_query(&q), &quant.encode(&x));
                 acc += est as f64;
             }
@@ -546,9 +548,7 @@ mod tests {
                 let mut ds: Vec<(usize, f32)> = base
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| {
-                        (i, x.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum())
-                    })
+                    .map(|(i, x)| (i, x.iter().zip(q).map(|(a, b)| (a - b) * (a - b)).sum()))
                     .collect();
                 ds.sort_by(|a, b| a.1.total_cmp(&b.1));
                 ds.into_iter().take(k).map(|(i, _)| i).collect()

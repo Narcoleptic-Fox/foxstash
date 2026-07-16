@@ -1349,7 +1349,10 @@ mod nibble_lut_dot_tests {
         let nibbles = vec![0x10u8; 8]; // alternating codes 0, 1
         let levels = vec![-0.8f32, 0.8];
         let got = nibble_lut_dot_simd(&pq, &nibbles, &levels);
-        assert!((got - 0.0).abs() < 1e-5, "8×(-0.8) + 8×0.8 should cancel, got {got}");
+        assert!(
+            (got - 0.0).abs() < 1e-5,
+            "8×(-0.8) + 8×0.8 should cancel, got {got}"
+        );
     }
 }
 

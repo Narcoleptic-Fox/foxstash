@@ -43,9 +43,9 @@ pub mod store;
 // ── Desktop-only imports and types ──
 
 #[cfg(not(target_arch = "wasm32"))]
-use foxstash_core::index::{HNSWConfig, Storage};
-#[cfg(not(target_arch = "wasm32"))]
 use crate::inverted_index::BM25Config;
+#[cfg(not(target_arch = "wasm32"))]
+use foxstash_core::index::{HNSWConfig, Storage};
 use foxstash_core::storage::IncrementalConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use thiserror::Error;

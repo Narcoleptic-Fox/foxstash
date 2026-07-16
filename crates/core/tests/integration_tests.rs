@@ -9,9 +9,7 @@
 //! - Edge cases (empty index, single doc, zero vectors, k > n)
 //! - Concurrent parallel search
 
-use foxstash_core::index::{
-    DistanceMetric, FlatIndex, HNSWConfig, HNSWIndex, Storage,
-};
+use foxstash_core::index::{DistanceMetric, FlatIndex, HNSWConfig, HNSWIndex, Storage};
 use foxstash_core::storage::compression::{self, Codec};
 use foxstash_core::storage::file::{FileStorage, FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::storage::incremental::{

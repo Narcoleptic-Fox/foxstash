@@ -587,8 +587,11 @@ mod tests {
         let truth: Vec<Vec<usize>> = queries
             .iter()
             .map(|q| {
-                let mut ips: Vec<(usize, f32)> =
-                    base.iter().enumerate().map(|(i, x)| (i, dot(q, x))).collect();
+                let mut ips: Vec<(usize, f32)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (i, dot(q, x)))
+                    .collect();
                 ips.sort_by(|a, b| b.1.total_cmp(&a.1));
                 ips.into_iter().take(k).map(|(i, _)| i).collect()
             })

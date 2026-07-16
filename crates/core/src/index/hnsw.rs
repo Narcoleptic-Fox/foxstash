@@ -955,7 +955,10 @@ fn select_neighbors_core(
         if selected.len() >= m {
             break;
         }
-        if selected.iter().all(|&(_, sid)| dist_between(cid, sid) >= dq) {
+        if selected
+            .iter()
+            .all(|&(_, sid)| dist_between(cid, sid) >= dq)
+        {
             selected.push((dq, cid));
         } else {
             pruned.push((dq, cid));
@@ -974,7 +977,6 @@ fn select_neighbors_core(
     selected
 }
 
-
 impl HNSWIndex {
     /// Creates a new HNSW index with custom configuration
     ///
@@ -986,7 +988,12 @@ impl HNSWIndex {
         Self {
             level_rng,
             embedding_dim,
-            stride: node_stride(config.m0, embedding_dim, config.storage, config.quant_bits()),
+            stride: node_stride(
+                config.m0,
+                embedding_dim,
+                config.storage,
+                config.quant_bits(),
+            ),
             hdr: node_hdr_len(config.m0),
             config,
             nodes: Vec::new(),
@@ -1094,9 +1101,10 @@ impl HNSWIndex {
                             n
                         })
                         .collect();
-                    self.turborabit = Some(
-                        crate::vector::turborabit::TurboRabitQuantizer::fit(&normalized, bits),
-                    );
+                    self.turborabit = Some(crate::vector::turborabit::TurboRabitQuantizer::fit(
+                        &normalized,
+                        bits,
+                    ));
                 } else {
                     self.turborabit = Some(crate::vector::turborabit::TurboRabitQuantizer::fit(
                         embeddings, bits,
@@ -1374,9 +1382,14 @@ impl HNSWIndex {
         }
 
         // Pre-allocate
-        index
-            .nodes
-            .reserve(n * node_stride(index.config.m0, embedding_dim, index.config.storage, index.config.quant_bits()));
+        index.nodes.reserve(
+            n * node_stride(
+                index.config.m0,
+                embedding_dim,
+                index.config.storage,
+                index.config.quant_bits(),
+            ),
+        );
         index.fit_codebook(&embeddings);
         index.connections.reserve(n);
         index.ids.reserve(n);
@@ -1641,8 +1654,7 @@ impl HNSWIndex {
                 self.nodes[v] = code.dtc_sq.to_bits();
                 self.nodes[v + 1] = code.f_rescale.to_bits();
                 let nw = nibble_words(self.embedding_dim);
-                let nib: &mut [u8] =
-                    bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + nw]);
+                let nib: &mut [u8] = bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + nw]);
                 for (i, &c) in code.codes.iter().enumerate() {
                     nib[i / 2] |= c << (4 * (i % 2));
                 }
@@ -2310,7 +2322,12 @@ impl HNSWIndex {
         let n = self.len();
         let arena = self.nodes.capacity() * std::mem::size_of::<u32>();
         // Bytes the *traversal* reads for vectors: 4/dim under F32, 1/dim under SQ8.
-        let hot_vectors = n * vec_words(self.config.storage, self.embedding_dim, self.config.quant_bits()) * 4;
+        let hot_vectors =
+            n * vec_words(
+                self.config.storage,
+                self.embedding_dim,
+                self.config.quant_bits(),
+            ) * 4;
         // Under SQ8 the f32 vectors still exist, in the cold rerank array.
         let cold_vectors = self.full.capacity() * std::mem::size_of::<f32>();
 
@@ -2641,9 +2658,15 @@ impl HNSWIndex {
             self.config.keep_pruned_connections,
             |id| {
                 if layer == 0 {
-                    self.get_neighbors_l0(id).iter().map(|&n| n as usize).collect()
+                    self.get_neighbors_l0(id)
+                        .iter()
+                        .map(|&n| n as usize)
+                        .collect()
                 } else if layer < self.connections[id].len() {
-                    self.connections[id][layer].iter().map(|&n| n as usize).collect()
+                    self.connections[id][layer]
+                        .iter()
+                        .map(|&n| n as usize)
+                        .collect()
                 } else {
                     Vec::new()
                 }
@@ -2828,9 +2851,8 @@ impl HNSWIndex {
             let mut ip = gamma * tq.qjl_scale() * s;
             if tq.mse_bits() > 0 {
                 let start = v + 1 + bit_words;
-                let nib: &[u8] = bytemuck::cast_slice(
-                    &self.nodes[start..start + nibble_words(tq.padded_dim())],
-                );
+                let nib: &[u8] =
+                    bytemuck::cast_slice(&self.nodes[start..start + nibble_words(tq.padded_dim())]);
                 ip += crate::vector::simd::nibble_lut_dot_simd(prepared.pq(), nib, tq.levels());
             }
             return match self.config.metric {
@@ -2858,12 +2880,10 @@ impl HNSWIndex {
             let v = node_id * self.stride + self.hdr;
             let dtc_sq = f32::from_bits(self.nodes[v]);
             let f_rescale = f32::from_bits(self.nodes[v + 1]);
-            let nib: &[u8] = bytemuck::cast_slice(
-                &self.nodes[v + 2..v + 2 + nibble_words(self.embedding_dim)],
-            );
+            let nib: &[u8] =
+                bytemuck::cast_slice(&self.nodes[v + 2..v + 2 + nibble_words(self.embedding_dim)]);
             let dot = crate::vector::simd::nibble_uint_dot_simd(prepared.rq(), nib);
-            let raw =
-                (dtc_sq + prepared.qn_sq() + f_rescale * (dot + prepared.cb_sum())).max(0.0);
+            let raw = (dtc_sq + prepared.qn_sq() + f_rescale * (dot + prepared.cb_sum())).max(0.0);
             return match self.config.metric {
                 DistanceMetric::L2 => raw,
                 DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
@@ -3220,8 +3240,10 @@ impl HNSWIndex {
         extend_candidates: bool,
         zero: &[RwLock<ZeroNode>],
     ) -> Vec<Candidate> {
-        let scored: Vec<(f32, usize)> =
-            sorted.iter().map(|c| (c.distance, c.pid.as_usize())).collect();
+        let scored: Vec<(f32, usize)> = sorted
+            .iter()
+            .map(|c| (c.distance, c.pid.as_usize()))
+            .collect();
 
         select_neighbors_core(
             &scored,
@@ -3234,7 +3256,10 @@ impl HNSWIndex {
             |a, b| Self::parallel_distance(metric, &points[a], &points[b]),
         )
         .into_iter()
-        .map(|(distance, id)| Candidate { distance, pid: PointId(id as u32) })
+        .map(|(distance, id)| Candidate {
+            distance,
+            pid: PointId(id as u32),
+        })
         .collect()
     }
 
@@ -3376,7 +3401,12 @@ impl HNSWIndex {
             // bulk-built index continues a reproducible stream rather than starting a random one.
             level_rng: StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random)),
             embedding_dim,
-            stride: node_stride(config.m0, embedding_dim, config.storage, config.quant_bits()),
+            stride: node_stride(
+                config.m0,
+                embedding_dim,
+                config.storage,
+                config.quant_bits(),
+            ),
             hdr: node_hdr_len(config.m0),
             config,
             nodes: Vec::new(),
@@ -4493,18 +4523,38 @@ mod tests {
     #[test]
     fn random_level_never_panics_and_comes_from_the_seeded_stream() {
         let draws = |seed: Option<u64>| -> Vec<usize> {
-            let mut index = HNSWIndex::new(3, HNSWConfig { seed, ..Default::default() });
+            let mut index = HNSWIndex::new(
+                3,
+                HNSWConfig {
+                    seed,
+                    ..Default::default()
+                },
+            );
             (0..10_000).map(|_| index.random_level()).collect()
         };
 
         // ln(0) is impossible: a level is finite, so it is small. (`as usize` on -inf saturates
         // to 0 rather than panicking, so assert the shape of the distribution, not just liveness.)
         let a = draws(Some(7));
-        assert!(a.iter().all(|&l| l < 64), "exponential decay must not produce absurd levels");
-        assert!(a.iter().any(|&l| l > 0), "every node landing on layer 0 means ml is not applied");
+        assert!(
+            a.iter().all(|&l| l < 64),
+            "exponential decay must not produce absurd levels"
+        );
+        assert!(
+            a.iter().any(|&l| l > 0),
+            "every node landing on layer 0 means ml is not applied"
+        );
 
-        assert_eq!(a, draws(Some(7)), "a fixed seed must give a reproducible level sequence");
-        assert_ne!(a, draws(Some(8)), "a different seed must give a different level sequence");
+        assert_eq!(
+            a,
+            draws(Some(7)),
+            "a fixed seed must give a reproducible level sequence"
+        );
+        assert_ne!(
+            a,
+            draws(Some(8)),
+            "a different seed must give a different level sequence"
+        );
     }
 
     /// `seed` must reach the INCREMENTAL path too, not just the bulk builders.
@@ -4516,13 +4566,22 @@ mod tests {
     #[test]
     fn seed_reaches_the_incremental_add_path() {
         let vecs: Vec<Vec<f32>> = (0..200)
-            .map(|i| (0..8).map(|d| ((i * 7 + d * 13) % 40) as f32 * 0.1).collect())
+            .map(|i| {
+                (0..8)
+                    .map(|d| ((i * 7 + d * 13) % 40) as f32 * 0.1)
+                    .collect()
+            })
             .collect();
 
         let grown = |seed: u64| -> Vec<Vec<u32>> {
             let mut ix = HNSWIndex::new(
                 8,
-                HNSWConfig { seed: Some(seed), m: 4, m0: 8, ..Default::default() },
+                HNSWConfig {
+                    seed: Some(seed),
+                    m: 4,
+                    m0: 8,
+                    ..Default::default()
+                },
             );
             for (i, v) in vecs.iter().enumerate() {
                 ix.add_embedding(i.to_string(), v.clone()).unwrap();
@@ -4542,7 +4601,11 @@ mod tests {
             "an index grown by add() must be reproducible at a fixed seed -- `add` is inherently \
              sequential, so unlike the parallel bulk builder it has no thread race to blame"
         );
-        assert_ne!(grown(7), grown(9), "a different seed must give a different graph");
+        assert_ne!(
+            grown(7),
+            grown(9),
+            "a different seed must give a different graph"
+        );
     }
 
     // ========================================================================
@@ -4801,7 +4864,9 @@ mod tests {
             .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
             .collect();
         let jitter = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
-            c.iter().map(|x| x + rng.random::<f32>() * 0.5 - 0.25).collect()
+            c.iter()
+                .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                .collect()
         };
         let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
             .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
@@ -4824,8 +4889,11 @@ mod tests {
         let truth: Vec<HashSet<usize>> = queries
             .iter()
             .map(|q| {
-                let mut s: Vec<(f32, usize)> =
-                    base.iter().enumerate().map(|(i, v)| (cos(v, q), i)).collect();
+                let mut s: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (cos(v, q), i))
+                    .collect();
                 s.sort_by(|a, b| b.0.total_cmp(&a.0));
                 s.into_iter().take(k).map(|(_, i)| i).collect()
             })
@@ -4862,7 +4930,10 @@ mod tests {
         let r4 = recall_for(4);
         // Non-vacuous floor (sabotaging the estimator collapses this), and more bits never hurt.
         assert!(r2 > 0.6, "TurboQuant b=2 recall too low end-to-end: {r2}");
-        assert!(r4 >= r2 - 0.05, "b=4 ({r4}) unexpectedly far below b=2 ({r2})");
+        assert!(
+            r4 >= r2 - 0.05,
+            "b=4 ({r4}) unexpectedly far below b=2 ({r2})"
+        );
     }
 
     /// End-to-end recall through the real index under [`Storage::TurboRabit`] — same contract
@@ -4879,7 +4950,9 @@ mod tests {
             .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
             .collect();
         let jitter = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
-            c.iter().map(|x| x + rng.random::<f32>() * 0.5 - 0.25).collect()
+            c.iter()
+                .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                .collect()
         };
         let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
             .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
@@ -4898,9 +4971,8 @@ mod tests {
             }
             d / (na.sqrt() * nb.sqrt()).max(1e-9)
         };
-        let l2 = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
-        };
+        let l2 =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };
 
         let truth_for = |better_first: &dyn Fn(&[f32], &[f32]) -> f32, descending: bool| {
             queries
@@ -4916,7 +4988,10 @@ mod tests {
                     } else {
                         s.sort_by(|a, b| a.0.total_cmp(&b.0));
                     }
-                    s.into_iter().take(k).map(|(_, i)| i).collect::<HashSet<usize>>()
+                    s.into_iter()
+                        .take(k)
+                        .map(|(_, i)| i)
+                        .collect::<HashSet<usize>>()
                 })
                 .collect::<Vec<_>>()
         };
@@ -4952,13 +5027,22 @@ mod tests {
         let truth_cos = truth_for(&cos, true);
         let r2 = recall_for(DistanceMetric::Cosine, 2, &truth_cos);
         let r4 = recall_for(DistanceMetric::Cosine, 4, &truth_cos);
-        assert!(r2 > 0.6, "TurboRabit b=2 cosine recall too low end-to-end: {r2}");
-        assert!(r4 >= r2 - 0.05, "b=4 ({r4}) unexpectedly far below b=2 ({r2})");
+        assert!(
+            r2 > 0.6,
+            "TurboRabit b=2 cosine recall too low end-to-end: {r2}"
+        );
+        assert!(
+            r4 >= r2 - 0.05,
+            "b=4 ({r4}) unexpectedly far below b=2 ({r2})"
+        );
 
         // L2: the estimator is native squared-L2, no proxy — hold it to the same floor.
         let truth_l2 = truth_for(&l2, false);
         let r3_l2 = recall_for(DistanceMetric::L2, 3, &truth_l2);
-        assert!(r3_l2 > 0.6, "TurboRabit b=3 L2 recall too low end-to-end: {r3_l2}");
+        assert!(
+            r3_l2 > 0.6,
+            "TurboRabit b=3 L2 recall too low end-to-end: {r3_l2}"
+        );
     }
 
     /// The packed arena walk and the quantizer module are two implementations of one
@@ -5118,8 +5202,11 @@ mod tests {
         let truth: Vec<HashSet<usize>> = queries
             .iter()
             .map(|q| {
-                let mut s: Vec<(f32, usize)> =
-                    base.iter().enumerate().map(|(i, v)| (cos(v, q), i)).collect();
+                let mut s: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (cos(v, q), i))
+                    .collect();
                 s.sort_by(|a, b| b.0.total_cmp(&a.0));
                 s.into_iter().take(k).map(|(_, i)| i).collect()
             })
@@ -5142,7 +5229,10 @@ mod tests {
 
             // Graph identity — exact, node by node.
             assert_eq!(re.len(), src.len());
-            assert_eq!(re.entry_point, src.entry_point, "{storage:?}: entry point moved");
+            assert_eq!(
+                re.entry_point, src.entry_point,
+                "{storage:?}: entry point moved"
+            );
             assert_eq!(re.max_layer, src.max_layer, "{storage:?}: max layer moved");
             for i in 0..src.len() {
                 assert_eq!(
@@ -5151,7 +5241,10 @@ mod tests {
                     "{storage:?}: node {i} layer-0 links differ"
                 );
             }
-            assert_eq!(re.connections, src.connections, "{storage:?}: upper layers differ");
+            assert_eq!(
+                re.connections, src.connections,
+                "{storage:?}: upper layers differ"
+            );
 
             // And it actually searches.
             let mut hits = 0usize;
@@ -5270,10 +5363,16 @@ mod tests {
 
             // Verbatim: the arena and every sibling structure, bit for bit.
             assert_eq!(re.nodes, src.nodes, "{label}: arena differs");
-            assert_eq!(re.connections, src.connections, "{label}: upper layers differ");
+            assert_eq!(
+                re.connections, src.connections,
+                "{label}: upper layers differ"
+            );
             assert_eq!(re.stride, src.stride, "{label}: derived stride differs");
             assert_eq!(re.hdr, src.hdr, "{label}: derived hdr differs");
-            assert_eq!(re.entry_point, src.entry_point, "{label}: entry point differs");
+            assert_eq!(
+                re.entry_point, src.entry_point,
+                "{label}: entry point differs"
+            );
             assert_eq!(re.max_layer, src.max_layer, "{label}: max layer differs");
             assert_eq!(re.q_min, src.q_min, "{label}: q_min differs");
             assert_eq!(re.q_scale, src.q_scale, "{label}: q_scale differs");
@@ -5557,7 +5656,11 @@ mod tests {
             ),
             "raising the rerank pool on a vectors-dropped index must be an error"
         );
-        assert_eq!(dropped.rerank_candidates(), 0, "the refused set must not take effect");
+        assert_eq!(
+            dropped.rerank_candidates(),
+            0,
+            "the refused set must not take effect"
+        );
         // Lowering to 0 is always fine — nothing to rescore against is what it already wants.
         assert!(dropped.set_rerank_candidates(0).is_ok());
 
@@ -6140,9 +6243,9 @@ mod tests {
             let mut index = HNSWIndex::new(2, config);
             index.push_node(&d); // id 0
             index.push_node(&e); // id 1
-            // D's only layer-0 neighbour is E. `candidates` passed to `select_neighbors` below
-            // is `[0]` (D) only — E is reachable exclusively by walking this link, which only
-            // happens when `extend_candidates` is set.
+                                 // D's only layer-0 neighbour is E. `candidates` passed to `select_neighbors` below
+                                 // is `[0]` (D) only — E is reachable exclusively by walking this link, which only
+                                 // happens when `extend_candidates` is set.
             index.l0_push(0, 1);
             index
         };
@@ -6406,7 +6509,10 @@ mod tests {
             norm(&mut v);
             v
         };
-        let sample_from = |rng: &mut StdRng, centers: &[Vec<f32>], gauss: &mut dyn FnMut(&mut StdRng) -> f32| -> Vec<f32> {
+        let sample_from = |rng: &mut StdRng,
+                           centers: &[Vec<f32>],
+                           gauss: &mut dyn FnMut(&mut StdRng) -> f32|
+         -> Vec<f32> {
             let c = &centers[rng.random::<u64>() as usize % centers.len()];
             let mut v: Vec<f32> = c.iter().map(|x| x + 0.05 * gauss(rng)).collect();
             norm(&mut v);
@@ -6418,10 +6524,12 @@ mod tests {
         // both builders ~100% and hide the gap.)
         let base_centers: Vec<Vec<f32>> = (0..100).map(|_| unit(&mut rng)).collect();
         let query_centers: Vec<Vec<f32>> = (0..100).map(|_| unit(&mut rng)).collect();
-        let base: Vec<Vec<f32>> =
-            (0..10_000).map(|_| sample_from(&mut rng, &base_centers, &mut gauss)).collect();
-        let queries: Vec<Vec<f32>> =
-            (0..200).map(|_| sample_from(&mut rng, &query_centers, &mut gauss)).collect();
+        let base: Vec<Vec<f32>> = (0..10_000)
+            .map(|_| sample_from(&mut rng, &base_centers, &mut gauss))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..200)
+            .map(|_| sample_from(&mut rng, &query_centers, &mut gauss))
+            .collect();
 
         const K: usize = 10;
         let truth: Vec<Vec<usize>> = queries
@@ -6431,7 +6539,10 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(j, v)| {
-                        (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j)
+                        (
+                            q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(),
+                            j,
+                        )
                     })
                     .collect();
                 d.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -6626,11 +6737,7 @@ mod tests {
         // And the unwelcome half of the truth, pinned so it cannot rot silently.
         let par_a = graph_of(BuildStrategy::Parallel);
         let par_b = graph_of(BuildStrategy::Parallel);
-        let differing = par_a
-            .iter()
-            .zip(&par_b)
-            .filter(|(x, y)| x != y)
-            .count();
+        let differing = par_a.iter().zip(&par_b).filter(|(x, y)| x != y).count();
         assert!(
             differing > 0,
             "the parallel builder has become reproducible under a fixed seed ({differing} nodes \

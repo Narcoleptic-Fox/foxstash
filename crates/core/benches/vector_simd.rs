@@ -3,12 +3,12 @@
 //! This benchmark suite measures the performance improvement from SIMD acceleration
 //! for various vector operations across different dimensions.
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::vector::{
     cosine_similarity, cosine_similarity_simd, dot_product, dot_product_simd, l2_distance,
     l2_distance_simd,
 };
+use std::hint::black_box;
 
 fn create_test_vectors(size: usize) -> (Vec<f32>, Vec<f32>) {
     let a: Vec<f32> = (0..size).map(|i| (i as f32) / (size as f32)).collect();
