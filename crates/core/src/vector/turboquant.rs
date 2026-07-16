@@ -38,26 +38,50 @@ use serde::{Deserialize, Serialize};
 /// Default seed for `Π` and `S`, so builds are reproducible by default.
 const DEFAULT_SEED: u64 = 0x_5455_5242_4F51_5421; // "TURBOQ!" ish
 
+/// Number of Rademacher-flip + FWHT rounds in the structured rotation. One round is the
+/// Fast-TurboQuant minimum; the RaBitQ-Library `FhtKacRotator` uses 4 for Haar-like mixing
+/// at negligible cost (each round is `O(P log P)` additions), and we match it.
+const FHT_ROUNDS: usize = 4;
+
+/// The padded dimension the structured rotation operates in: the next power of two
+/// (FWHT butterflies need one). Codes and the rotated query live at this length; the
+/// QJL sketch and residual stay at the original `dim`. One definition — the HNSW arena
+/// sizes its nibble section with this same function.
+pub const fn fht_padded_dim(dim: usize) -> usize {
+    dim.next_power_of_two()
+}
+
 /// Data-oblivious multi-bit quantizer. Holds only dimension-derived state
-/// (rotation, sketch, Gaussian codebook) — never anything fitted to the data.
+/// (rotation flips, sketch, Gaussian codebook) — never anything fitted to the data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurboQuantizer {
     dim: usize,
+    /// `dim.next_power_of_two()` — the length the rotation, codes, and rotated query
+    /// live at. Fast-TurboQuant's zero-padding: energy spreads over more, smaller
+    /// coordinates, which the paper reports *reduces* quantization MSE.
+    padded_dim: usize,
     /// Bits per coordinate for the MSE scalar code (`= total_bits - 1`).
     mse_bits: usize,
-    /// Row-major `dim×dim` orthonormal rotation `Π`.
-    rotation: Vec<f32>,
-    /// Row-major `dim×dim` Gaussian QJL sketch `S` (i.i.d. `N(0,1)`).
+    /// Rademacher sign diagonals for the structured rotation `Π = (H·D_k)^(FHT_ROUNDS)`
+    /// (Fast-TurboQuant, arXiv:2606.21448): `FHT_ROUNDS · padded_dim/8` bytes, rounds
+    /// concatenated, bit `i%8` of byte `i/8` within each round. Replaces the dense
+    /// `dim×dim` matrix — `O(P log P)` additions instead of `O(d²)` multiplies, and no
+    /// `d²·4`-byte matrix to store or stream.
+    flips: Vec<u8>,
+    /// Row-major `dim×dim` Gaussian QJL sketch `S` (i.i.d. `N(0,1)`). Deliberately NOT
+    /// replaced by the structured transform: the QJL debias constant `√(π/2)/d` is
+    /// derived for a Gaussian sketch, and the sketch runs over the (unpadded) residual.
     sketch: Vec<f32>,
-    /// `2^mse_bits` reconstruction levels for `N(0, 1/d)` (empty if `mse_bits == 0`).
+    /// `2^mse_bits` reconstruction levels for `N(0, 1/padded_dim)` (empty if `mse_bits == 0`).
     levels: Vec<f32>,
 }
 
 /// TurboQuant code for one vector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurboCode {
-    /// One MSE codebook index per coordinate (`< 2^mse_bits`). Empty if `mse_bits == 0`.
-    /// One `u8` per coordinate here for clarity; the HNSW arena packs to `mse_bits`.
+    /// One MSE codebook index per PADDED coordinate (`< 2^mse_bits`; length
+    /// [`TurboQuantizer::padded_dim`]). Empty if `mse_bits == 0`. One `u8` per
+    /// coordinate here for clarity; the HNSW arena packs to nibbles.
     pub idx: Vec<u8>,
     /// Packed QJL sign bits of `S·r` (`ceil(dim/8)` bytes).
     pub qjl: Vec<u8>,
@@ -101,24 +125,30 @@ impl TurboQuantizer {
         assert!(dim > 0, "Dimension must be positive");
         assert!(total_bits > 0, "total_bits must be >= 1");
         let mse_bits = total_bits - 1;
+        let padded_dim = fht_padded_dim(dim);
 
-        // Independent seeds for the two matrices so they are uncorrelated.
-        let rotation = random_orthonormal(dim, seed);
+        // Independent seeds for the flips and the sketch so they are uncorrelated.
+        let mut rng = StdRng::seed_from_u64(seed);
+        let flips: Vec<u8> = (0..FHT_ROUNDS * padded_dim.div_ceil(8))
+            .map(|_| rng.random::<u8>())
+            .collect();
         let sketch = gaussian_matrix(dim, seed ^ 0x9E37_79B9_7F4A_7C15);
 
-        // Codebook: Lloyd–Max levels for the unit Gaussian, scaled to N(0, 1/d).
+        // Codebook: Lloyd–Max levels for the unit Gaussian, scaled to N(0, 1/P) — the
+        // rotation spreads a unit vector's energy over the PADDED coordinates.
         let levels = if mse_bits == 0 {
             Vec::new()
         } else {
             let unit = derive_gaussian_lloyd_max(1usize << mse_bits);
-            let sigma = 1.0 / (dim as f32).sqrt();
+            let sigma = 1.0 / (padded_dim as f32).sqrt();
             unit.into_iter().map(|c| c * sigma).collect()
         };
 
         Self {
             dim,
+            padded_dim,
             mse_bits,
-            rotation,
+            flips,
             sketch,
             levels,
         }
@@ -148,9 +178,56 @@ impl TurboQuantizer {
         (std::f32::consts::PI / 2.0).sqrt() / self.dim as f32
     }
 
+    /// Padded (power-of-two) dimension — the length of `TurboCode::idx` and of the
+    /// rotated query [`PreparedQuery::pq`].
+    pub fn padded_dim(&self) -> usize {
+        self.padded_dim
+    }
+
     /// Number of QJL sign bytes per code.
     fn qjl_bytes(&self) -> usize {
         self.dim.div_ceil(8)
+    }
+
+    /// `Π·x` — the structured rotation: `FHT_ROUNDS` rounds of (Rademacher sign flip →
+    /// normalized FWHT), applied to the zero-padded input, in place. Orthonormal by
+    /// construction: each diagonal is its own inverse and the normalized Hadamard is its
+    /// own inverse, so [`Self::rotate_inv`] just replays the rounds backwards.
+    fn rotate(&self, x: &mut [f32]) {
+        debug_assert_eq!(x.len(), self.padded_dim);
+        let round_bytes = self.padded_dim.div_ceil(8);
+        for k in 0..FHT_ROUNDS {
+            let flips = &self.flips[k * round_bytes..(k + 1) * round_bytes];
+            for (i, v) in x.iter_mut().enumerate() {
+                if (flips[i / 8] >> (i % 8)) & 1 == 1 {
+                    *v = -*v;
+                }
+            }
+            fwht_normalized(x);
+        }
+    }
+
+    /// `Πᵀ·y` — exact inverse of [`Self::rotate`]: rounds in reverse, FWHT first
+    /// (self-inverse), then the same sign diagonal.
+    fn rotate_inv(&self, y: &mut [f32]) {
+        debug_assert_eq!(y.len(), self.padded_dim);
+        let round_bytes = self.padded_dim.div_ceil(8);
+        for k in (0..FHT_ROUNDS).rev() {
+            fwht_normalized(y);
+            let flips = &self.flips[k * round_bytes..(k + 1) * round_bytes];
+            for (i, v) in y.iter_mut().enumerate() {
+                if (flips[i / 8] >> (i % 8)) & 1 == 1 {
+                    *v = -*v;
+                }
+            }
+        }
+    }
+
+    /// Zero-pad `x` to the padded dimension.
+    fn pad(&self, x: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.padded_dim];
+        out[..x.len()].copy_from_slice(x);
+        out
     }
 
     /// Encode a (ideally unit-norm) vector into a TurboQuant code.
@@ -158,20 +235,25 @@ impl TurboQuantizer {
         debug_assert_eq!(x.len(), self.dim);
         let d = self.dim;
 
-        // MSE scalar code on the rotated vector y = Π·x.
+        // MSE scalar code on the rotated padded vector y = Π·pad(x). The reconstruction
+        // x̃_mse comes back through the exact inverse rotation; only its first `dim`
+        // coordinates matter for the residual (the query is zero-padded too, so the
+        // padded tail of x̃ never meets a nonzero query coordinate at estimate time).
         let (idx, x_mse) = if self.mse_bits == 0 {
             (Vec::new(), vec![0.0f32; d])
         } else {
-            let y = matvec(&self.rotation, x, d);
-            let mut idx = vec![0u8; d];
-            let mut y_hat = vec![0.0f32; d];
+            let mut y = self.pad(x);
+            self.rotate(&mut y);
+            let mut idx = vec![0u8; self.padded_dim];
+            let mut y_hat = vec![0.0f32; self.padded_dim];
             for (j, &yj) in y.iter().enumerate() {
                 let k = nearest_level(&self.levels, yj);
                 idx[j] = k as u8;
                 y_hat[j] = self.levels[k];
             }
-            // x̃_mse = Πᵀ · ŷ.
-            (idx, matvec_transpose(&self.rotation, &y_hat, d))
+            self.rotate_inv(&mut y_hat);
+            y_hat.truncate(d);
+            (idx, y_hat)
         };
 
         // Residual r = x − x̃_mse, and its 1-bit QJL sketch qjl = sign(S·r).
@@ -197,12 +279,14 @@ impl TurboQuantizer {
     }
 
     /// Prepare a query once for repeated [`estimate_ip`](Self::estimate_ip) calls.
+    /// `pq` is padded-length (rotated), `sq` is dim-length (sketched).
     pub fn prepare_query(&self, q: &[f32]) -> PreparedQuery {
         debug_assert_eq!(q.len(), self.dim);
-        let d = self.dim;
+        let mut pq = self.pad(q);
+        self.rotate(&mut pq);
         PreparedQuery {
-            pq: matvec(&self.rotation, q, d),
-            sq: matvec(&self.sketch, q, d),
+            pq,
+            sq: matvec(&self.sketch, q, self.dim),
         }
     }
 
@@ -339,49 +423,30 @@ fn matvec(m: &[f32], v: &[f32], d: usize) -> Vec<f32> {
     out
 }
 
-/// `Mᵀ · v` for row-major `d×d` `M`.
-fn matvec_transpose(m: &[f32], v: &[f32], d: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; d];
-    for (r, &vr) in v.iter().enumerate() {
-        let row = &m[r * d..(r + 1) * d];
-        for (o, &mc) in out.iter_mut().zip(row) {
-            *o += mc * vr;
-        }
-    }
-    out
-}
-
-/// Row-major `dim×dim` orthonormal matrix via modified Gram–Schmidt on seeded
-/// Gaussian rows. Deterministic for `(dim, seed)`.
-fn random_orthonormal(dim: usize, seed: u64) -> Vec<f32> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut rows: Vec<Vec<f32>> = Vec::with_capacity(dim);
-    for _ in 0..dim {
-        let mut v: Vec<f32> = (0..dim).map(|_| gaussian(&mut rng)).collect();
-        loop {
-            for prev in &rows {
-                let proj = dot(&v, prev);
-                for (vi, &pi) in v.iter_mut().zip(prev) {
-                    *vi -= proj * pi;
-                }
+/// In-place normalized fast Walsh–Hadamard transform: `x ← H·x / √len`.
+/// `len` must be a power of two. Self-inverse (H² = len·I, and the √len
+/// normalization is applied once per call), which is what lets the inverse
+/// rotation simply replay rounds backwards.
+fn fwht_normalized(x: &mut [f32]) {
+    let n = x.len();
+    debug_assert!(n.is_power_of_two());
+    let mut h = 1;
+    while h < n {
+        let mut i = 0;
+        while i < n {
+            for j in i..i + h {
+                let (a, b) = (x[j], x[j + h]);
+                x[j] = a + b;
+                x[j + h] = a - b;
             }
-            let norm = dot(&v, &v).sqrt();
-            if norm >= 1e-6 {
-                let inv = 1.0 / norm;
-                for vi in &mut v {
-                    *vi *= inv;
-                }
-                break;
-            }
-            v = (0..dim).map(|_| gaussian(&mut rng)).collect();
+            i += h * 2;
         }
-        rows.push(v);
+        h *= 2;
     }
-    let mut flat = Vec::with_capacity(dim * dim);
-    for row in rows {
-        flat.extend_from_slice(&row);
+    let scale = 1.0 / (n as f32).sqrt();
+    for v in x {
+        *v *= scale;
     }
-    flat
 }
 
 /// Row-major `dim×dim` matrix of i.i.d. `N(0,1)` entries, seeded.
@@ -390,7 +455,8 @@ fn gaussian_matrix(dim: usize, seed: u64) -> Vec<f32> {
     (0..dim * dim).map(|_| gaussian(&mut rng)).collect()
 }
 
-#[inline]
+/// Test-only reference dot (the shipped paths use `simd::dot_product_simd`).
+#[cfg(test)]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(&x, &y)| x * y).sum()
 }
@@ -416,17 +482,55 @@ mod tests {
         v
     }
 
+    /// The normalized FWHT is its own inverse — the property the inverse rotation
+    /// (`rotate_inv` replaying rounds backwards) relies on.
     #[test]
-    fn rotation_is_orthonormal() {
-        let d = 48;
-        let r = random_orthonormal(d, 7);
-        // Rows are unit-norm and mutually orthogonal.
-        for i in 0..d {
-            let ri = &r[i * d..(i + 1) * d];
-            assert!((dot(ri, ri) - 1.0).abs() < 1e-4, "row {i} not unit");
-            for j in (i + 1)..d {
-                let rj = &r[j * d..(j + 1) * d];
-                assert!(dot(ri, rj).abs() < 1e-3, "rows {i},{j} not orthogonal");
+    fn fwht_is_involutive() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut x: Vec<f32> = (0..256).map(|_| gaussian(&mut rng)).collect();
+        let orig = x.clone();
+        fwht_normalized(&mut x);
+        assert!(
+            x.iter().zip(&orig).any(|(a, b)| (a - b).abs() > 1e-3),
+            "transform must actually change the vector"
+        );
+        fwht_normalized(&mut x);
+        for (a, b) in x.iter().zip(&orig) {
+            assert!((a - b).abs() < 1e-4, "H(Hx) != x: {a} vs {b}");
+        }
+    }
+
+    /// The full structured rotation must be orthonormal: inner products (and hence
+    /// norms) are preserved, and rotate_inv undoes rotate exactly — including at a
+    /// NON-power-of-two dim, where the zero-padding path is live.
+    #[test]
+    fn rotation_is_orthonormal_and_invertible() {
+        let mut rng = StdRng::seed_from_u64(8);
+        for &d in &[64usize, 97] {
+            let q = TurboQuantizer::with_seed(d, 3, 11);
+            let a: Vec<f32> = (0..d).map(|_| gaussian(&mut rng)).collect();
+            let b: Vec<f32> = (0..d).map(|_| gaussian(&mut rng)).collect();
+            let ip = dot(&a, &b);
+
+            let (mut ra, mut rb) = (q.pad(&a), q.pad(&b));
+            q.rotate(&mut ra);
+            q.rotate(&mut rb);
+            let rip = dot(&ra, &rb);
+            assert!(
+                (rip - ip).abs() < 1e-3 * ip.abs().max(1.0),
+                "d={d}: rotation not orthonormal: <Ra,Rb>={rip} vs <a,b>={ip}"
+            );
+
+            q.rotate_inv(&mut ra);
+            for (i, (&got, &want)) in ra.iter().zip(a.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "d={d}: rotate_inv(rotate(a))[{i}] = {got}, want {want}"
+                );
+            }
+            // The padded tail must come back to (near-)zero too.
+            for (i, &got) in ra.iter().enumerate().skip(d) {
+                assert!(got.abs() < 1e-4, "d={d}: padded tail [{i}] = {got}, want 0");
             }
         }
     }

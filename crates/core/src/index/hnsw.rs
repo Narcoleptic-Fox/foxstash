@@ -723,8 +723,16 @@ const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
         Storage::RaBitQ => 2 + rabitq_bit_words(dim),
         // `[gamma][qjl sign bits][mse nibbles]` — the nibble section exists only when
         // there are MSE bits (`total_bits > 1`); `total_bits = 1` is a pure QJL sketch.
+        // Nibbles are sized by the FWHT-PADDED dim (next power of two): the structured
+        // rotation quantizes in the padded space, so `TurboCode::idx` is padded-length.
+        // The qjl section stays at the raw dim (the sketch runs over the unpadded residual).
         Storage::TurboQuant => {
-            1 + rabitq_bit_words(dim) + if quant_bits > 1 { nibble_words(dim) } else { 0 }
+            1 + rabitq_bit_words(dim)
+                + if quant_bits > 1 {
+                    nibble_words(crate::vector::turboquant::fht_padded_dim(dim))
+                } else {
+                    0
+                }
         }
         // `[dtc_sq][f_rescale][bit-plane 0]..[bit-plane B−1]` — each plane packs bit k of
         // every coordinate's B-bit code, so the estimator is B passes of the 1-bit kernel.
@@ -1564,7 +1572,7 @@ impl HNSWIndex {
                     bytemuck::cast_slice_mut(&mut self.nodes[v + 1..v + 1 + bit_words]);
                 qjl_bytes[..code.qjl.len()].copy_from_slice(&code.qjl);
                 if !code.idx.is_empty() {
-                    let nw = nibble_words(self.embedding_dim);
+                    let nw = nibble_words(tq.padded_dim());
                     let start = v + 1 + bit_words;
                     let nib: &mut [u8] =
                         bytemuck::cast_slice_mut(&mut self.nodes[start..start + nw]);
@@ -2535,7 +2543,7 @@ impl HNSWIndex {
             if tq.mse_bits() > 0 {
                 let start = v + 1 + bit_words;
                 let nib: &[u8] = bytemuck::cast_slice(
-                    &self.nodes[start..start + nibble_words(self.embedding_dim)],
+                    &self.nodes[start..start + nibble_words(tq.padded_dim())],
                 );
                 ip += crate::vector::simd::nibble_lut_dot_simd(prepared.pq(), nib, tq.levels());
             }
