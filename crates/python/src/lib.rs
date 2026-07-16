@@ -39,9 +39,10 @@ fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
         "rabitq" => Ok((Storage::RaBitQ, 0)),
         other if other.starts_with("turboquant") => {
             let bits = other["turboquant".len()..].parse::<usize>().unwrap_or(2);
-            if bits < 1 {
+            if !(1..=4).contains(&bits) {
                 return Err(PyValueError::new_err(
-                    "foxstash: turboquant bit budget must be >= 1 (e.g. \"turboquant2\").",
+                    "foxstash: turboquant bit budget must be in 1..=4 (e.g. \"turboquant2\") — \
+                     the packed MSE kernel dequantizes through an 8-entry LUT.",
                 ));
             }
             Ok((Storage::TurboQuant, bits))

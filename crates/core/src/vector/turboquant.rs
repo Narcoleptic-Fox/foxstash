@@ -129,6 +129,25 @@ impl TurboQuantizer {
         self.dim
     }
 
+    /// Bits per coordinate of the MSE scalar code (`total_bits − 1`; 0 = pure QJL).
+    pub fn mse_bits(&self) -> usize {
+        self.mse_bits
+    }
+
+    /// The `2^mse_bits` Lloyd–Max reconstruction levels (empty if `mse_bits == 0`).
+    /// Exposed for the packed arena walk, which dequantizes codes through this table
+    /// in its own kernel instead of going through [`TurboCode`].
+    pub fn levels(&self) -> &[f32] {
+        &self.levels
+    }
+
+    /// `√(π/2)/d` — the QJL debias scale. One definition, shared by
+    /// [`Self::estimate_ip`] and the packed arena walk, so the two paths cannot
+    /// disagree on the constant.
+    pub fn qjl_scale(&self) -> f32 {
+        (std::f32::consts::PI / 2.0).sqrt() / self.dim as f32
+    }
+
     /// Number of QJL sign bytes per code.
     fn qjl_bytes(&self) -> usize {
         self.dim.div_ceil(8)
@@ -209,9 +228,7 @@ impl TurboQuantizer {
                 s -= sqr;
             }
         }
-        let qjl_scale = (std::f32::consts::PI / 2.0).sqrt() / self.dim as f32;
-
-        mse + code.gamma * qjl_scale * s
+        mse + code.gamma * self.qjl_scale() * s
     }
 
     /// Cosine distance estimate for unit-norm vectors: `1 − ⟨q, x⟩`.
