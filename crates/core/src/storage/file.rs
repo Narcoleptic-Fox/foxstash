@@ -1055,6 +1055,8 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             // current in-memory VIBE experiment. Defaulted so a reloaded config is valid; wire
             // into HNSWConfigWrapper before relying on TurboQuant across a save/load.
             turbo_bits: crate::index::HNSWConfig::default().turbo_bits,
+            // Same status as `turbo_bits` directly above: TurboRabit save/load is not wired yet.
+            rabit_bits: crate::index::HNSWConfig::default().rabit_bits,
             seed: wrapper.seed,
             // NOT persisted, and that is deliberate rather than an oversight: `to_index`
             // rebuilds the graph by looping `add()`, which never consults `build_strategy`.

@@ -28,9 +28,10 @@ fn parse_metric(s: &str) -> PyResult<DistanceMetric> {
     }
 }
 
-/// Parse a storage string into `(mode, turbo_bits)`. `turbo_bits` is meaningful only for
-/// TurboQuant; `"turboquant"` defaults to 2 bits, `"turboquant3"` requests 3, etc. Encoding the
-/// bit budget in the string keeps the positional constructor (and VIBE's caller) unchanged.
+/// Parse a storage string into `(mode, bits)`. `bits` is meaningful only for the multi-bit
+/// modes: `"turboquant"` defaults to 2 total bits, `"turboquant3"` requests 3; `"turborabit"`
+/// defaults to 3 total bits, `"turborabit4"` requests 4. Encoding the bit budget in the string
+/// keeps the positional constructor (and VIBE's caller) unchanged.
 fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
     match s {
         "f32" => Ok((Storage::F32, 0)),
@@ -45,8 +46,18 @@ fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
             }
             Ok((Storage::TurboQuant, bits))
         }
+        other if other.starts_with("turborabit") => {
+            let bits = other["turborabit".len()..].parse::<usize>().unwrap_or(3);
+            if !(1..=8).contains(&bits) {
+                return Err(PyValueError::new_err(
+                    "foxstash: turborabit bit budget must be in 1..=8 (e.g. \"turborabit3\").",
+                ));
+            }
+            Ok((Storage::TurboRabit, bits))
+        }
         other => Err(PyValueError::new_err(format!(
-            "foxstash: unsupported storage {other:?}. Expected \"f32\", \"sq8\", \"rabitq\", or \"turboquant[N]\"."
+            "foxstash: unsupported storage {other:?}. Expected \"f32\", \"sq8\", \"rabitq\", \
+             \"turboquant[N]\", or \"turborabit[N]\"."
         ))),
     }
 }
@@ -146,7 +157,18 @@ impl Foxstash {
             seed: None,
             storage: self.storage,
             rerank_candidates: self.rerank_candidates,
-            turbo_bits: self.turbo_bits,
+            // `self.turbo_bits` holds whichever budget the storage string encoded; route it
+            // to the field its storage mode reads and leave the other at its default.
+            turbo_bits: if self.storage == Storage::TurboQuant {
+                self.turbo_bits
+            } else {
+                HNSWConfig::default().turbo_bits
+            },
+            rabit_bits: if self.storage == Storage::TurboRabit {
+                self.turbo_bits
+            } else {
+                HNSWConfig::default().rabit_bits
+            },
         };
 
         // `embeddings` is plain owned Rust data (no Py<T>/Bound<T> inside it), so it's safe
