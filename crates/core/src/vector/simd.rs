@@ -1148,6 +1148,78 @@ fn nibble_lut_dot_scalar(pq: &[f32], nibbles: &[u8], lut: &[f32; 8]) -> f32 {
     acc
 }
 
+/// `Σ uᵢ · rqᵢ` — dot of nibble-packed unsigned codes (`uᵢ ∈ 0..16`) against a
+/// full-precision query, converting the code value directly (no LUT).
+///
+/// This is TurboRabit's FUSED kernel: the Extended-RaBitQ estimate is *linear in
+/// the code value* (`dsq = dtc² + qn² + f_rescale·(⟨u,rq⟩ + c_B·Σrq)`), so unlike
+/// TurboQuant's Lloyd–Max levels there is nothing to gather — one `cvtepi32_ps` +
+/// one FMA per lane replaces the previous B bit-plane passes (B×dim FMAs and B
+/// horizontal reductions collapse to dim FMAs and one). Packing convention is
+/// identical to [`nibble_lut_dot_simd`]: nibble `i` in `nibbles[i/2]`, low nibble
+/// for even `i`.
+#[inline]
+pub fn nibble_uint_dot_simd(rq: &[f32], nibbles: &[u8]) -> f32 {
+    debug_assert!(nibbles.len() >= rq.len().div_ceil(2));
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: feature-detected; reads 4 bytes at `i/2` only while `i + 8 <= len`,
+            // and `nibbles.len() >= ceil(len/2) >= i/2 + 4` (checked above).
+            return unsafe { nibble_uint_dot_avx2(rq, nibbles) };
+        }
+    }
+    nibble_uint_dot_scalar(rq, nibbles)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn nibble_uint_dot_avx2(rq: &[f32], nibbles: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = rq.len();
+    let mut acc = _mm256_setzero_ps();
+    // Lane j holds dim i+j = nibble j of the u32 at byte i/2 (i steps by 8, so even).
+    let shifts = _mm256_set_epi32(28, 24, 20, 16, 12, 8, 4, 0);
+    let nib_mask = _mm256_set1_epi32(0xF);
+
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = unsafe { (nibbles.as_ptr().add(i / 2) as *const u32).read_unaligned() };
+        let u = _mm256_and_si256(
+            _mm256_srlv_epi32(_mm256_set1_epi32(w as i32), shifts),
+            nib_mask,
+        );
+        let uf = _mm256_cvtepi32_ps(u);
+        let rq_vec = _mm256_loadu_ps(rq.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(rq_vec, uf, acc);
+        i += 8;
+    }
+
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+
+    for j in i..n {
+        let nib = (nibbles[j / 2] >> (4 * (j % 2))) & 0xF;
+        total += nib as f32 * rq[j];
+    }
+    total
+}
+
+fn nibble_uint_dot_scalar(rq: &[f32], nibbles: &[u8]) -> f32 {
+    let mut acc = 0.0f32;
+    for (i, &rqi) in rq.iter().enumerate() {
+        let nib = (nibbles[i / 2] >> (4 * (i % 2))) & 0xF;
+        acc += nib as f32 * rqi;
+    }
+    acc
+}
+
 #[cfg(test)]
 mod rabitq_asymmetric_tests {
     use super::*;
@@ -1245,6 +1317,28 @@ mod nibble_lut_dot_tests {
         assert!(
             rel < 1e-5,
             "nibble LUT kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
+        );
+    }
+
+    /// AVX2 and scalar paths of the uint kernel must agree — odd dim exercises the
+    /// tail loop and the half-used final nibble byte; codes span the full 0..16 range.
+    #[test]
+    fn uint_avx2_matches_scalar() {
+        let dim: usize = 131;
+        let rq: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.23).cos() * 4.0).collect();
+        let nibbles: Vec<u8> = (0..dim.div_ceil(2))
+            .map(|i| {
+                let lo = (i * 7 + 3) % 16;
+                let hi = (i * 11 + 5) % 16;
+                (lo | (hi << 4)) as u8
+            })
+            .collect();
+        let dispatched = nibble_uint_dot_simd(&rq, &nibbles);
+        let scalar = nibble_uint_dot_scalar(&rq, &nibbles);
+        let rel = (dispatched - scalar).abs() / scalar.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "uint kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
         );
     }
 

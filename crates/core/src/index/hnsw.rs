@@ -399,7 +399,8 @@ pub struct HNSWConfig {
 
     /// Total bits per dimension for [`Storage::TurboRabit`] (`B`): 1 sign bit + `B−1`
     /// magnitude bits. Ignored by every other storage mode. `B = 1` is exactly classic
-    /// RaBitQ; sweep `{2, 3, 4}` against `turbo_bits` at matched budgets. Must be in `1..=8`.
+    /// RaBitQ; sweep `{2, 3, 4}` against `turbo_bits` at matched budgets. Must be in
+    /// `1..=4` (nibble-packed codes; b=4 already reaches F32 recall).
     pub rabit_bits: usize,
 }
 
@@ -734,9 +735,12 @@ const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
                     0
                 }
         }
-        // `[dtc_sq][f_rescale][bit-plane 0]..[bit-plane B−1]` — each plane packs bit k of
-        // every coordinate's B-bit code, so the estimator is B passes of the 1-bit kernel.
-        Storage::TurboRabit => 2 + quant_bits * rabitq_bit_words(dim),
+        // `[dtc_sq][f_rescale][nibble-packed codes]` — one 4-bit slot per coordinate
+        // regardless of B (bounded 1..=4 at fit time), read by the FUSED kernel: the
+        // Extended-RaBitQ estimate is linear in the code value, so one cvt+FMA per
+        // coordinate replaces the earlier B bit-plane passes. `quant_bits` no longer
+        // affects the block size, only the values inside the slots.
+        Storage::TurboRabit => 2 + nibble_words(dim),
     }
 }
 
@@ -1036,11 +1040,14 @@ impl HNSWIndex {
             // unit-normalization trick, which works for the same reason: the estimator
             // computes squared L2, and on unit vectors that is 2·cosine_distance exactly.
             Storage::TurboRabit => {
-                // Same hard-bound rationale as TurboQuant above: `vec_words` sizes the block
-                // from the raw config value, so a clamp here would desynchronize them.
+                // Same hard-bound rationale as TurboQuant above. ≤ 4 because codes are
+                // nibble-packed for the fused kernel — and because b=4 already reaches
+                // F32 recall (coco 0.9998), so 5..8 would be a second layout for a range
+                // with no measured use case (an untested public option = a shipped bug).
                 assert!(
-                    (1..=8).contains(&self.config.rabit_bits),
-                    "rabit_bits must be in 1..=8, got {}",
+                    (1..=4).contains(&self.config.rabit_bits),
+                    "rabit_bits must be in 1..=4, got {}: codes are nibble-packed, and b=4 \
+                     already reaches F32 recall",
                     self.config.rabit_bits
                 );
                 let bits = self.config.rabit_bits;
@@ -1588,9 +1595,9 @@ impl HNSWIndex {
                 // Same cosine convention as RaBitQ: encode a unit-normalized copy under
                 // cosine (see `rabitq_cosine_input`), the original under L2. `self.full`
                 // always keeps the ORIGINAL embedding for exact rerank.
-                // Block: `[dtc_sq][f_rescale][plane 0]..[plane B−1]` — plane k packs bit k
-                // of every coordinate's code in the 1-bit kernel's `bits[i/8]` convention,
-                // so the walk is B passes of `rabitq_signed_sum` (see `distance_to_node`).
+                // Block: `[dtc_sq][f_rescale][nibble-packed codes]` — one 4-bit slot per
+                // coordinate (B ≤ 4, asserted at fit), read by the fused
+                // `nibble_uint_dot_simd` kernel in `distance_to_node`.
                 let tr = self
                     .turborabit
                     .as_ref()
@@ -1599,16 +1606,11 @@ impl HNSWIndex {
                 let code = tr.encode(&encode_input);
                 self.nodes[v] = code.dtc_sq.to_bits();
                 self.nodes[v + 1] = code.f_rescale.to_bits();
-                let bit_words = rabitq_bit_words(self.embedding_dim);
-                for k in 0..tr.total_bits() {
-                    let start = v + 2 + k * bit_words;
-                    let plane: &mut [u8] =
-                        bytemuck::cast_slice_mut(&mut self.nodes[start..start + bit_words]);
-                    for (i, &c) in code.codes.iter().enumerate() {
-                        if (c >> k) & 1 == 1 {
-                            plane[i / 8] |= 1 << (i % 8);
-                        }
-                    }
+                let nw = nibble_words(self.embedding_dim);
+                let nib: &mut [u8] =
+                    bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + nw]);
+                for (i, &c) in code.codes.iter().enumerate() {
+                    nib[i / 2] |= c << (4 * (i % 2));
                 }
                 if self.config.rerank_candidates > 0 {
                     self.full.extend_from_slice(embedding);
@@ -2556,13 +2558,14 @@ impl HNSWIndex {
             };
         }
 
-        // Under TurboRabit the walk reads `[dtc_sq][f_rescale][plane 0]..[plane B−1]` from the
-        // node's own arena block. The B-bit code decomposes over its bit-planes as
-        // `uᵢ + c_B = ½·Σₖ 2ᵏ·(2·bitₖ(i) − 1)`, so the estimator is B passes of the proven
-        // 1-bit signed-sum kernel — `dsq = dtc² + qn² + ½·f_rescale·Σₖ 2ᵏ·Sₖ` — and the grid
-        // offset c_B cancels exactly (no correction term needed). Same metric dispatch as
-        // RaBitQ: raw under L2, halved under cosine (both sides unit-normalized before
-        // encoding, making `raw = 2·cosine_distance`). Must match
+        // Under TurboRabit the walk reads `[dtc_sq][f_rescale][nibble codes]` from the
+        // node's own arena block and computes `⟨u, rq⟩` with the FUSED kernel — the
+        // Extended-RaBitQ estimate is linear in the code value, so one cvt+FMA per
+        // coordinate does what B bit-plane passes did (B×dim FMAs + B reductions → dim
+        // FMAs + 1): `dsq = dtc² + qn² + f_rescale·(⟨u,rq⟩ + c_B·Σrq)`, with `c_B·Σrq`
+        // precomputed once per query (`cb_sum`). Same metric dispatch as RaBitQ: raw
+        // under L2, halved under cosine (both sides unit-normalized before encoding,
+        // making `raw = 2·cosine_distance`). Must match
         // `TurboRabitQuantizer::estimate_dist_sq` exactly — guarded by the same tests.
         if self.config.storage == Storage::TurboRabit {
             let prepared = qprep.turborabit.expect(
@@ -2571,16 +2574,12 @@ impl HNSWIndex {
             let v = node_id * self.stride + self.hdr;
             let dtc_sq = f32::from_bits(self.nodes[v]);
             let f_rescale = f32::from_bits(self.nodes[v + 1]);
-            let bit_words = rabitq_bit_words(self.embedding_dim);
-            let mut s_total = 0.0f32;
-            for k in 0..self.config.rabit_bits {
-                let start = v + 2 + k * bit_words;
-                let plane: &[u8] =
-                    bytemuck::cast_slice(&self.nodes[start..start + bit_words]);
-                s_total += (1u32 << k) as f32
-                    * crate::vector::simd::rabitq_signed_sum(prepared.rq(), plane);
-            }
-            let raw = (dtc_sq + prepared.qn_sq() + 0.5 * f_rescale * s_total).max(0.0);
+            let nib: &[u8] = bytemuck::cast_slice(
+                &self.nodes[v + 2..v + 2 + nibble_words(self.embedding_dim)],
+            );
+            let dot = crate::vector::simd::nibble_uint_dot_simd(prepared.rq(), nib);
+            let raw =
+                (dtc_sq + prepared.qn_sq() + f_rescale * (dot + prepared.cb_sum())).max(0.0);
             return match self.config.metric {
                 DistanceMetric::L2 => raw,
                 DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
@@ -4723,8 +4722,11 @@ mod tests {
                     DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
                 };
                 let rel = (packed - expected).abs() / expected.abs().max(1e-4);
+                // 1e-4, not 1e-3: both paths run the same f32 algebra, so the only honest
+                // difference is summation order (~1e-5). A loose tolerance let a 1%-of-one-
+                // term sabotage through; this one catches it.
                 assert!(
-                    rel < 1e-3,
+                    rel < 1e-4,
                     "{metric:?} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
                 );
             }

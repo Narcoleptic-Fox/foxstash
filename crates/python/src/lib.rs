@@ -49,9 +49,10 @@ fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
         }
         other if other.starts_with("turborabit") => {
             let bits = other["turborabit".len()..].parse::<usize>().unwrap_or(3);
-            if !(1..=8).contains(&bits) {
+            if !(1..=4).contains(&bits) {
                 return Err(PyValueError::new_err(
-                    "foxstash: turborabit bit budget must be in 1..=8 (e.g. \"turborabit3\").",
+                    "foxstash: turborabit bit budget must be in 1..=4 (e.g. \"turborabit3\") — \
+                     codes are nibble-packed, and b=4 already reaches F32 recall.",
                 ));
             }
             Ok((Storage::TurboRabit, bits))
