@@ -645,25 +645,40 @@ impl HNSWConfig {
         }
     }
 
-    /// Resolve storage from a corpus **sample** via centroid dominance `‖μ‖ / E‖x − μ‖` — the
-    /// cheap, build-free predictor of how hostile a distribution is to sign-based (RaBitQ-family)
-    /// codes (see [`recommend_turborabit_bits`](crate::vector::turborabit::recommend_turborabit_bits)).
-    /// This encodes the one durable lesson of the quantizer work: the right bit budget is
-    /// **data-dependent**, not fixed — a nomic-style cone needs 4 bits where a well-spread corpus
-    /// is fine at 2.
+    /// Resolve storage **and reranking** from a corpus **sample** via centroid dominance
+    /// `‖μ‖ / E‖x − μ‖` — the cheap, build-free predictor of how hostile a distribution is to
+    /// sign-based (RaBitQ-family) codes
+    /// (see [`centroid_dominance`](crate::vector::turborabit::centroid_dominance)). One predictor
+    /// gates two decisions, both measured:
     ///
-    /// Sets `storage = TurboRabit` with the recommended budget (2–4), and — because TurboRabit
-    /// reaches its recall through reranking — ensures `rerank_candidates > 0` (a 0 is bumped to
-    /// the default). Everything else is left as you set it. The returned config always holds a
-    /// concrete storage the builder can encode directly.
+    /// - **Friendly corpus** (dominance `< 0.3`): SQ8 is a near-lossless *reconstruction* — its
+    ///   walk ranks correctly on its own, so f32 reranking earns almost nothing (measured 0.9964
+    ///   no-rerank vs 0.9997 with rerank, recall@100, distilroberta-768). Pick `SQ8` with
+    ///   `rerank_candidates = 0`: **drop the retained f32 entirely** — ~4.5× less vector storage
+    ///   and no rerank pass, for ~0.3 recall points.
+    /// - **Hostile corpus** (cone, dominance `≥ 0.3`): sign codes are blind and even SQ8 no-rerank
+    ///   caps ~0.974 (nomic-768) — the f32 rerank buys the last ~2 points and nothing cheaper
+    ///   recovers them, while TurboRabit's high-variance *estimator* collapses to ~0.76 without it.
+    ///   Pick `TurboRabit` at the recommended bit budget (2–4) **with** reranking on.
     ///
-    /// A few thousand sample vectors is plenty (dominance is a distribution statistic, not a
-    /// per-vector one); the full corpus works but is unnecessary.
+    /// The 0.3 threshold is calibrated on two embedders (distilroberta ≈0.07, nomic ≈1.9), so the
+    /// middle band is interpolated — treat it as provisional. `rerank_candidates` is only forced
+    /// when the hostile branch needs it; the friendly branch deliberately zeroes it. Everything
+    /// else is left as you set it, and the result always holds a concrete storage the builder can
+    /// encode. A few thousand sample vectors is plenty.
     pub fn with_auto_storage(mut self, sample: &[Vec<f32>]) -> Self {
-        self.storage = Storage::TurboRabit;
-        self.rabit_bits = crate::vector::turborabit::recommend_turborabit_bits(sample);
-        if self.rerank_candidates == 0 {
-            self.rerank_candidates = Self::default().rerank_candidates;
+        let dominance = crate::vector::turborabit::centroid_dominance(sample);
+        if dominance < 0.3 {
+            // Friendly: SQ8 reconstruction is near-lossless without reranking — go memory-optimal.
+            self.storage = Storage::SQ8;
+            self.rerank_candidates = 0;
+        } else {
+            // Hostile: the recall genuinely needs f32 reranking; bits scale with hostility.
+            self.storage = Storage::TurboRabit;
+            self.rabit_bits = crate::vector::turborabit::recommend_turborabit_bits(sample);
+            if self.rerank_candidates == 0 {
+                self.rerank_candidates = Self::default().rerank_candidates;
+            }
         }
         self
     }
@@ -5423,7 +5438,27 @@ mod tests {
         assert_eq!(auto.rabit_bits, 4, "cone corpus should auto-pick max bits");
         assert!(
             auto.rerank_candidates > 0,
-            "auto must enable rerank for TurboRabit"
+            "hostile corpus must enable f32 rerank (recall needs it)"
+        );
+
+        // Friendly corpus: centred at ~0, spread residuals (low centroid dominance) → auto goes
+        // memory-optimal: SQ8 with rerank OFF, since SQ8-no-rerank is near-lossless there.
+        let spread: Vec<Vec<f32>> = (0..500)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let auto_friendly = HNSWConfig {
+            rerank_candidates: 200,
+            ..Default::default()
+        }
+        .with_auto_storage(&spread);
+        assert_eq!(
+            auto_friendly.storage,
+            Storage::SQ8,
+            "friendly corpus should pick SQ8"
+        );
+        assert_eq!(
+            auto_friendly.rerank_candidates, 0,
+            "friendly corpus should drop f32 rerank (memory-optimal)"
         );
 
         assert_eq!(HNSWConfig::rag_high_recall().storage, Storage::TurboRabit);

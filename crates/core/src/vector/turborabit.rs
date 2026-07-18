@@ -123,6 +123,26 @@ pub fn recommend_turborabit_bits(sample: &[Vec<f32>]) -> usize {
     if sample.is_empty() {
         return 3; // the HNSWConfig default
     }
+    let dominance = centroid_dominance(sample);
+    if dominance >= 1.0 {
+        4
+    } else if dominance >= 0.3 {
+        3
+    } else {
+        2
+    }
+}
+
+/// **Centroid dominance** `‖μ‖ / E‖x − μ‖` of a corpus sample — the cheap, build-free predictor of
+/// how hostile a distribution is to sign-based (RaBitQ-family) codes. High (≳1) = a narrow cone
+/// where the ranking signal lives in tiny residuals; low (≪1) = centred and spread. It drives both
+/// [`recommend_turborabit_bits`] (how many bits) and
+/// [`super::super::index::hnsw::HNSWConfig::with_auto_storage`] (whether f32 reranking is needed).
+/// An empty sample returns 0 (treated as friendly).
+pub fn centroid_dominance(sample: &[Vec<f32>]) -> f64 {
+    if sample.is_empty() {
+        return 0.0;
+    }
     let dim = sample[0].len();
     let n = sample.len() as f64;
     let mut mu = vec![0f64; dim];
@@ -148,17 +168,10 @@ pub fn recommend_turborabit_bits(sample: &[Vec<f32>]) -> usize {
         res_sum += d.sqrt();
     }
     let e_res = res_sum / n;
-    let dominance = if e_res > 1e-12 {
+    if e_res > 1e-12 {
         mu_norm / e_res
     } else {
         f64::INFINITY
-    };
-    if dominance >= 1.0 {
-        4
-    } else if dominance >= 0.3 {
-        3
-    } else {
-        2
     }
 }
 
