@@ -1782,6 +1782,114 @@ impl HNSWIndex {
         Ok(index)
     }
 
+    /// Relabel nodes in **breadth-first order from the entry point** so that graph-adjacent
+    /// nodes land at nearby arena offsets. The search visits a node then its neighbours, so
+    /// when those neighbours sit in nearby cache lines/pages the walk suffers fewer misses —
+    /// the measured bottleneck at high recall (see the `coco_m_scaling` diagnosis: per-hop
+    /// visit cost, not graph degree). AVX-512 cut the *compute* half of that cost; this cuts
+    /// the *memory* half.
+    ///
+    /// This is a **pure layout change**: the graph topology, the codes, and every returned
+    /// document id are identical — the result is the same index, faster. `self` is untouched;
+    /// a new index is returned. Storage-agnostic (it copies encoded arena blocks verbatim
+    /// rather than re-encoding, so it needs no f32 source, unlike [`Self::requantize`]).
+    pub fn reorder_for_locality(&self) -> HNSWIndex {
+        let n = self.len();
+        let stride = self.stride;
+
+        // BFS over layer 0 from the entry point → visitation order `order[new] = old`.
+        // A layer-0-disconnected node (rare) can't be reached; append any stragglers in id
+        // order so the permutation stays a bijection.
+        let start = self.entry_point.unwrap_or(0);
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        if n > 0 {
+            let mut queue = std::collections::VecDeque::with_capacity(n);
+            queue.push_back(start);
+            seen[start] = true;
+            while let Some(u) = queue.pop_front() {
+                order.push(u);
+                for &nb in self.get_neighbors_l0(u) {
+                    let nb = nb as usize;
+                    if !seen[nb] {
+                        seen[nb] = true;
+                        queue.push_back(nb);
+                    }
+                }
+            }
+            for (i, &s) in seen.iter().enumerate() {
+                if !s {
+                    order.push(i);
+                }
+            }
+        }
+        // Inverse permutation: `pos[old] = new`.
+        let mut pos = vec![0u32; n];
+        for (new, &old) in order.iter().enumerate() {
+            pos[old] = new as u32;
+        }
+
+        // Copy each arena block to its new slot, then remap the layer-0 neighbour ids it
+        // carries (the vector/codes half of the block copies verbatim).
+        let mut nodes = vec![0u32; n * stride];
+        for (new, &old) in order.iter().enumerate() {
+            let (dst, src) = (new * stride, old * stride);
+            nodes[dst..dst + stride].copy_from_slice(&self.nodes[src..src + stride]);
+            let count = nodes[dst] as usize;
+            for k in 0..count {
+                nodes[dst + 2 + k] = pos[nodes[dst + 2 + k] as usize];
+            }
+        }
+
+        // Upper layers: permute the outer index and remap every neighbour id. Layer 0 slots
+        // are empty post-`migrate_l0_into_arena`, so they remap to nothing.
+        let connections: Vec<Vec<Vec<u32>>> = order
+            .iter()
+            .map(|&old| {
+                self.connections[old]
+                    .iter()
+                    .map(|layer| layer.iter().map(|&nb| pos[nb as usize]).collect())
+                    .collect()
+            })
+            .collect();
+
+        // Per-node cold arrays follow the permutation. `full` (f32 rerank vectors) is a flat
+        // n×dim blob; permute it row-wise if present.
+        let permute = |src: &[String]| order.iter().map(|&o| src[o].clone()).collect::<Vec<_>>();
+        let dim = self.embedding_dim;
+        let full = if self.full.is_empty() {
+            Vec::new()
+        } else {
+            let mut f = vec![0f32; n * dim];
+            for (new, &old) in order.iter().enumerate() {
+                f[new * dim..new * dim + dim]
+                    .copy_from_slice(&self.full[old * dim..old * dim + dim]);
+            }
+            f
+        };
+
+        Self {
+            level_rng: StdRng::seed_from_u64(self.config.seed.unwrap_or_else(rand::random)),
+            embedding_dim: dim,
+            stride,
+            hdr: self.hdr,
+            config: self.config.clone(),
+            nodes,
+            connections,
+            q_min: self.q_min.clone(),
+            q_scale: self.q_scale.clone(),
+            full,
+            rabitq: self.rabitq.clone(),
+            turboquant: self.turboquant.clone(),
+            turborabit: self.turborabit.clone(),
+            ids: permute(&self.ids),
+            contents: permute(&self.contents),
+            metadata: order.iter().map(|&o| self.metadata[o].clone()).collect(),
+            entry_point: self.entry_point.map(|e| pos[e] as usize),
+            max_layer: self.max_layer,
+        }
+    }
+
     /// Write a **verbatim binary snapshot**: arena words, links, codebooks, docs — the graph
     /// comes back *identical*, not rebuilt.
     ///
@@ -5143,6 +5251,78 @@ mod tests {
                     rel < 1e-3,
                     "b={bits} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
                 );
+            }
+        }
+    }
+
+    /// `reorder_for_locality` is a pure layout change: it must return **byte-identical search
+    /// results** (same ids, same scores, same order) as the source for every query, in every
+    /// storage. That is the whole contract — if a relabel is wrong it shows up here as a
+    /// changed result, not a crash. Also checks the permutation is a bijection (every id
+    /// still present exactly once).
+    #[test]
+    fn reorder_for_locality_preserves_search_results() {
+        let mut rng = StdRng::seed_from_u64(41);
+        let dim = 80;
+        let centers: Vec<Vec<f32>> = (0..10)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..500)
+            .map(|i| {
+                centers[i % 10]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..50)
+            .map(|i| {
+                centers[i % 10]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+
+        for (storage, tb, rb) in [
+            (Storage::F32, 2, 3),
+            (Storage::SQ8, 2, 3),
+            (Storage::TurboRabit, 2, 4),
+            (Storage::TurboQuant, 3, 3),
+        ] {
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 16,
+                m0: 32,
+                ef_construction: 200,
+                ef_search: 100,
+                storage,
+                turbo_bits: tb,
+                rabit_bits: rb,
+                rerank_candidates: if storage == Storage::F32 { 0 } else { 50 },
+                seed: Some(5),
+                ..Default::default()
+            };
+            let src = HNSWIndex::build_parallel(base.clone(), config);
+            let re = src.reorder_for_locality();
+
+            assert_eq!(re.len(), src.len(), "{storage:?}: node count changed");
+            // Bijection: the multiset of document ids is unchanged.
+            let mut a = src.ids.clone();
+            let mut b = re.ids.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{storage:?}: reorder is not a bijection over ids");
+
+            // Byte-identical results per query — ids, scores, order.
+            for q in &queries {
+                let rs = src.search(q, 10).expect("src search");
+                let rr = re.search(q, 10).expect("reordered search");
+                let sv: Vec<(String, u32)> =
+                    rs.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                let rv: Vec<(String, u32)> =
+                    rr.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                assert_eq!(sv, rv, "{storage:?}: reorder changed a query's results");
             }
         }
     }
