@@ -1164,6 +1164,14 @@ pub fn nibble_uint_dot_simd(rq: &[f32], nibbles: &[u8]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX-512 processes 16 dims/iter (512-bit) vs AVX2's 8; on Zen 4 (7840HS) the wider
+        // FMA halves the iteration count of this ALU-bound kernel. Feature-gated with an AVX2
+        // fallback for older cores.
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: feature-detected; reads 8 bytes at `i/2` only while `i + 16 <= len`,
+            // and `nibbles.len() >= ceil(len/2) >= i/2 + 8` (checked above).
+            return unsafe { nibble_uint_dot_avx512(rq, nibbles) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: feature-detected; reads 4 bytes at `i/2` only while `i + 8 <= len`,
             // and `nibbles.len() >= ceil(len/2) >= i/2 + 4` (checked above).
@@ -1171,6 +1179,44 @@ pub fn nibble_uint_dot_simd(rq: &[f32], nibbles: &[u8]) -> f32 {
         }
     }
     nibble_uint_dot_scalar(rq, nibbles)
+}
+
+/// AVX-512 sibling of [`nibble_uint_dot_avx2`]: 16 dims per iteration. The 16 nibbles for
+/// `dims i..i+16` occupy 8 bytes = two `u32` words `w0` (dims i..i+8) and `w1` (dims i+8..i+16);
+/// lanes 0..7 broadcast `w0`, lanes 8..15 broadcast `w1`, each right-shifted by its lane's nibble
+/// offset then masked. Only AVX512F is required (no DQ/BW).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn nibble_uint_dot_avx512(rq: &[f32], nibbles: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = rq.len();
+    let mut acc = _mm512_setzero_ps();
+    // lane 0..7: shifts 0,4,..,28 applied to w0; lane 8..15: same applied to w1.
+    // _mm512_set_epi32 takes lane 15 first, lane 0 last.
+    let shifts = _mm512_set_epi32(28, 24, 20, 16, 12, 8, 4, 0, 28, 24, 20, 16, 12, 8, 4, 0);
+    let nib_mask = _mm512_set1_epi32(0xF);
+
+    let mut i = 0;
+    while i + 16 <= n {
+        let w0 = unsafe { (nibbles.as_ptr().add(i / 2) as *const u32).read_unaligned() } as i32;
+        let w1 = unsafe { (nibbles.as_ptr().add(i / 2 + 4) as *const u32).read_unaligned() } as i32;
+        let words = _mm512_set_epi32(
+            w1, w1, w1, w1, w1, w1, w1, w1, w0, w0, w0, w0, w0, w0, w0, w0,
+        );
+        let u = _mm512_and_si512(_mm512_srlv_epi32(words, shifts), nib_mask);
+        let uf = _mm512_cvtepi32_ps(u);
+        let rq_vec = _mm512_loadu_ps(rq.as_ptr().add(i));
+        acc = _mm512_fmadd_ps(rq_vec, uf, acc);
+        i += 16;
+    }
+
+    let mut total = _mm512_reduce_add_ps(acc);
+    for j in i..n {
+        let nib = (nibbles[j / 2] >> (4 * (j % 2))) & 0xF;
+        total += nib as f32 * rq[j];
+    }
+    total
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1340,6 +1386,34 @@ mod nibble_lut_dot_tests {
             rel < 1e-5,
             "uint kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
         );
+    }
+
+    /// The AVX-512 uint kernel (16 dims/iter) must match scalar directly, not just via dispatch.
+    /// Dims span the 16-lane boundary — 16 (exact), 17/31 (1- and 15-wide tails), 768 (the real
+    /// embedding dim), and 131 (8 full blocks + 3 tail) — with codes across the full 0..16 range.
+    #[test]
+    fn uint_avx512_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("avx512f") {
+                eprintln!("avx512f unavailable on this host; skipping direct AVX-512 check");
+                return;
+            }
+            for dim in [16usize, 17, 31, 32, 47, 128, 131, 768] {
+                let rq: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.23).cos() * 4.0).collect();
+                let nibbles: Vec<u8> = (0..dim.div_ceil(2))
+                    .map(|i| (((i * 7 + 3) % 16) | (((i * 11 + 5) % 16) << 4)) as u8)
+                    .collect();
+                // SAFETY: avx512f feature-detected just above.
+                let avx512 = unsafe { nibble_uint_dot_avx512(&rq, &nibbles) };
+                let scalar = nibble_uint_dot_scalar(&rq, &nibbles);
+                let rel = (avx512 - scalar).abs() / scalar.abs().max(1e-6);
+                assert!(
+                    rel < 1e-5,
+                    "dim {dim}: AVX-512 {avx512} vs scalar {scalar} (rel {rel:.2e})"
+                );
+            }
+        }
     }
 
     /// A short LUT (2 levels = 1 MSE bit) must zero-pad, not read garbage.
