@@ -102,6 +102,66 @@ impl PreparedQuery {
     }
 }
 
+/// Recommend a TurboRabit bit budget (`rabit_bits`) from a corpus sample via **centroid
+/// dominance** `‖μ‖ / E‖x − μ‖` — the cheap, build-free predictor of how hostile a distribution
+/// is to sign-based (RaBitQ-family) codes.
+///
+/// TurboRabit centres on the corpus mean `μ` and codes the *residual* `x − μ`. When the corpus
+/// sits in a narrow cone (`‖μ‖` large, residuals small → dominance ≳ 1) the ranking signal lives
+/// in tiny residuals that few bits cannot resolve, so it needs a larger budget; a centred, spread
+/// corpus (dominance ≪ 1) is well served by few bits.
+///
+/// Returns a value in `2..=4`:
+/// - `dom < 0.3` → **2** (friendly; even 1-bit RaBitQ often suffices, 2 is a safe floor)
+/// - `0.3 ≤ dom < 1.0` → **3**
+/// - `dom ≥ 1.0` → **4** (hostile cone)
+///
+/// Calibrated on two embedders — nomic (`dom ≈ 1.9`, needs b4 for 0.9999 recall@100) and
+/// distilroberta (`dom ≈ 0.07`, b2 already at 0.999). Treat the middle band as interpolated until
+/// a third embedder lands. **Advisory**: pass the result as [`super::super::index::hnsw::HNSWConfig::rabit_bits`].
+pub fn recommend_turborabit_bits(sample: &[Vec<f32>]) -> usize {
+    if sample.is_empty() {
+        return 3; // the HNSWConfig default
+    }
+    let dim = sample[0].len();
+    let n = sample.len() as f64;
+    let mut mu = vec![0f64; dim];
+    for v in sample {
+        for (m, &x) in mu.iter_mut().zip(v) {
+            *m += x as f64;
+        }
+    }
+    for m in &mut mu {
+        *m /= n;
+    }
+    let mu_norm = mu.iter().map(|&m| m * m).sum::<f64>().sqrt();
+    let mut res_sum = 0f64;
+    for v in sample {
+        let d: f64 = v
+            .iter()
+            .zip(&mu)
+            .map(|(&x, &m)| {
+                let e = x as f64 - m;
+                e * e
+            })
+            .sum();
+        res_sum += d.sqrt();
+    }
+    let e_res = res_sum / n;
+    let dominance = if e_res > 1e-12 {
+        mu_norm / e_res
+    } else {
+        f64::INFINITY
+    };
+    if dominance >= 1.0 {
+        4
+    } else if dominance >= 0.3 {
+        3
+    } else {
+        2
+    }
+}
+
 impl TurboRabitQuantizer {
     /// Fit from training vectors (centroid = per-dimension mean), default seed.
     ///
@@ -423,6 +483,40 @@ mod tests {
             *x /= n;
         }
         v
+    }
+
+    #[test]
+    fn recommend_bits_tracks_centroid_dominance() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let dim = 128;
+
+        // Cone-shaped corpus: a large shared offset + tiny residuals → high dominance → b4.
+        // (This is the nomic-embedding failure mode in miniature.)
+        let offset: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 3.0).collect();
+        let cone: Vec<Vec<f32>> = (0..500)
+            .map(|_| {
+                offset
+                    .iter()
+                    .map(|&o| o + (rng.random::<f32>() - 0.5) * 0.1)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            recommend_turborabit_bits(&cone),
+            4,
+            "cone corpus should want max bits"
+        );
+
+        // Centred, spread corpus (mean ≈ 0, residuals ≈ signal) → low dominance → b2.
+        let spread: Vec<Vec<f32>> = (0..500).map(|_| rng_vec(&mut rng, dim)).collect();
+        assert_eq!(
+            recommend_turborabit_bits(&spread),
+            2,
+            "spread corpus needs few bits"
+        );
+
+        // Degenerate input must not panic and must return a sane default.
+        assert_eq!(recommend_turborabit_bits(&[]), 3);
     }
 
     #[test]

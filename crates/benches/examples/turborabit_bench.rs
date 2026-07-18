@@ -71,6 +71,9 @@ fn main() {
         "{}: {n} x {dim}, {nq} q | {storage_s} M={mm} efc={efc} rerank={rerank}",
         dir.rsplit('/').next().unwrap_or(&dir)
     );
+    // #15: what would the centroid-dominance auto-tuner pick for this corpus?
+    let reco = foxstash_core::vector::turborabit::recommend_turborabit_bits(&train);
+    println!("auto-tune: recommend_turborabit_bits = {reco}");
 
     let config = HNSWConfig {
         metric: DistanceMetric::Cosine,
