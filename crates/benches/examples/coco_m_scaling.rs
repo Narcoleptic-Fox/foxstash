@@ -46,11 +46,18 @@ fn main() {
         .map(|row| row.iter().take(k).map(|&i| i as usize).collect())
         .collect();
 
-    // Two graphs, matched efc, f32 storage. The only difference is degree + builder.
-    for (label, m, m0, strat) in [
-        ("parallel M=32", 32, 64, BuildStrategy::Parallel),
-        ("sequential M=48", 48, 96, BuildStrategy::Sequential),
-    ] {
+    // Graphs at matched efc, f32 storage. Parallel-M32 vs Sequential-M48 conflates degree with
+    // builder; Sequential-M32 is the control that isolates each (same builder as M48 / same
+    // degree as the parallel run). Set COCO_SEQ32_ONLY=1 to run just that control.
+    let configs: Vec<(&str, usize, usize, BuildStrategy)> = if std::env::var("COCO_SEQ32_ONLY").is_ok() {
+        vec![("sequential M=32", 32, 64, BuildStrategy::Sequential)]
+    } else {
+        vec![
+            ("parallel M=32", 32, 64, BuildStrategy::Parallel),
+            ("sequential M=48", 48, 96, BuildStrategy::Sequential),
+        ]
+    };
+    for (label, m, m0, strat) in configs {
         let config = HNSWConfig {
             metric: DistanceMetric::Cosine,
             m,
