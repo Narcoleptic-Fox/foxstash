@@ -104,6 +104,8 @@ pub struct SerializedHNSWConfig {
     pub turbo_bits: usize,
     #[serde(default = "default_rabit_bits")]
     pub rabit_bits: usize,
+    #[serde(default = "default_reorder_for_locality")]
+    pub reorder_for_locality: bool,
 }
 
 fn default_turbo_bits() -> usize {
@@ -112,6 +114,10 @@ fn default_turbo_bits() -> usize {
 
 fn default_rabit_bits() -> usize {
     foxstash_core::index::HNSWConfig::default().rabit_bits
+}
+
+fn default_reorder_for_locality() -> bool {
+    foxstash_core::index::HNSWConfig::default().reorder_for_locality
 }
 
 fn default_use_heuristic() -> bool {
@@ -572,7 +578,6 @@ pub fn create_flat_index(embedding_dim: usize, documents: Vec<Document>) -> Seri
     })
 }
 
-
 /// Serializes a FlatIndex to SerializedFlatIndex
 pub fn serialize_flat_index(
     index: &foxstash_core::index::FlatIndex,
@@ -624,6 +629,7 @@ pub fn serialize_hnsw_index(
             seed: config.seed,
             turbo_bits: config.turbo_bits,
             rabit_bits: config.rabit_bits,
+            reorder_for_locality: config.reorder_for_locality,
         },
         nodes,
         entry_point: index.entry_point(),
@@ -649,7 +655,7 @@ pub fn deserialize_hnsw_index(
     data: SerializedHNSWIndex,
 ) -> Result<foxstash_core::index::HNSWIndex, String> {
     use foxstash_core::index::HNSWConfig;
-use foxstash_core::Document;
+    use foxstash_core::Document;
 
     if data.config.m == 0 || data.config.m > 127 {
         return Err(format!(
@@ -687,6 +693,7 @@ use foxstash_core::Document;
     config.seed = data.config.seed;
     config.turbo_bits = data.config.turbo_bits;
     config.rabit_bits = data.config.rabit_bits;
+    config.reorder_for_locality = data.config.reorder_for_locality;
 
     let mut index = foxstash_core::index::HNSWIndex::new(data.embedding_dim, config);
 
@@ -753,21 +760,22 @@ mod tests {
         // is distinguishable from "we round-tripped correctly". A fixture equal to the default
         // cannot tell those apart, which is exactly how this shipped.
         let config = HNSWConfig {
-            metric: DistanceMetric::L2,          // default is Cosine
+            metric: DistanceMetric::L2, // default is Cosine
             m: 12,
-            m0: 40,                              // NOT m * 2, so `with_m` overwriting it is caught
+            m0: 40, // NOT m * 2, so `with_m` overwriting it is caught
             ef_construction: 111,
             ef_search: 77,
-            ml: 0.9,                             // NOT 1/ln(m)
-            use_heuristic: false,                // default is true
-            extend_candidates: true,             // default is false
-            keep_pruned_connections: false,      // default is true
-            storage: Storage::SQ8,               // default is F32
-            rerank_candidates: 33,               // default is 0
-            seed: Some(4242),                    // default is None
+            ml: 0.9,                        // NOT 1/ln(m)
+            use_heuristic: false,           // default is true
+            extend_candidates: true,        // default is false
+            keep_pruned_connections: false, // default is true
+            storage: Storage::SQ8,          // default is F32
+            rerank_candidates: 33,          // default is 0
+            seed: Some(4242),               // default is None
             build_strategy: BuildStrategy::Sequential,
-            turbo_bits: 4,                       // default is 2
-            rabit_bits: 5,                       // default is 3
+            turbo_bits: 4,               // default is 2
+            rabit_bits: 5,               // default is 3
+            reorder_for_locality: false, // default is true
         };
 
         let base: Vec<Vec<f32>> = (0..60)
@@ -781,12 +789,27 @@ mod tests {
         let restored = deserialize_hnsw_index(blob).expect("deserialize");
         let got = restored.config();
 
-        assert_eq!(got.metric, config.metric, "metric was lost in the round-trip");
-        assert_eq!(got.storage, config.storage, "storage was lost -- the index changed quantization mode");
-        assert_eq!(got.rerank_candidates, config.rerank_candidates, "rerank_candidates was lost");
-        assert_eq!(got.seed, config.seed, "seed was lost -- reproducibility silently gone");
+        assert_eq!(
+            got.metric, config.metric,
+            "metric was lost in the round-trip"
+        );
+        assert_eq!(
+            got.storage, config.storage,
+            "storage was lost -- the index changed quantization mode"
+        );
+        assert_eq!(
+            got.rerank_candidates, config.rerank_candidates,
+            "rerank_candidates was lost"
+        );
+        assert_eq!(
+            got.seed, config.seed,
+            "seed was lost -- reproducibility silently gone"
+        );
         assert_eq!(got.m0, config.m0, "m0 was overwritten by with_m's `m * 2`");
-        assert_eq!(got.ml, config.ml, "ml was overwritten by with_m's `1 / ln(m)`");
+        assert_eq!(
+            got.ml, config.ml,
+            "ml was overwritten by with_m's `1 / ln(m)`"
+        );
         assert_eq!(got.m, config.m);
         assert_eq!(got.ef_construction, config.ef_construction);
         assert_eq!(got.ef_search, config.ef_search);
@@ -795,6 +818,10 @@ mod tests {
         assert_eq!(got.keep_pruned_connections, config.keep_pruned_connections);
         assert_eq!(got.turbo_bits, config.turbo_bits, "turbo_bits was lost");
         assert_eq!(got.rabit_bits, config.rabit_bits, "rabit_bits was lost");
+        assert_eq!(
+            got.reorder_for_locality, config.reorder_for_locality,
+            "reorder_for_locality was lost"
+        );
     }
 
     #[test]
@@ -867,6 +894,7 @@ mod tests {
                 rerank_candidates: 0,
                 turbo_bits: 2,
                 rabit_bits: 3,
+                reorder_for_locality: true,
                 seed: None,
             },
             nodes: vec![],
@@ -898,6 +926,7 @@ mod tests {
                 rerank_candidates: 0,
                 turbo_bits: 2,
                 rabit_bits: 3,
+                reorder_for_locality: true,
                 seed: None,
             },
             nodes: vec![SerializedHNSWNode {

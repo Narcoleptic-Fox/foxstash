@@ -41,6 +41,7 @@ storage                                read              read              read 
 rerank_candidates                      read              read              read              read              read
 turbo_bits                             read              read              read              read              read
 rabit_bits                             read              read              read              read              read
+reorder_for_locality                   read              read              read                 .                 .
 ```
 
 **An empty cell is a bug report.** Every builder bug in the audit has exactly this signature — a

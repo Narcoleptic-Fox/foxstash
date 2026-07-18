@@ -402,6 +402,18 @@ pub struct HNSWConfig {
     /// RaBitQ; sweep `{2, 3, 4}` against `turbo_bits` at matched budgets. Must be in
     /// `1..=4` (nibble-packed codes; b=4 already reaches F32 recall).
     pub rabit_bits: usize,
+
+    /// Relabel nodes in BFS order after the build so graph-adjacent nodes sit at nearby arena
+    /// offsets — a pure locality win worth **+10–15% query QPS** at zero recall cost (the walk's
+    /// bottleneck is per-hop cache misses, not compute; see [`HNSWIndex::reorder_for_locality`]).
+    /// It is transparent: returned document ids are unchanged, only faster.
+    ///
+    /// **Default `true`** — this is a free lunch for query-heavy indexes, which is most of them.
+    /// Its one cost is at build time: a single reorder pass (sub-second on 300k nodes, a few
+    /// seconds on 1.5M) that briefly holds a second copy of the arena, so peak build memory is
+    /// ~2× the index size for the duration. Set `false` if your build is memory-constrained or
+    /// you rebuild far more often than you query.
+    pub reorder_for_locality: bool,
 }
 
 /// Distance metric for [`HNSWIndex`]. **Every** storage mode honours it.
@@ -587,6 +599,7 @@ impl Default for HNSWConfig {
             rerank_candidates: 100,
             turbo_bits: 2,
             rabit_bits: 3,
+            reorder_for_locality: true,
         }
     }
 }
@@ -603,6 +616,56 @@ impl HNSWConfig {
             Storage::TurboRabit => self.rabit_bits,
             _ => 0,
         }
+    }
+
+    /// Preset: **high-recall RAG at scale**. `TurboRabit` at 4 bits + reranking + the locality
+    /// relabel — it owns the high-recall Pareto (r ≥ 0.99) at roughly half SQ8's hot-block bytes
+    /// on the datasets measured, matching SQ8's throughput with a better ceiling.
+    ///
+    /// A good **starting point, not a universal optimum**: quantizer recall is distribution-
+    /// dependent (a cone-shaped corpus is hostile to few-bit codes — see [`Self::with_auto_storage`]),
+    /// so verify on your data. Graph knobs come from [`Self::default`] (M=32, cosine).
+    pub fn rag_high_recall() -> Self {
+        Self {
+            storage: Storage::TurboRabit,
+            rabit_bits: 4,
+            rerank_candidates: 200,
+            ..Self::default()
+        }
+    }
+
+    /// Preset: **throughput RAG**. `SQ8` + reranking — the mid-recall throughput frontier
+    /// (r ≈ 0.95): tracks F32 recall within ~0.3 points at higher QPS and 4× compression. Pick
+    /// this when you do not need the last recall point. Starting point, not a universal optimum.
+    pub fn rag_throughput() -> Self {
+        Self {
+            storage: Storage::SQ8,
+            rerank_candidates: 100,
+            ..Self::default()
+        }
+    }
+
+    /// Resolve storage from a corpus **sample** via centroid dominance `‖μ‖ / E‖x − μ‖` — the
+    /// cheap, build-free predictor of how hostile a distribution is to sign-based (RaBitQ-family)
+    /// codes (see [`recommend_turborabit_bits`](crate::vector::turborabit::recommend_turborabit_bits)).
+    /// This encodes the one durable lesson of the quantizer work: the right bit budget is
+    /// **data-dependent**, not fixed — a nomic-style cone needs 4 bits where a well-spread corpus
+    /// is fine at 2.
+    ///
+    /// Sets `storage = TurboRabit` with the recommended budget (2–4), and — because TurboRabit
+    /// reaches its recall through reranking — ensures `rerank_candidates > 0` (a 0 is bumped to
+    /// the default). Everything else is left as you set it. The returned config always holds a
+    /// concrete storage the builder can encode directly.
+    ///
+    /// A few thousand sample vectors is plenty (dominance is a distribution statistic, not a
+    /// per-vector one); the full corpus works but is unnecessary.
+    pub fn with_auto_storage(mut self, sample: &[Vec<f32>]) -> Self {
+        self.storage = Storage::TurboRabit;
+        self.rabit_bits = crate::vector::turborabit::recommend_turborabit_bits(sample);
+        if self.rerank_candidates == 0 {
+            self.rerank_candidates = Self::default().rerank_candidates;
+        }
+        self
     }
 
     /// Use simple nearest-neighbor selection (faster construction, lower recall)
@@ -1443,7 +1506,7 @@ impl HNSWIndex {
         }
 
         index.shrink_to_fit();
-        index
+        index.finalize_reorder()
     }
 
     /// Returns the number of nodes in the index
@@ -1780,6 +1843,18 @@ impl HNSWIndex {
         index.migrate_l0_into_arena();
         index.shrink_to_fit();
         Ok(index)
+    }
+
+    /// Apply the BFS locality relabel iff `config.reorder_for_locality` — the shared build
+    /// finale for both builders, so a direct `build_parallel`/`build_sequential` call gets the
+    /// same treatment as `build`. Consuming `self` keeps the peak at one index plus the reorder's
+    /// transient copy, not three.
+    fn finalize_reorder(self) -> Self {
+        if self.config.reorder_for_locality {
+            self.reorder_for_locality()
+        } else {
+            self
+        }
     }
 
     /// Relabel nodes in **breadth-first order from the entry point** so that graph-adjacent
@@ -3207,6 +3282,7 @@ impl HNSWIndex {
 
         // Convert to final index format
         Self::convert_parallel_to_index(zero, layers, points, shuffled, embedding_dim, config, top)
+            .finalize_reorder()
     }
 
     /// Insert a single node during parallel construction
@@ -5252,6 +5328,156 @@ mod tests {
                     "b={bits} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
                 );
             }
+        }
+    }
+
+    /// `reorder_for_locality: true` is the default and must be **transparent**: a build with it
+    /// on returns the same search results as one with it off (only faster), while actually
+    /// changing the internal layout. This pins both halves — the default is applied (arena
+    /// differs) and it is safe (results identical).
+    #[test]
+    fn reorder_default_is_transparent_but_real() {
+        let mut rng = StdRng::seed_from_u64(51);
+        let base: Vec<Vec<f32>> = (0..400)
+            .map(|_| (0..48).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..30)
+            .map(|_| (0..48).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let cfg = |reorder: bool| HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 16,
+            m0: 32,
+            ef_construction: 200,
+            ef_search: 100,
+            seed: Some(9),
+            reorder_for_locality: reorder,
+            ..Default::default()
+        };
+        let plain = HNSWIndex::build_parallel(base.clone(), cfg(false));
+        let reordered = HNSWIndex::build_parallel(base.clone(), cfg(true));
+
+        // Real: the default actually relabelled the arena (entry point almost surely moves to a
+        // low id under BFS; the arenas are not byte-identical).
+        assert_ne!(
+            plain.nodes, reordered.nodes,
+            "reorder_for_locality: true must change the layout, but the arenas are identical"
+        );
+        // Transparent: identical results, scores included.
+        for q in &queries {
+            let a: Vec<(String, u32)> = plain
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            let b: Vec<(String, u32)> = reordered
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            assert_eq!(a, b, "default reorder changed a query's results");
+        }
+    }
+
+    /// The presets and `with_auto_storage` must produce configs that **build and search**, and
+    /// the auto-picker must pick sensibly (max bits + rerank on a hostile cone corpus).
+    #[test]
+    fn presets_and_auto_storage_are_sane() {
+        let mut rng = StdRng::seed_from_u64(61);
+        let dim = 64;
+
+        // Cone-shaped (hostile) corpus: big shared offset, tiny residuals → auto wants max bits.
+        let offset: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 3.0).collect();
+        let cone: Vec<Vec<f32>> = (0..500)
+            .map(|_| {
+                offset
+                    .iter()
+                    .map(|&o| o + (rng.random::<f32>() - 0.5) * 0.1)
+                    .collect()
+            })
+            .collect();
+        let auto = HNSWConfig {
+            rerank_candidates: 0,
+            ..Default::default()
+        }
+        .with_auto_storage(&cone);
+        assert_eq!(auto.storage, Storage::TurboRabit);
+        assert_eq!(auto.rabit_bits, 4, "cone corpus should auto-pick max bits");
+        assert!(
+            auto.rerank_candidates > 0,
+            "auto must enable rerank for TurboRabit"
+        );
+
+        assert_eq!(HNSWConfig::rag_high_recall().storage, Storage::TurboRabit);
+        assert_eq!(HNSWConfig::rag_high_recall().rabit_bits, 4);
+        assert_eq!(HNSWConfig::rag_throughput().storage, Storage::SQ8);
+
+        // Each config builds a working index. Clustered data + held-out queries, cosine.
+        let centers: Vec<Vec<f32>> = (0..8)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0).collect())
+            .collect();
+        let mk = |n: usize, rng: &mut StdRng| -> Vec<Vec<f32>> {
+            (0..n)
+                .map(|i| {
+                    centers[i % 8]
+                        .iter()
+                        .map(|x| x + rng.random::<f32>() * 0.3)
+                        .collect()
+                })
+                .collect()
+        };
+        let base = mk(600, &mut rng);
+        let queries = mk(40, &mut rng);
+        let cos = |a: &[f32], b: &[f32]| {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt()).max(1e-9)
+        };
+        let truth: Vec<HashSet<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut s: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (cos(v, q), i))
+                    .collect();
+                s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                s.into_iter().take(10).map(|(_, i)| i).collect()
+            })
+            .collect();
+
+        for (label, mut cfg) in [
+            ("high_recall", HNSWConfig::rag_high_recall()),
+            ("throughput", HNSWConfig::rag_throughput()),
+            ("auto", HNSWConfig::default().with_auto_storage(&base)),
+        ] {
+            cfg.ef_search = 200;
+            cfg.seed = Some(3);
+            let idx = HNSWIndex::build_parallel(base.clone(), cfg);
+            let hits: usize = queries
+                .iter()
+                .zip(&truth)
+                .map(|(q, gt)| {
+                    let got: HashSet<usize> = idx
+                        .search(q, 10)
+                        .unwrap()
+                        .into_iter()
+                        .filter_map(|r| r.id.parse().ok())
+                        .collect();
+                    gt.intersection(&got).count()
+                })
+                .sum();
+            let recall = hits as f32 / (queries.len() * 10) as f32;
+            assert!(
+                recall > 0.80,
+                "{label} preset recall {recall:.2} too low to be working"
+            );
         }
     }
 
