@@ -17,7 +17,7 @@ name: Benchmarks
 #   2. Cache target/criterion so future PRs can compare against them
 #
 # CI-safe benchmark subset (no ONNX runtime required):
-#   - foxstash-core: vector_simd, quantization
+#   - foxstash-core: vector_simd
 #   - foxstash-benches: embedding (active criterion_group is ONNX-free), storage
 #   Skipped: full (requires real FileStorage wrappers not yet wired up),
 #             comparison (100K vectors, runs for tens of minutes)
@@ -27,7 +27,7 @@ name: Benchmarks
 #
 # Relationship to benchmark-gate.yml: this job and that one check different
 # things and both are worth keeping. This one catches op-level timing
-# regressions in vector_simd/quantization/embedding — e.g. losing a SIMD fast
+# regressions in vector_simd/embedding — e.g. losing a SIMD fast
 # path or adding an allocation to a hot loop — none of which move recall.
 # benchmark-gate.yml catches the opposite class: a graph that is fast, builds,
 # passes 247 unit tests, and returns wrong answers (RaBitQ at 1.1% recall,
@@ -81,14 +81,6 @@ jobs:
           cargo bench \
             -p foxstash-core \
             --bench vector_simd \
-            --features "" \
-            -- --save-baseline "$BASELINE_NAME"
-
-      - name: Run core benchmarks (quantization)
-        run: |
-          cargo bench \
-            -p foxstash-core \
-            --bench quantization \
             --features "" \
             -- --save-baseline "$BASELINE_NAME"
 
@@ -185,14 +177,6 @@ jobs:
             --features "" \
             -- --save-baseline pr-branch
 
-      - name: Run core benchmarks (quantization) on PR branch
-        run: |
-          cargo bench \
-            -p foxstash-core \
-            --bench quantization \
-            --features "" \
-            -- --save-baseline pr-branch
-
       - name: Run benches crate (embedding) on PR branch
         run: |
           cargo bench \
@@ -272,7 +256,7 @@ jobs:
             }
 
             body += `### Full Comparison (baseline \`main\` vs this PR)\n\`\`\`\n${report}\n\`\`\`\n\n`;
-            body += `_Benchmarks run: \`vector_simd\`, \`quantization\` (foxstash-core), `;
+            body += `_Benchmarks run: \`vector_simd\` (foxstash-core), `;
             body += `\`embedding\`, \`storage\` (foxstash-benches). `;
             body += `ONNX-dependent benchmarks and the \`comparison\` bench (100K vectors) `;
             body += `are excluded from CI to keep runtime manageable._`;

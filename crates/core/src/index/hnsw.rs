@@ -6796,7 +6796,11 @@ mod tests {
         // rather than as a signal. `keep_pruned_connections: false` is essential: the backfill
         // exists precisely to refill the slots the heuristic emptied, and would erase the effect.
         let avg_degree = |heuristic: bool, extend: bool, strategy: BuildStrategy| -> f64 {
-            let reps = 3;
+            // 6, not 3: this averages away the parallel builder's thread-scheduling wobble, and a
+            // CI runner with a different core count than the dev box wobbles differently. More
+            // reps pull each mean closer to its true expectation, so the effect sizes below clear
+            // their margins on every platform (this test was flaky on Windows/macOS at reps=3).
+            let reps = 6;
             (0..reps)
                 .map(|r| {
                     let ix = HNSWIndex::build(
@@ -6829,7 +6833,21 @@ mod tests {
             // The noise floor, measured on the same statistic the assertions use. The parallel
             // builder is not reproducible (see `seed_gives_reproducible_builds_only_on_the_...`),
             // so an effect must be shown to exceed the wobble, not merely to exist.
-            let noise = (avg_degree(true, false, strategy) - heuristic).abs();
+            //
+            // A SINGLE resample diff is itself one draw from that wobble — on a differently-
+            // scheduled runner it can land high and break a `noise * 10` guard calibrated on the
+            // dev box (the Windows/macOS flake). Average several independent same-config pairs so
+            // the floor is a stable statistic. Sequential is deterministic, so its floor is 0.
+            let noise = {
+                let pairs = 5;
+                (0..pairs)
+                    .map(|_| {
+                        (avg_degree(true, false, strategy) - avg_degree(true, false, strategy))
+                            .abs()
+                    })
+                    .sum::<f64>()
+                    / pairs as f64
+            };
 
             // Greedy selection takes the m0 nearest candidates and fills every slot.
             assert!(

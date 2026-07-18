@@ -1,0 +1,25 @@
+# Coverage is a signal here, not a merge gate.
+#
+# foxstash ships CPU-feature-gated SIMD kernels — the AVX-512 / AVX2 / scalar dispatch in
+# crates/core/src/vector/simd.rs, selected at runtime via is_x86_feature_detected!. A
+# feature-specific branch only executes on hardware that has that feature; GitHub's coverage
+# runners do not have AVX-512, so those lines are unreachable in CI *by construction*, not for
+# want of a test (the kernels are cross-checked against scalar by unit tests that run wherever
+# the feature is present). Hard-blocking merges on patch coverage would penalize every PR that
+# adds a SIMD fast path for code CI cannot exercise.
+#
+# So: `patch` is informational (reported on the PR, never blocking); `project` keeps a real
+# floor with a small threshold to absorb measurement noise.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        informational: true
+
+comment:
+  layout: "reach, diff, files"
+  require_changes: true
