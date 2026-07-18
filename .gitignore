@@ -21,3 +21,4 @@ __pycache__/
 # Do not commit these. A dataset in git is a dataset nobody re-verifies; the
 # previously-committed `sift1m/` held a 10,000-vector base for months.
 benchmarks/data/
+*.pyc

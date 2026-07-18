@@ -28,7 +28,7 @@ float:
       f32:
         args:
           m: [16, 32]
-          ef_construction: [100, 200, 500]
+          ef_construction: [100, 200]
           storage: [f32]
           rerank_candidates: [0]
         query_args:
@@ -36,7 +36,7 @@ float:
       sq8:
         args:
           m: [16, 32]
-          ef_construction: [100, 200, 500]
+          ef_construction: [100, 200]
           storage: [sq8]
           rerank_candidates: [500]
         query_args:
@@ -45,8 +45,20 @@ float:
       rabitq:
         args:
           m: [16, 32]
-          ef_construction: [100, 200, 500]
+          ef_construction: [100, 200]
           storage: [rabitq]
+          rerank_candidates: [500]
+        query_args:
+          ef: [10, 20, 50, 100, 200, 500]
+          rerank: [50, 100, 200, 500]
+      # TurboQuant (data-oblivious multi-bit; bit budget encoded in the storage string). The
+      # question this group answers: does b=2/3/4 close the RaBitQ 1-bit gap on real embeddings?
+      # Expected recall to climb toward SQ8/F32 as bits rise, at a memory sweet spot below SQ8.
+      turboquant:
+        args:
+          m: [16, 32]
+          ef_construction: [100, 200]
+          storage: [turboquant2, turboquant3, turboquant4]
           rerank_candidates: [500]
         query_args:
           ef: [10, 20, 50, 100, 200, 500]

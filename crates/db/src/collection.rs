@@ -1174,10 +1174,20 @@ mod tests {
 
             // `rare` appears once in `once` and five times in `often`. Under k1 = 0 the two are
             // indistinguishable to BM25; under a large k1, `often` pulls ahead.
-            col.insert("once".into(), "rare filler filler filler filler".into(),
-                       vec![1.0, 0.0, 0.0], None).unwrap();
-            col.insert("often".into(), "rare rare rare rare rare".into(),
-                       vec![1.0, 0.0, 0.0], None).unwrap();
+            col.insert(
+                "once".into(),
+                "rare filler filler filler filler".into(),
+                vec![1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+            col.insert(
+                "often".into(),
+                "rare rare rare rare rare".into(),
+                vec![1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
 
             let hits = col.search_text("rare", 2, None).unwrap();
             hits.into_iter().map(|h| (h.id, h.score)).collect()
@@ -1199,7 +1209,8 @@ mod tests {
             "control failed: at k1 = 0, BM25 must ignore term frequency, so `once` ({:.4}) and \
              `often` ({:.4}) should score identically. They do not, so this fixture is not \
              measuring k1 and the real assertion below proves nothing.",
-            get(&flat, "once"), get(&flat, "often")
+            get(&flat, "once"),
+            get(&flat, "often")
         );
 
         // The real assertion: raising k1 must reward the repeated term.
@@ -1208,7 +1219,8 @@ mod tests {
             "at k1 = 4.0 the document repeating `rare` five times ({:.4}) must outscore the one \
              containing it once ({:.4}). It does not, so `DbConfig::bm25` never reached the \
              InvertedIndex -- it is going into the struct and quietly nowhere.",
-            get(&saturating, "often"), get(&saturating, "once")
+            get(&saturating, "often"),
+            get(&saturating, "once")
         );
     }
 
@@ -1223,16 +1235,32 @@ mod tests {
         config.hybrid = weighted.clone();
         let col = Collection::create("test", dir.path(), config).unwrap();
 
-        col.insert("a".into(), "gateway service".into(), vec![1.0, 0.0, 0.0], None)
-            .unwrap();
-        col.insert("b".into(), "gateway timeout".into(), vec![0.0, 0.0, 1.0], None)
-            .unwrap();
+        col.insert(
+            "a".into(),
+            "gateway service".into(),
+            vec![1.0, 0.0, 0.0],
+            None,
+        )
+        .unwrap();
+        col.insert(
+            "b".into(),
+            "gateway timeout".into(),
+            vec![0.0, 0.0, 1.0],
+            None,
+        )
+        .unwrap();
 
         // Control: the fixture discriminates. Forcing the DEFAULT (Rrf) via an explicit
         // override must score the top hit far below what WeightedSum gives it. If this fails,
         // the two configs are indistinguishable here and the real assertion proves nothing.
         let rrf = col
-            .search_hybrid(&[1.0, 0.0, 0.0], "gateway", 10, None, Some(&HybridConfig::default()))
+            .search_hybrid(
+                &[1.0, 0.0, 0.0],
+                "gateway",
+                10,
+                None,
+                Some(&HybridConfig::default()),
+            )
             .unwrap();
         assert!(
             rrf[0].score < 0.1,

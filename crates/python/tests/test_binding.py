@@ -188,3 +188,75 @@ def test_rerank_on_a_codes_only_index_is_refused():
     ix = build(x, "euclidean", "sq8", rerank=0)
     with pytest.raises(ValueError):
         ix.set_query_arguments(100, 50)
+
+
+def test_fit_cached_shares_one_build_across_storages(tmp_path):
+    """One F32 build serves every storage arm — the benchmark-sweep cache.
+
+    First call misses (builds + publishes the snapshot); later calls with *different storages*
+    hit it and requantize instead of rebuilding. Each arm is then scored against brute force:
+    the failure this guards is a hit-path index that loads without error but searches a wrong
+    or empty graph — only recall tells that apart from a healthy one.
+    """
+    x, queries = corpus()
+    cache = tmp_path / "build.snap"
+
+    def cached(storage, rerank):
+        ix = foxstash.Foxstash(
+            metric="cosine", dim=DIM, m=16, ef_construction=200, storage=storage,
+            rerank_candidates=rerank,
+        )
+        ix.fit_cached(x, str(cache))
+        ix.set_query_arguments(200)
+        return ix
+
+    arms = [
+        ("sq8", 50, 0.95),          # miss: builds F32, snapshots, requantizes
+        ("turborabit4", 50, 0.85),  # hit: loads + requantizes
+        ("f32", 0, 0.95),           # hit: the cached build IS the target, used as-is
+    ]
+    ix0 = cached(*arms[0][:2])
+    assert cache.exists(), "miss path must publish the snapshot"
+    stamp = cache.stat().st_mtime_ns
+
+    gt = brute_force(x, queries, "cosine")
+    for (storage, rerank, floor), ix in zip(
+        arms, [ix0] + [cached(s, r) for s, r, _ in arms[1:]]
+    ):
+        got = np.array([ix.query(q, K) for q in queries])
+        r = recall_at_k(got, gt)
+        assert r >= floor, f"{storage} via cache: recall@{K} = {r:.1%}, floor {floor:.0%}"
+
+    assert cache.stat().st_mtime_ns == stamp, "hit paths must not rewrite the snapshot"
+
+
+def test_fit_cached_refuses_a_mismatched_or_corrupt_cache(tmp_path):
+    """A wrong cache must fail loudly, never silently serve the wrong graph.
+
+    Two ways a cache dir goes stale: the caller's key misses a graph-shaping knob (here: m),
+    or the file predates a foxstash rebuild / isn't a snapshot at all. Both must surface as
+    exceptions — a benchmark that silently ran on a mismatched graph would produce numbers
+    that look plausible and mean nothing.
+    """
+    x, _ = corpus()
+    cache = tmp_path / "build.snap"
+    foxstash.Foxstash(
+        metric="cosine", dim=DIM, m=16, ef_construction=200, storage="sq8",
+        rerank_candidates=50,
+    ).fit_cached(x, str(cache))
+
+    # Same path, different graph knob: requantize re-checks and refuses.
+    with pytest.raises(ValueError):
+        foxstash.Foxstash(
+            metric="cosine", dim=DIM, m=8, ef_construction=200, storage="sq8",
+            rerank_candidates=50,
+        ).fit_cached(x, str(cache))
+
+    # Not a snapshot at all.
+    junk = tmp_path / "junk.snap"
+    junk.write_bytes(b"not a snapshot")
+    with pytest.raises(ValueError, match="cache load failed"):
+        foxstash.Foxstash(
+            metric="cosine", dim=DIM, m=16, ef_construction=200, storage="sq8",
+            rerank_candidates=50,
+        ).fit_cached(x, str(junk))

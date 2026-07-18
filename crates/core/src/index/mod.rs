@@ -266,5 +266,4 @@ mod tests {
             "expected NotTrained, got {err:?}"
         );
     }
-
 }

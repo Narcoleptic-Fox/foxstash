@@ -14,12 +14,12 @@ From: base.sif
 
   pip install --no-cache-dir maturin
 
-  # ASSUMPTION, not verified against a real tag: pins `main` because foxstash has no release
-  # tag as of writing. Replace with a pinned tag/commit before this image is built for a real
-  # benchmark run, the same way every other image.def here pins an exact version
-  # (hnswlib==0.8.0, flatnav==0.1.2, pyglass's commit hash) — floating on `main` would make
-  # results silently non-reproducible.
-  git clone --depth 1 --branch main https://github.com/Narcoleptic-Fox/foxstash.git /opt/foxstash
+  # Pinned to the v0.6.0 release tag (the "1.0 audit": one HNSWIndex with Storage modes, RaBitQ,
+  # Python binding, and the parallel-builder recall fix). Pinning an immutable tag — the same way
+  # every other image.def here pins an exact version (hnswlib==0.8.0, flatnav==0.1.2, pyglass's
+  # commit hash) — keeps results reproducible; floating on `main` would not. Bump this tag when a
+  # newer foxstash release is the intended benchmark target.
+  git clone --depth 1 --branch v0.6.0 https://github.com/Narcoleptic-Fox/foxstash.git /opt/foxstash
 
   cd /opt/foxstash/crates/python
   maturin build --release --interpreter python3 --out /tmp/foxstash-wheels

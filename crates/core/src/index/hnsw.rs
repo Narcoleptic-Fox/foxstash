@@ -121,6 +121,8 @@ impl BitsetVisited {
 struct QueryPrep<'a> {
     norm: f32,
     rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
+    turboquant: Option<&'a crate::vector::turboquant::PreparedQuery>,
+    turborabit: Option<&'a crate::vector::turborabit::PreparedQuery>,
 }
 
 /// Per-query scratch space: the visited bitset and the two heaps.
@@ -285,7 +287,7 @@ impl Searcher<'_> {
 /// builds with `Parallel` at 1M and reports 99.5% recall), which means the evidence refuting the
 /// caveat was sitting in the README the whole time. A stale warning is not free: it keeps costing
 /// you until someone measures it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BuildStrategy {
     /// Rayon-parallel build. **The default.** 5.2x faster than `Sequential` at 1M vectors, for a
     /// recall cost of 0.02–0.31 points (see the table above).
@@ -301,7 +303,7 @@ pub enum BuildStrategy {
 }
 
 /// Configuration for HNSW index
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HNSWConfig {
     /// Distance metric used for both construction and search.
     ///
@@ -389,6 +391,17 @@ pub struct HNSWConfig {
     /// It costs whatever recall the approximate ranking loses, which is a real trade and
     /// should be measured on your data, not assumed.
     pub rerank_candidates: usize,
+
+    /// Total bits per dimension for [`Storage::TurboQuant`] (`b`): `b−1` MSE bits + 1 QJL bit.
+    /// Ignored by every other storage mode. `b = 2` (≈2.5 bits/dim, between RaBitQ and SQ8) is a
+    /// sensible default; sweep `{2, 3, 4}` to trade memory for recall. Must be ≥ 1.
+    pub turbo_bits: usize,
+
+    /// Total bits per dimension for [`Storage::TurboRabit`] (`B`): 1 sign bit + `B−1`
+    /// magnitude bits. Ignored by every other storage mode. `B = 1` is exactly classic
+    /// RaBitQ; sweep `{2, 3, 4}` against `turbo_bits` at matched budgets. Must be in
+    /// `1..=4` (nibble-packed codes; b=4 already reaches F32 recall).
+    pub rabit_bits: usize,
 }
 
 /// Distance metric for [`HNSWIndex`]. **Every** storage mode honours it.
@@ -535,6 +548,24 @@ pub enum Storage {
     /// neighbours before the exact rescore sees them. If recall goes down when you search
     /// harder, raise [`HNSWConfig::rerank_candidates`] before suspecting the quantizer.
     RaBitQ,
+    /// Data-oblivious multi-bit TurboQuant codes (see [`crate::vector::turboquant`]).
+    ///
+    /// A separate, self-contained alternative to [`Storage::RaBitQ`]: `b−1` MSE bits per
+    /// coordinate plus a 1-bit QJL residual, with an unbiased inner-product estimator and a
+    /// codebook **derived** from the known post-rotation Gaussian (no k-means on the data). The
+    /// bit budget `b` is set by [`HNSWConfig::turbo_bits`]. Correctness-first integration stores
+    /// codes in a parallel array; arena-packing is a later QPS optimization.
+    TurboQuant,
+    /// Extended RaBitQ — B-bit codes with the RaBitQ unbiased estimator (see
+    /// [`crate::vector::turborabit`]).
+    ///
+    /// A separate, self-contained multi-bit extension of [`Storage::RaBitQ`] (which stays
+    /// frozen as the 1-bit baseline): the signed grid `{u − (2^B−1)/2}`, encoded by the
+    /// optimal-rescale critical-value sweep, estimated by the same folded
+    /// `dtc² + ‖q−c‖² − 2ℓ²⟨v,rq⟩/⟨r,v⟩` algebra. `B` is set by [`HNSWConfig::rabit_bits`].
+    /// Correctness-first integration stores codes in a parallel array; arena-packing is the
+    /// same later QPS optimization as TurboQuant's.
+    TurboRabit,
 }
 
 impl Default for HNSWConfig {
@@ -554,11 +585,26 @@ impl Default for HNSWConfig {
             seed: None,
             storage: Storage::default(),
             rerank_candidates: 100,
+            turbo_bits: 2,
+            rabit_bits: 3,
         }
     }
 }
 
 impl HNSWConfig {
+    /// The bit budget the active storage mode actually reads: `turbo_bits` under
+    /// [`Storage::TurboQuant`], `rabit_bits` under [`Storage::TurboRabit`], `0` otherwise.
+    /// The arena layout ([`vec_words`]) is a function of this, so it must be resolved the
+    /// same way everywhere — one accessor, not per-call-site matches that could drift.
+    #[inline]
+    pub(crate) fn quant_bits(&self) -> usize {
+        match self.storage {
+            Storage::TurboQuant => self.turbo_bits,
+            Storage::TurboRabit => self.rabit_bits,
+            _ => 0,
+        }
+    }
+
     /// Use simple nearest-neighbor selection (faster construction, lower recall)
     pub fn with_simple_selection(mut self) -> Self {
         self.use_heuristic = false;
@@ -660,19 +706,48 @@ const fn rabitq_bit_words(dim: usize) -> usize {
 /// `est_factor`) that its distance estimator needs per vector — see [`Storage::RaBitQ`]. In
 /// every case the codes sit in the same arena as the links, so a node visit still touches
 /// exactly one contiguous block.
+/// Words needed for `dim` nibble-packed codes (4 bits/dim, byte-packed then word-rounded) —
+/// TurboQuant's MSE indices. Byte-granular like [`rabitq_bit_words`], for the same reason.
 #[inline(always)]
-const fn vec_words(storage: Storage, dim: usize) -> usize {
+const fn nibble_words(dim: usize) -> usize {
+    dim.div_ceil(2).div_ceil(4)
+}
+
+/// `quant_bits` is the active multi-bit budget: `turbo_bits` under `TurboQuant`,
+/// `rabit_bits` under `TurboRabit`, ignored (pass 0) otherwise — see
+/// [`HNSWConfig::quant_bits`].
+#[inline(always)]
+const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
     match storage {
         Storage::F32 => dim,
         Storage::SQ8 => dim.div_ceil(4),
         Storage::RaBitQ => 2 + rabitq_bit_words(dim),
+        // `[gamma][qjl sign bits][mse nibbles]` — the nibble section exists only when
+        // there are MSE bits (`total_bits > 1`); `total_bits = 1` is a pure QJL sketch.
+        // Nibbles are sized by the FWHT-PADDED dim (next power of two): the structured
+        // rotation quantizes in the padded space, so `TurboCode::idx` is padded-length.
+        // The qjl section stays at the raw dim (the sketch runs over the unpadded residual).
+        Storage::TurboQuant => {
+            1 + rabitq_bit_words(dim)
+                + if quant_bits > 1 {
+                    nibble_words(crate::vector::turboquant::fht_padded_dim(dim))
+                } else {
+                    0
+                }
+        }
+        // `[dtc_sq][f_rescale][nibble-packed codes]` — one 4-bit slot per coordinate
+        // regardless of B (bounded 1..=4 at fit time), read by the FUSED kernel: the
+        // Extended-RaBitQ estimate is linear in the code value, so one cvt+FMA per
+        // coordinate replaces the earlier B bit-plane passes. `quant_bits` no longer
+        // affects the block size, only the values inside the slots.
+        Storage::TurboRabit => 2 + nibble_words(dim),
     }
 }
 
 /// Size, in 4-byte units, of one node block.
 #[inline(always)]
-const fn node_stride(m0: usize, dim: usize, storage: Storage) -> usize {
-    node_hdr_len(m0) + vec_words(storage, dim)
+const fn node_stride(m0: usize, dim: usize, storage: Storage, quant_bits: usize) -> usize {
+    node_hdr_len(m0) + vec_words(storage, dim, quant_bits)
 }
 
 /// HNSW index for efficient similarity search.
@@ -744,6 +819,16 @@ pub struct HNSWIndex {
     /// (not once per node visit — see [`Self::distance_to_node`]).
     rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
 
+    // === TurboQuant storage (None unless Storage::TurboQuant) ===
+    /// Data-oblivious multi-bit quantizer (rotation + Gaussian sketch + derived codebook).
+    /// Codes are arena-packed per node as `[gamma][qjl bits][mse nibbles]`.
+    turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
+
+    // === TurboRabit storage (None unless Storage::TurboRabit) ===
+    /// Extended-RaBitQ B-bit quantizer (centroid + rotation, fitted like RaBitQ's).
+    /// Codes are arena-packed per node as `[dtc_sq][f_rescale][B bit-planes]`.
+    turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
+
     // === GRAPH STRUCTURE (layers >= 1 only) ===
     /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
     ///
@@ -773,6 +858,40 @@ pub struct HNSWIndex {
     /// `Sequential`) while an index grown by `add()` never was, at any seed. The bug survived
     /// because its test, `random_level_never_panics`, asserted only that the call did not panic.
     level_rng: StdRng,
+}
+
+/// Bump when the meaning of any [`HNSWSnapshot`] field changes. Belt-and-braces on top of the
+/// crate-version check: two builds of the *same* crate version can still disagree if a field is
+/// reinterpreted on a dev branch.
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// The verbatim on-disk image behind [`HNSWIndex::snapshot_to_file`]. Every field is a direct
+/// clone of the corresponding `HNSWIndex` field except the two version stamps; `stride`, `hdr`
+/// and `level_rng` are derived from `config` on load rather than stored.
+///
+/// Same-version cache format only — see `snapshot_to_file` for why this is not the portable path.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HNSWSnapshot {
+    format_version: u32,
+    crate_version: String,
+    embedding_dim: usize,
+    config: HNSWConfig,
+    nodes: Vec<u32>,
+    connections: Vec<Vec<Vec<u32>>>,
+    q_min: Vec<f32>,
+    q_scale: Vec<f32>,
+    full: Vec<f32>,
+    rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
+    turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
+    turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
+    ids: Vec<String>,
+    contents: Vec<String>,
+    /// `serde_json::Value` cannot ride bincode (its `Deserialize` is self-describing —
+    /// `deserialize_any` — which a non-self-describing format rejects at runtime, not compile
+    /// time). Stored as JSON text and re-parsed on load.
+    metadata: Vec<Option<String>>,
+    entry_point: Option<usize>,
+    max_layer: usize,
 }
 
 /// **The** neighbour-selection algorithm. HNSW paper, Algorithm 4 (SELECT-NEIGHBORS-HEURISTIC).
@@ -836,7 +955,10 @@ fn select_neighbors_core(
         if selected.len() >= m {
             break;
         }
-        if selected.iter().all(|&(_, sid)| dist_between(cid, sid) >= dq) {
+        if selected
+            .iter()
+            .all(|&(_, sid)| dist_between(cid, sid) >= dq)
+        {
             selected.push((dq, cid));
         } else {
             pruned.push((dq, cid));
@@ -855,7 +977,6 @@ fn select_neighbors_core(
     selected
 }
 
-
 impl HNSWIndex {
     /// Creates a new HNSW index with custom configuration
     ///
@@ -867,7 +988,12 @@ impl HNSWIndex {
         Self {
             level_rng,
             embedding_dim,
-            stride: node_stride(config.m0, embedding_dim, config.storage),
+            stride: node_stride(
+                config.m0,
+                embedding_dim,
+                config.storage,
+                config.quant_bits(),
+            ),
             hdr: node_hdr_len(config.m0),
             config,
             nodes: Vec::new(),
@@ -876,6 +1002,8 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
+            turboquant: None,
+            turborabit: None,
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -932,6 +1060,57 @@ impl HNSWIndex {
                     self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(embeddings));
                 }
             }
+            // Data-oblivious: needs only `dim` and the bit budget, never the data itself.
+            Storage::TurboQuant => {
+                // Hard bound, not a clamp: the arena layout (`vec_words`) reads the raw
+                // config value, so silently coercing it here would make the quantizer and
+                // the layout disagree about the block size. ≤ 4 total bits = ≤ 3 MSE bits,
+                // the most one nibble + the 8-entry `vpermd` LUT kernel can dequantize.
+                assert!(
+                    (1..=4).contains(&self.config.turbo_bits),
+                    "turbo_bits must be in 1..=4 (got {}): the packed MSE kernel dequantizes \
+                     through an 8-entry LUT",
+                    self.config.turbo_bits
+                );
+                self.turboquant = Some(crate::vector::turboquant::TurboQuantizer::new(
+                    self.embedding_dim,
+                    self.config.turbo_bits,
+                ));
+            }
+            // Fitted exactly like RaBitQ (centroid + rotation) — including the cosine
+            // unit-normalization trick, which works for the same reason: the estimator
+            // computes squared L2, and on unit vectors that is 2·cosine_distance exactly.
+            Storage::TurboRabit => {
+                // Same hard-bound rationale as TurboQuant above. ≤ 4 because codes are
+                // nibble-packed for the fused kernel — and because b=4 already reaches
+                // F32 recall (coco 0.9998), so 5..8 would be a second layout for a range
+                // with no measured use case (an untested public option = a shipped bug).
+                assert!(
+                    (1..=4).contains(&self.config.rabit_bits),
+                    "rabit_bits must be in 1..=4, got {}: codes are nibble-packed, and b=4 \
+                     already reaches F32 recall",
+                    self.config.rabit_bits
+                );
+                let bits = self.config.rabit_bits;
+                if self.config.metric == DistanceMetric::Cosine {
+                    let normalized: Vec<Vec<f32>> = embeddings
+                        .iter()
+                        .map(|v| {
+                            let mut n = v.clone();
+                            crate::vector::ops::normalize(&mut n);
+                            n
+                        })
+                        .collect();
+                    self.turborabit = Some(crate::vector::turborabit::TurboRabitQuantizer::fit(
+                        &normalized,
+                        bits,
+                    ));
+                } else {
+                    self.turborabit = Some(crate::vector::turborabit::TurboRabitQuantizer::fit(
+                        embeddings, bits,
+                    ));
+                }
+            }
         }
     }
 
@@ -972,6 +1151,8 @@ impl HNSWIndex {
             Storage::F32 => true,
             Storage::SQ8 => !self.q_scale.is_empty(),
             Storage::RaBitQ => self.rabitq.is_some(),
+            Storage::TurboQuant => self.turboquant.is_some(),
+            Storage::TurboRabit => self.turborabit.is_some(),
         }
     }
 
@@ -1201,9 +1382,14 @@ impl HNSWIndex {
         }
 
         // Pre-allocate
-        index
-            .nodes
-            .reserve(n * node_stride(index.config.m0, embedding_dim, index.config.storage));
+        index.nodes.reserve(
+            n * node_stride(
+                index.config.m0,
+                embedding_dim,
+                index.config.storage,
+                index.config.quant_bits(),
+            ),
+        );
         index.fit_codebook(&embeddings);
         index.connections.reserve(n);
         index.ids.reserve(n);
@@ -1288,7 +1474,7 @@ impl HNSWIndex {
                 let start = node_id * self.stride + self.hdr;
                 bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
             }
-            Storage::SQ8 | Storage::RaBitQ => {
+            Storage::SQ8 | Storage::RaBitQ | Storage::TurboQuant | Storage::TurboRabit => {
                 debug_assert!(
                     !self.full.is_empty(),
                     "full-precision vectors were dropped (rerank_candidates = 0); \
@@ -1304,7 +1490,7 @@ impl HNSWIndex {
     #[inline(always)]
     fn get_codes(&self, node_id: usize) -> &[u8] {
         let start = node_id * self.stride + self.hdr;
-        let words = vec_words(Storage::SQ8, self.embedding_dim);
+        let words = vec_words(Storage::SQ8, self.embedding_dim, 0);
         let bytes: &[u8] = bytemuck::cast_slice(&self.nodes[start..start + words]);
         &bytes[..self.embedding_dim]
     }
@@ -1385,7 +1571,7 @@ impl HNSWIndex {
             Storage::SQ8 => {
                 // Codes go in the hot block. The f32 vector goes to the cold side array only
                 // if a rerank stage will actually read it — otherwise it is pure memory cost.
-                let words = vec_words(Storage::SQ8, self.embedding_dim);
+                let words = vec_words(Storage::SQ8, self.embedding_dim, 0);
                 let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut self.nodes[v..v + words]);
                 for (d, &x) in embedding.iter().enumerate() {
                     let s = self.q_scale[d];
@@ -1421,6 +1607,61 @@ impl HNSWIndex {
                     self.full.extend_from_slice(embedding);
                 }
             }
+            Storage::TurboQuant => {
+                // TurboQuant assumes unit-norm input (its codebook is derived for N(0,1/d) on the
+                // sphere), so encode a normalized copy unconditionally. The cold `full` array
+                // keeps the ORIGINAL for exact rerank. Block: `[gamma][qjl bits][mse nibbles]` —
+                // qjl is already bit-packed by `encode`; the byte-per-coordinate `idx` is packed
+                // to nibbles here (mse_bits ≤ 3 guaranteed by `fit_codebook`, so codes fit).
+                let tq = self
+                    .turboquant
+                    .as_ref()
+                    .expect("TurboQuant storage requires fit_codebook to run before push_node");
+                let mut unit = embedding.to_vec();
+                crate::vector::ops::normalize(&mut unit);
+                let code = tq.encode(&unit);
+                self.nodes[v] = code.gamma.to_bits();
+                let bit_words = rabitq_bit_words(self.embedding_dim);
+                let qjl_bytes: &mut [u8] =
+                    bytemuck::cast_slice_mut(&mut self.nodes[v + 1..v + 1 + bit_words]);
+                qjl_bytes[..code.qjl.len()].copy_from_slice(&code.qjl);
+                if !code.idx.is_empty() {
+                    let nw = nibble_words(tq.padded_dim());
+                    let start = v + 1 + bit_words;
+                    let nib: &mut [u8] =
+                        bytemuck::cast_slice_mut(&mut self.nodes[start..start + nw]);
+                    for (i, &c) in code.idx.iter().enumerate() {
+                        nib[i / 2] |= c << (4 * (i % 2));
+                    }
+                }
+                if self.config.rerank_candidates > 0 {
+                    self.full.extend_from_slice(embedding);
+                }
+            }
+            Storage::TurboRabit => {
+                // Same cosine convention as RaBitQ: encode a unit-normalized copy under
+                // cosine (see `rabitq_cosine_input`), the original under L2. `self.full`
+                // always keeps the ORIGINAL embedding for exact rerank.
+                // Block: `[dtc_sq][f_rescale][nibble-packed codes]` — one 4-bit slot per
+                // coordinate (B ≤ 4, asserted at fit), read by the fused
+                // `nibble_uint_dot_simd` kernel in `distance_to_node`.
+                let tr = self
+                    .turborabit
+                    .as_ref()
+                    .expect("TurboRabit storage requires fit_codebook to run before push_node");
+                let encode_input = self.rabitq_cosine_input(embedding);
+                let code = tr.encode(&encode_input);
+                self.nodes[v] = code.dtc_sq.to_bits();
+                self.nodes[v + 1] = code.f_rescale.to_bits();
+                let nw = nibble_words(self.embedding_dim);
+                let nib: &mut [u8] = bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + nw]);
+                for (i, &c) in code.codes.iter().enumerate() {
+                    nib[i / 2] |= c << (4 * (i % 2));
+                }
+                if self.config.rerank_candidates > 0 {
+                    self.full.extend_from_slice(embedding);
+                }
+            }
         }
     }
 
@@ -1438,6 +1679,343 @@ impl HNSWIndex {
                 self.l0_replace(i, &neighbors);
             }
         }
+    }
+
+    /// Re-encode this index's vectors into a different storage mode, **reusing the graph**.
+    ///
+    /// The graph is storage-independent by construction — `build_parallel` selects edges with
+    /// exact f32 distances and only quantizes the traversal storage afterwards — so building
+    /// the same corpus once per storage mode repeats identical (and expensive) graph work to
+    /// reach an identical graph. `requantize` extracts this index's vectors and links, fits
+    /// the target storage's codebook, and re-encodes: minutes of encode instead of a rebuild.
+    ///
+    /// It is also the *cleaner experiment*: two direct builds never share a graph (the
+    /// parallel builder is non-reproducible even at a fixed seed), so storage comparisons
+    /// between them carry graph noise. Requantized siblings share the graph exactly — any
+    /// recall difference is the quantizer's alone.
+    ///
+    /// # Contract
+    /// - The source must be `Storage::F32` — the arena then holds exact vectors to re-encode.
+    ///   (A quantized source would re-encode its own reconstruction error.)
+    /// - `new_config` may change `storage`, the bit budgets, `rerank_candidates` and
+    ///   `ef_search`. It must NOT change `m`, `m0`, `metric` or `ef_construction`: the graph
+    ///   was built under those, and silently relabeling them would misdescribe the index
+    ///   (the same footgun class as the wasm config round-trip bug).
+    ///
+    /// # Errors
+    /// Returns [`RagError::InvalidInput`](crate::RagError::InvalidInput) on a non-F32 source
+    /// or a graph-relevant config mismatch.
+    pub fn requantize(&self, new_config: HNSWConfig) -> Result<HNSWIndex> {
+        if self.config.storage != Storage::F32 {
+            return Err(crate::RagError::InvalidInput(format!(
+                "requantize requires a Storage::F32 source (got {:?}) — a quantized source \
+                 would re-encode its own reconstruction error",
+                self.config.storage
+            )));
+        }
+        if new_config.m != self.config.m
+            || new_config.m0 != self.config.m0
+            || new_config.metric != self.config.metric
+            || new_config.ef_construction != self.config.ef_construction
+        {
+            return Err(crate::RagError::InvalidInput(
+                "requantize cannot change m, m0, metric or ef_construction — the graph was \
+                 built under them; build a fresh index instead"
+                    .into(),
+            ));
+        }
+
+        let n = self.len();
+        let points: Vec<Vec<f32>> = (0..n).map(|i| self.get_embedding(i).to_vec()).collect();
+
+        // Reassemble the nested per-layer links: upper layers are still nested; layer 0
+        // lives in the arena (post-`migrate_l0_into_arena`), so put it back into slot 0
+        // for the new index's own migrate pass.
+        let mut connections = self.connections.clone();
+        for (i, c) in connections.iter_mut().enumerate() {
+            let l0 = self.get_neighbors_l0(i).to_vec();
+            if c.is_empty() {
+                c.push(l0);
+            } else {
+                c[0] = l0;
+            }
+        }
+
+        // Same assembly as `build_parallel`'s finale: fit the codebook from the exact
+        // vectors, push every node in id order (id order is what aligns arena blocks with
+        // `ids`/`contents`/`metadata`), then hand layer 0 to the arena.
+        let mut index = Self {
+            level_rng: StdRng::seed_from_u64(new_config.seed.unwrap_or_else(rand::random)),
+            embedding_dim: self.embedding_dim,
+            stride: node_stride(
+                new_config.m0,
+                self.embedding_dim,
+                new_config.storage,
+                new_config.quant_bits(),
+            ),
+            hdr: node_hdr_len(new_config.m0),
+            config: new_config,
+            nodes: Vec::new(),
+            connections,
+            q_min: Vec::new(),
+            q_scale: Vec::new(),
+            full: Vec::new(),
+            rabitq: None,
+            turboquant: None,
+            turborabit: None,
+            ids: self.ids.clone(),
+            contents: self.contents.clone(),
+            metadata: self.metadata.clone(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+        };
+        index.fit_codebook(&points);
+        index.nodes.reserve(n * index.stride);
+        if index.config.storage != Storage::F32 && index.config.rerank_candidates > 0 {
+            index.full.reserve(n * self.embedding_dim);
+        }
+        for p in &points {
+            index.push_node(p);
+        }
+        index.migrate_l0_into_arena();
+        index.shrink_to_fit();
+        Ok(index)
+    }
+
+    /// Relabel nodes in **breadth-first order from the entry point** so that graph-adjacent
+    /// nodes land at nearby arena offsets. The search visits a node then its neighbours, so
+    /// when those neighbours sit in nearby cache lines/pages the walk suffers fewer misses —
+    /// the measured bottleneck at high recall (see the `coco_m_scaling` diagnosis: per-hop
+    /// visit cost, not graph degree). AVX-512 cut the *compute* half of that cost; this cuts
+    /// the *memory* half.
+    ///
+    /// This is a **pure layout change**: the graph topology, the codes, and every returned
+    /// document id are identical — the result is the same index, faster. `self` is untouched;
+    /// a new index is returned. Storage-agnostic (it copies encoded arena blocks verbatim
+    /// rather than re-encoding, so it needs no f32 source, unlike [`Self::requantize`]).
+    pub fn reorder_for_locality(&self) -> HNSWIndex {
+        let n = self.len();
+        let stride = self.stride;
+
+        // BFS over layer 0 from the entry point → visitation order `order[new] = old`.
+        // A layer-0-disconnected node (rare) can't be reached; append any stragglers in id
+        // order so the permutation stays a bijection.
+        let start = self.entry_point.unwrap_or(0);
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        if n > 0 {
+            let mut queue = std::collections::VecDeque::with_capacity(n);
+            queue.push_back(start);
+            seen[start] = true;
+            while let Some(u) = queue.pop_front() {
+                order.push(u);
+                for &nb in self.get_neighbors_l0(u) {
+                    let nb = nb as usize;
+                    if !seen[nb] {
+                        seen[nb] = true;
+                        queue.push_back(nb);
+                    }
+                }
+            }
+            for (i, &s) in seen.iter().enumerate() {
+                if !s {
+                    order.push(i);
+                }
+            }
+        }
+        // Inverse permutation: `pos[old] = new`.
+        let mut pos = vec![0u32; n];
+        for (new, &old) in order.iter().enumerate() {
+            pos[old] = new as u32;
+        }
+
+        // Copy each arena block to its new slot, then remap the layer-0 neighbour ids it
+        // carries (the vector/codes half of the block copies verbatim).
+        let mut nodes = vec![0u32; n * stride];
+        for (new, &old) in order.iter().enumerate() {
+            let (dst, src) = (new * stride, old * stride);
+            nodes[dst..dst + stride].copy_from_slice(&self.nodes[src..src + stride]);
+            let count = nodes[dst] as usize;
+            for k in 0..count {
+                nodes[dst + 2 + k] = pos[nodes[dst + 2 + k] as usize];
+            }
+        }
+
+        // Upper layers: permute the outer index and remap every neighbour id. Layer 0 slots
+        // are empty post-`migrate_l0_into_arena`, so they remap to nothing.
+        let connections: Vec<Vec<Vec<u32>>> = order
+            .iter()
+            .map(|&old| {
+                self.connections[old]
+                    .iter()
+                    .map(|layer| layer.iter().map(|&nb| pos[nb as usize]).collect())
+                    .collect()
+            })
+            .collect();
+
+        // Per-node cold arrays follow the permutation. `full` (f32 rerank vectors) is a flat
+        // n×dim blob; permute it row-wise if present.
+        let permute = |src: &[String]| order.iter().map(|&o| src[o].clone()).collect::<Vec<_>>();
+        let dim = self.embedding_dim;
+        let full = if self.full.is_empty() {
+            Vec::new()
+        } else {
+            let mut f = vec![0f32; n * dim];
+            for (new, &old) in order.iter().enumerate() {
+                f[new * dim..new * dim + dim]
+                    .copy_from_slice(&self.full[old * dim..old * dim + dim]);
+            }
+            f
+        };
+
+        Self {
+            level_rng: StdRng::seed_from_u64(self.config.seed.unwrap_or_else(rand::random)),
+            embedding_dim: dim,
+            stride,
+            hdr: self.hdr,
+            config: self.config.clone(),
+            nodes,
+            connections,
+            q_min: self.q_min.clone(),
+            q_scale: self.q_scale.clone(),
+            full,
+            rabitq: self.rabitq.clone(),
+            turboquant: self.turboquant.clone(),
+            turborabit: self.turborabit.clone(),
+            ids: permute(&self.ids),
+            contents: permute(&self.contents),
+            metadata: order.iter().map(|&o| self.metadata[o].clone()).collect(),
+            entry_point: self.entry_point.map(|e| pos[e] as usize),
+            max_layer: self.max_layer,
+        }
+    }
+
+    /// Write a **verbatim binary snapshot**: arena words, links, codebooks, docs — the graph
+    /// comes back *identical*, not rebuilt.
+    ///
+    /// This exists because the JSON save/load path (`storage/file.rs`) deliberately
+    /// re-inserts documents through `add()` on load — which re-runs graph construction
+    /// (O(build) load time) and, the parallel builder being non-reproducible, returns a
+    /// *different graph* than was saved. Fine for portability; wrong for caching a build.
+    ///
+    /// **This is a same-version cache format, not an archival format**: it is raw bincode of
+    /// the in-memory layout, guarded by a version stamp — a snapshot written by a different
+    /// foxstash version refuses to load (with a clear error) instead of misreading. Use the
+    /// JSON path for anything that must outlive a version bump.
+    pub fn snapshot_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let snap = HNSWSnapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            embedding_dim: self.embedding_dim,
+            config: self.config.clone(),
+            nodes: self.nodes.clone(),
+            connections: self.connections.clone(),
+            q_min: self.q_min.clone(),
+            q_scale: self.q_scale.clone(),
+            full: self.full.clone(),
+            rabitq: self.rabitq.clone(),
+            turboquant: self.turboquant.clone(),
+            turborabit: self.turborabit.clone(),
+            ids: self.ids.clone(),
+            contents: self.contents.clone(),
+            metadata: self
+                .metadata
+                .iter()
+                .map(|m| m.as_ref().map(|v| v.to_string()))
+                .collect(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+        };
+        let file = std::fs::File::create(path)?;
+        bincode::serialize_into(std::io::BufWriter::new(file), &snap)?;
+        Ok(())
+    }
+
+    /// Load a [`Self::snapshot_to_file`] snapshot. The graph is restored verbatim; the level
+    /// RNG is reseeded from `config.seed` (a later incremental `add()` draws a fresh seeded
+    /// stream rather than continuing the original one — same caveat as the JSON path).
+    pub fn snapshot_from_file(path: &std::path::Path) -> Result<HNSWIndex> {
+        use bincode::Options;
+        let file = std::fs::File::open(path)?;
+        // Limit = the file's own size. Without it, a corrupt/foreign file's garbage length
+        // prefix makes bincode try to allocate whatever number it read — found as a hard
+        // ABORT (allocation failure), not a catchable error, when fed a non-snapshot file.
+        // `fixint + allow_trailing_bytes` is the exact config `bincode::serialize` writes;
+        // the bare `options()` default is varint and would misread our own files.
+        let limit = file.metadata()?.len();
+        let snap: HNSWSnapshot = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(limit)
+            .deserialize_from(std::io::BufReader::new(file))?;
+        if snap.format_version != SNAPSHOT_FORMAT_VERSION
+            || snap.crate_version != env!("CARGO_PKG_VERSION")
+        {
+            return Err(crate::RagError::InvalidInput(format!(
+                "snapshot was written by foxstash {} (format v{}), this is {} (format v{}) — \
+                 snapshots are a same-version cache, rebuild the index",
+                snap.crate_version,
+                snap.format_version,
+                env!("CARGO_PKG_VERSION"),
+                SNAPSHOT_FORMAT_VERSION,
+            )));
+        }
+        let stride = node_stride(
+            snap.config.m0,
+            snap.embedding_dim,
+            snap.config.storage,
+            snap.config.quant_bits(),
+        );
+        if !snap.nodes.len().is_multiple_of(stride) {
+            return Err(crate::RagError::InvalidInput(format!(
+                "snapshot arena length {} is not a multiple of the node stride {} its config \
+                 implies — corrupt or mismatched snapshot",
+                snap.nodes.len(),
+                stride
+            )));
+        }
+        let n = snap.nodes.len() / stride;
+        if snap.ids.len() != n || snap.contents.len() != n || snap.metadata.len() != n {
+            return Err(crate::RagError::InvalidInput(format!(
+                "snapshot document arrays ({} ids) do not match its {} arena nodes",
+                snap.ids.len(),
+                n
+            )));
+        }
+        let metadata: Vec<Option<serde_json::Value>> = snap
+            .metadata
+            .into_iter()
+            .map(|m| {
+                m.map(|s| {
+                    serde_json::from_str(&s).map_err(|e| {
+                        crate::RagError::InvalidInput(format!(
+                            "snapshot metadata is not valid JSON: {e}"
+                        ))
+                    })
+                })
+                .transpose()
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            level_rng: StdRng::seed_from_u64(snap.config.seed.unwrap_or_else(rand::random)),
+            embedding_dim: snap.embedding_dim,
+            stride,
+            hdr: node_hdr_len(snap.config.m0),
+            config: snap.config,
+            nodes: snap.nodes,
+            connections: snap.connections,
+            q_min: snap.q_min,
+            q_scale: snap.q_scale,
+            full: snap.full,
+            rabitq: snap.rabitq,
+            turboquant: snap.turboquant,
+            turborabit: snap.turborabit,
+            ids: snap.ids,
+            contents: snap.contents,
+            metadata,
+            entry_point: snap.entry_point,
+            max_layer: snap.max_layer,
+        })
     }
 
     /// Adds a document to the index
@@ -1646,9 +2224,13 @@ impl HNSWIndex {
         // `Storage::RaBitQ` exists to avoid.
         let query_norm = crate::vector::simd::norm_simd(query);
         let rq_prepared = self.prepare_rabitq_query(query);
+        let tq_prepared = self.prepare_turboquant_query(query);
+        let tr_prepared = self.prepare_turborabit_query(query);
         let qprep = QueryPrep {
             norm: query_norm,
             rabitq: rq_prepared.as_ref(),
+            turboquant: tq_prepared.as_ref(),
+            turborabit: tr_prepared.as_ref(),
         };
 
         let entry_point = self.entry_point.unwrap();
@@ -1674,8 +2256,29 @@ impl HNSWIndex {
         if self.config.storage != Storage::F32 && self.config.rerank_candidates > 0 {
             let pool = self.config.rerank_candidates.max(k).min(found.len());
             found.truncate(pool);
-            for entry in found.iter_mut() {
-                entry.0 = self.exact_distance(query, entry.1);
+            // Software-pipeline the pool reads. Each `exact_distance` gathers a
+            // `dim×4`-byte vector from the cold `full` array at an effectively random
+            // offset; unprefetched, every iteration serializes a full DRAM round-trip
+            // before the next can start. Prefetching a few entries ahead overlaps the
+            // fetch with the current entry's scoring — the same trick the walk uses at
+            // `search_layer` — and at rerank=500 this loop reads ~1.5 MB/query at 768-d,
+            // which dominates the high-recall operating points. Only the head lines are
+            // issued; `exact_distance` reads the vector sequentially, so the hardware
+            // streamer covers the tail (same rationale as VECTOR_LINES above).
+            const RERANK_PREFETCH_AHEAD: usize = 4;
+            const RERANK_HEAD_LINES: usize = 8; // 512 B of a 3 KB vector at 768-d
+            let dim = self.embedding_dim;
+            for i in 0..found.len() {
+                let ahead = i + RERANK_PREFETCH_AHEAD;
+                if ahead < found.len() {
+                    // SAFETY: prefetch is a hint — `wrapping_add` cannot leave the
+                    // allocation for a valid node id, and a stale line costs nothing.
+                    unsafe {
+                        let p = self.full.as_ptr().wrapping_add(found[ahead].1 * dim) as *const u8;
+                        prefetch_embedding(p, RERANK_HEAD_LINES);
+                    }
+                }
+                found[i].0 = self.exact_distance(query, found[i].1);
             }
             found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         }
@@ -1827,7 +2430,12 @@ impl HNSWIndex {
         let n = self.len();
         let arena = self.nodes.capacity() * std::mem::size_of::<u32>();
         // Bytes the *traversal* reads for vectors: 4/dim under F32, 1/dim under SQ8.
-        let hot_vectors = n * vec_words(self.config.storage, self.embedding_dim) * 4;
+        let hot_vectors =
+            n * vec_words(
+                self.config.storage,
+                self.embedding_dim,
+                self.config.quant_bits(),
+            ) * 4;
         // Under SQ8 the f32 vectors still exist, in the cold rerank array.
         let cold_vectors = self.full.capacity() * std::mem::size_of::<f32>();
 
@@ -1880,9 +2488,13 @@ impl HNSWIndex {
         let query_norm = crate::vector::simd::norm_simd(&node_embedding);
         // See `search_inner`: prepared once per inserted node, not once per distance call.
         let rq_prepared = self.prepare_rabitq_query(&node_embedding);
+        let tq_prepared = self.prepare_turboquant_query(&node_embedding);
+        let tr_prepared = self.prepare_turborabit_query(&node_embedding);
         let qprep = QueryPrep {
             norm: query_norm,
             rabitq: rq_prepared.as_ref(),
+            turboquant: tq_prepared.as_ref(),
+            turborabit: tr_prepared.as_ref(),
         };
         let mut ctx = SearchContext::new(self.len());
 
@@ -2154,9 +2766,15 @@ impl HNSWIndex {
             self.config.keep_pruned_connections,
             |id| {
                 if layer == 0 {
-                    self.get_neighbors_l0(id).iter().map(|&n| n as usize).collect()
+                    self.get_neighbors_l0(id)
+                        .iter()
+                        .map(|&n| n as usize)
+                        .collect()
                 } else if layer < self.connections[id].len() {
-                    self.connections[id][layer].iter().map(|&n| n as usize).collect()
+                    self.connections[id][layer]
+                        .iter()
+                        .map(|&n| n as usize)
+                        .collect()
                 } else {
                     Vec::new()
                 }
@@ -2206,6 +2824,44 @@ impl HNSWIndex {
         // which geometry (raw or normalized) they're operating in.
         let query = self.rabitq_cosine_input(query);
         Some(rq.prepare_query(&query))
+    }
+
+    /// Prepare a query for [`Storage::TurboQuant`] traversal: rotate + sketch a unit-normalized
+    /// copy so both sides of the estimator share the same (unit-sphere) geometry the codes use.
+    /// `None` under any other storage.
+    fn prepare_turboquant_query(
+        &self,
+        query: &[f32],
+    ) -> Option<crate::vector::turboquant::PreparedQuery> {
+        if self.config.storage != Storage::TurboQuant {
+            return None;
+        }
+        let tq = self
+            .turboquant
+            .as_ref()
+            .expect("TurboQuant storage requires fit_codebook to run before any query");
+        let mut unit = query.to_vec();
+        crate::vector::ops::normalize(&mut unit);
+        Some(tq.prepare_query(&unit))
+    }
+
+    /// Prepare a query for [`Storage::TurboRabit`] traversal: same cosine convention as
+    /// [`Self::prepare_rabitq_query`] (unit-normalize under cosine, raw under L2), so the
+    /// estimator's squared-L2 output stays an exact affine function of cosine distance.
+    /// `None` under any other storage.
+    fn prepare_turborabit_query(
+        &self,
+        query: &[f32],
+    ) -> Option<crate::vector::turborabit::PreparedQuery> {
+        if self.config.storage != Storage::TurboRabit {
+            return None;
+        }
+        let tr = self
+            .turborabit
+            .as_ref()
+            .expect("TurboRabit storage requires fit_codebook to run before any query");
+        let query = self.rabitq_cosine_input(query);
+        Some(tr.prepare_query(&query))
     }
 
     /// Fused distance from query to a stored node.
@@ -2277,6 +2933,67 @@ impl HNSWIndex {
                 // additional approximation on top of the estimator's own error). Clamped
                 // defensively — cosine distance is bounded to [0, 2] by definition, and the
                 // estimator's own `.max(0.0)` only guards the lower bound.
+                DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
+            };
+        }
+
+        // Under TurboQuant the walk reads `[gamma][qjl bits][mse nibbles]` from the node's own
+        // arena block. The MSE term dequantizes the nibble codes through the Lloyd–Max LUT
+        // (`nibble_lut_dot_simd`); the QJL term is the 1-bit signed-sum kernel over the
+        // sketched query. Codes were encoded from unit-normalized vectors, so the estimate
+        // is of cosine similarity. Must match `TurboQuantizer::estimate_ip` exactly — the
+        // `packed_walk_matches_module_estimator` tests are the guard.
+        if self.config.storage == Storage::TurboQuant {
+            let prepared = qprep.turboquant.expect(
+                "Storage::TurboQuant traversal requires a query prepared via prepare_turboquant_query",
+            );
+            let tq = self
+                .turboquant
+                .as_ref()
+                .expect("TurboQuant codebook missing during traversal");
+            let v = node_id * self.stride + self.hdr;
+            let gamma = f32::from_bits(self.nodes[v]);
+            let bit_words = rabitq_bit_words(self.embedding_dim);
+            let qjl: &[u8] = bytemuck::cast_slice(&self.nodes[v + 1..v + 1 + bit_words]);
+            let s = crate::vector::simd::rabitq_signed_sum(prepared.sq(), qjl);
+            let mut ip = gamma * tq.qjl_scale() * s;
+            if tq.mse_bits() > 0 {
+                let start = v + 1 + bit_words;
+                let nib: &[u8] =
+                    bytemuck::cast_slice(&self.nodes[start..start + nibble_words(tq.padded_dim())]);
+                ip += crate::vector::simd::nibble_lut_dot_simd(prepared.pq(), nib, tq.levels());
+            }
+            return match self.config.metric {
+                // Cosine distance in [0, 2]; the estimate is unbiased but noisy, so clamp.
+                DistanceMetric::Cosine => (1.0 - ip).clamp(0.0, 2.0),
+                // TODO: norm-aware L2 encoding. For now a monotone-in-cosine proxy — TurboQuant is
+                // exercised under cosine in the VIBE sweep, so this path is not on the hot road yet.
+                DistanceMetric::L2 => (2.0 * (1.0 - ip)).clamp(0.0, 4.0),
+            };
+        }
+
+        // Under TurboRabit the walk reads `[dtc_sq][f_rescale][nibble codes]` from the
+        // node's own arena block and computes `⟨u, rq⟩` with the FUSED kernel — the
+        // Extended-RaBitQ estimate is linear in the code value, so one cvt+FMA per
+        // coordinate does what B bit-plane passes did (B×dim FMAs + B reductions → dim
+        // FMAs + 1): `dsq = dtc² + qn² + f_rescale·(⟨u,rq⟩ + c_B·Σrq)`, with `c_B·Σrq`
+        // precomputed once per query (`cb_sum`). Same metric dispatch as RaBitQ: raw
+        // under L2, halved under cosine (both sides unit-normalized before encoding,
+        // making `raw = 2·cosine_distance`). Must match
+        // `TurboRabitQuantizer::estimate_dist_sq` exactly — guarded by the same tests.
+        if self.config.storage == Storage::TurboRabit {
+            let prepared = qprep.turborabit.expect(
+                "Storage::TurboRabit traversal requires a query prepared via prepare_turborabit_query",
+            );
+            let v = node_id * self.stride + self.hdr;
+            let dtc_sq = f32::from_bits(self.nodes[v]);
+            let f_rescale = f32::from_bits(self.nodes[v + 1]);
+            let nib: &[u8] =
+                bytemuck::cast_slice(&self.nodes[v + 2..v + 2 + nibble_words(self.embedding_dim)]);
+            let dot = crate::vector::simd::nibble_uint_dot_simd(prepared.rq(), nib);
+            let raw = (dtc_sq + prepared.qn_sq() + f_rescale * (dot + prepared.cb_sum())).max(0.0);
+            return match self.config.metric {
+                DistanceMetric::L2 => raw,
                 DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
             };
         }
@@ -2631,8 +3348,10 @@ impl HNSWIndex {
         extend_candidates: bool,
         zero: &[RwLock<ZeroNode>],
     ) -> Vec<Candidate> {
-        let scored: Vec<(f32, usize)> =
-            sorted.iter().map(|c| (c.distance, c.pid.as_usize())).collect();
+        let scored: Vec<(f32, usize)> = sorted
+            .iter()
+            .map(|c| (c.distance, c.pid.as_usize()))
+            .collect();
 
         select_neighbors_core(
             &scored,
@@ -2645,7 +3364,10 @@ impl HNSWIndex {
             |a, b| Self::parallel_distance(metric, &points[a], &points[b]),
         )
         .into_iter()
-        .map(|(distance, id)| Candidate { distance, pid: PointId(id as u32) })
+        .map(|(distance, id)| Candidate {
+            distance,
+            pid: PointId(id as u32),
+        })
         .collect()
     }
 
@@ -2787,7 +3509,12 @@ impl HNSWIndex {
             // bulk-built index continues a reproducible stream rather than starting a random one.
             level_rng: StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random)),
             embedding_dim,
-            stride: node_stride(config.m0, embedding_dim, config.storage),
+            stride: node_stride(
+                config.m0,
+                embedding_dim,
+                config.storage,
+                config.quant_bits(),
+            ),
             hdr: node_hdr_len(config.m0),
             config,
             nodes: Vec::new(),
@@ -2796,6 +3523,8 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
+            turboquant: None,
+            turborabit: None,
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
@@ -3324,6 +4053,8 @@ mod tests {
         let qprep = QueryPrep {
             norm: 1.0,
             rabitq: None,
+            turboquant: None,
+            turborabit: None,
         };
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, &qprep);
         assert!(
@@ -3900,18 +4631,38 @@ mod tests {
     #[test]
     fn random_level_never_panics_and_comes_from_the_seeded_stream() {
         let draws = |seed: Option<u64>| -> Vec<usize> {
-            let mut index = HNSWIndex::new(3, HNSWConfig { seed, ..Default::default() });
+            let mut index = HNSWIndex::new(
+                3,
+                HNSWConfig {
+                    seed,
+                    ..Default::default()
+                },
+            );
             (0..10_000).map(|_| index.random_level()).collect()
         };
 
         // ln(0) is impossible: a level is finite, so it is small. (`as usize` on -inf saturates
         // to 0 rather than panicking, so assert the shape of the distribution, not just liveness.)
         let a = draws(Some(7));
-        assert!(a.iter().all(|&l| l < 64), "exponential decay must not produce absurd levels");
-        assert!(a.iter().any(|&l| l > 0), "every node landing on layer 0 means ml is not applied");
+        assert!(
+            a.iter().all(|&l| l < 64),
+            "exponential decay must not produce absurd levels"
+        );
+        assert!(
+            a.iter().any(|&l| l > 0),
+            "every node landing on layer 0 means ml is not applied"
+        );
 
-        assert_eq!(a, draws(Some(7)), "a fixed seed must give a reproducible level sequence");
-        assert_ne!(a, draws(Some(8)), "a different seed must give a different level sequence");
+        assert_eq!(
+            a,
+            draws(Some(7)),
+            "a fixed seed must give a reproducible level sequence"
+        );
+        assert_ne!(
+            a,
+            draws(Some(8)),
+            "a different seed must give a different level sequence"
+        );
     }
 
     /// `seed` must reach the INCREMENTAL path too, not just the bulk builders.
@@ -3923,13 +4674,22 @@ mod tests {
     #[test]
     fn seed_reaches_the_incremental_add_path() {
         let vecs: Vec<Vec<f32>> = (0..200)
-            .map(|i| (0..8).map(|d| ((i * 7 + d * 13) % 40) as f32 * 0.1).collect())
+            .map(|i| {
+                (0..8)
+                    .map(|d| ((i * 7 + d * 13) % 40) as f32 * 0.1)
+                    .collect()
+            })
             .collect();
 
         let grown = |seed: u64| -> Vec<Vec<u32>> {
             let mut ix = HNSWIndex::new(
                 8,
-                HNSWConfig { seed: Some(seed), m: 4, m0: 8, ..Default::default() },
+                HNSWConfig {
+                    seed: Some(seed),
+                    m: 4,
+                    m0: 8,
+                    ..Default::default()
+                },
             );
             for (i, v) in vecs.iter().enumerate() {
                 ix.add_embedding(i.to_string(), v.clone()).unwrap();
@@ -3949,7 +4709,11 @@ mod tests {
             "an index grown by add() must be reproducible at a fixed seed -- `add` is inherently \
              sequential, so unlike the parallel bulk builder it has no thread race to blame"
         );
-        assert_ne!(grown(7), grown(9), "a different seed must give a different graph");
+        assert_ne!(
+            grown(7),
+            grown(9),
+            "a different seed must give a different graph"
+        );
     }
 
     // ========================================================================
@@ -4174,12 +4938,12 @@ mod tests {
         // where they'd actually differ: dim = 100.
         // bytes = ceil(100/8) = 13, words = ceil(13/4) = 4.
         assert_eq!(rabitq_bit_words(100), 4);
-        assert_eq!(vec_words(Storage::RaBitQ, 100), 2 + 4);
+        assert_eq!(vec_words(Storage::RaBitQ, 100, 0), 2 + 4);
 
         // dim = 128 (SIFT-adjacent): bytes = 16, words = 4 -> vector region = 24 bytes,
         // matching the doc comment on `Storage`.
-        assert_eq!(vec_words(Storage::RaBitQ, 128), 2 + 4);
-        assert_eq!(vec_words(Storage::RaBitQ, 128) * 4, 24);
+        assert_eq!(vec_words(Storage::RaBitQ, 128, 0), 2 + 4);
+        assert_eq!(vec_words(Storage::RaBitQ, 128, 0) * 4, 24);
     }
 
     /// End-to-end recall gate for `Storage::RaBitQ`, built the same way the benchmarks do
@@ -4193,6 +4957,680 @@ mod tests {
     /// clustered, not uniform-random, for the same reason every other recall test here is:
     /// uniform-random vectors have no structure to lose and every ANN scores ~60% on them
     /// regardless of whether the graph or the metric is correct.
+    /// End-to-end recall through the real index under [`Storage::TurboQuant`] + cosine — a public
+    /// storage variant with no integration test is a shipped bug (`lesson_untested_public_options`).
+    /// Held-out queries only (never self-retrieval), clustered data, and a discriminating-power
+    /// floor: with the estimator sabotaged this recall collapses (verified separately). Also checks
+    /// that more bits ⇒ at least as much recall, end to end.
+    #[test]
+    fn turboquant_recall_on_clustered_data_with_held_out_queries() {
+        let mut rng = StdRng::seed_from_u64(2025);
+        let dim = 96;
+        let n_clusters = 16;
+        let per_cluster = 40;
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let jitter = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
+            c.iter()
+                .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                .collect()
+        };
+        let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
+            .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..60)
+            .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
+            .collect();
+
+        let k = 10;
+        // Cosine ground truth (TurboQuant estimates cosine similarity).
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt()).max(1e-9)
+        };
+        let truth: Vec<HashSet<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut s: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (cos(v, q), i))
+                    .collect();
+                s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                s.into_iter().take(k).map(|(_, i)| i).collect()
+            })
+            .collect();
+
+        let recall_for = |bits: usize| -> f32 {
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 16,
+                m0: 32,
+                ef_construction: 200,
+                ef_search: 200,
+                storage: Storage::TurboQuant,
+                turbo_bits: bits,
+                rerank_candidates: 50,
+                seed: Some(9),
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(base.clone(), config);
+            let mut total = 0.0f32;
+            for (q, gt) in queries.iter().zip(&truth) {
+                let got: HashSet<usize> = index
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                total += gt.intersection(&got).count() as f32 / k as f32;
+            }
+            total / queries.len() as f32
+        };
+
+        let r2 = recall_for(2);
+        let r4 = recall_for(4);
+        // Non-vacuous floor (sabotaging the estimator collapses this), and more bits never hurt.
+        assert!(r2 > 0.6, "TurboQuant b=2 recall too low end-to-end: {r2}");
+        assert!(
+            r4 >= r2 - 0.05,
+            "b=4 ({r4}) unexpectedly far below b=2 ({r2})"
+        );
+    }
+
+    /// End-to-end recall through the real index under [`Storage::TurboRabit`] — same contract
+    /// as the TurboQuant test above (public variant + no integration test = shipped bug), and
+    /// additionally under **both metrics**: honest L2 support is TurboRabit's differentiator
+    /// over TurboQuant, so an untested L2 path here would be the untested half of the point.
+    #[test]
+    fn turborabit_recall_on_clustered_data_with_held_out_queries() {
+        let mut rng = StdRng::seed_from_u64(2026);
+        let dim = 96;
+        let n_clusters = 16;
+        let per_cluster = 40;
+        let centers: Vec<Vec<f32>> = (0..n_clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let jitter = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
+            c.iter()
+                .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                .collect()
+        };
+        let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
+            .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..60)
+            .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
+            .collect();
+
+        let k = 10;
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt()).max(1e-9)
+        };
+        let l2 =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };
+
+        let truth_for = |better_first: &dyn Fn(&[f32], &[f32]) -> f32, descending: bool| {
+            queries
+                .iter()
+                .map(|q| {
+                    let mut s: Vec<(f32, usize)> = base
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| (better_first(v, q), i))
+                        .collect();
+                    if descending {
+                        s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    } else {
+                        s.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    }
+                    s.into_iter()
+                        .take(k)
+                        .map(|(_, i)| i)
+                        .collect::<HashSet<usize>>()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let recall_for = |metric: DistanceMetric, bits: usize, truth: &[HashSet<usize>]| -> f32 {
+            let config = HNSWConfig {
+                metric,
+                m: 16,
+                m0: 32,
+                ef_construction: 200,
+                ef_search: 200,
+                storage: Storage::TurboRabit,
+                rabit_bits: bits,
+                rerank_candidates: 50,
+                seed: Some(9),
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(base.clone(), config);
+            let mut total = 0.0f32;
+            for (q, gt) in queries.iter().zip(truth) {
+                let got: HashSet<usize> = index
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                total += gt.intersection(&got).count() as f32 / k as f32;
+            }
+            total / queries.len() as f32
+        };
+
+        // Cosine: floor + more-bits-never-hurt, same contract as the TurboQuant test.
+        let truth_cos = truth_for(&cos, true);
+        let r2 = recall_for(DistanceMetric::Cosine, 2, &truth_cos);
+        let r4 = recall_for(DistanceMetric::Cosine, 4, &truth_cos);
+        assert!(
+            r2 > 0.6,
+            "TurboRabit b=2 cosine recall too low end-to-end: {r2}"
+        );
+        assert!(
+            r4 >= r2 - 0.05,
+            "b=4 ({r4}) unexpectedly far below b=2 ({r2})"
+        );
+
+        // L2: the estimator is native squared-L2, no proxy — hold it to the same floor.
+        let truth_l2 = truth_for(&l2, false);
+        let r3_l2 = recall_for(DistanceMetric::L2, 3, &truth_l2);
+        assert!(
+            r3_l2 > 0.6,
+            "TurboRabit b=3 L2 recall too low end-to-end: {r3_l2}"
+        );
+    }
+
+    /// The packed arena walk and the quantizer module are two implementations of one
+    /// estimator — exactly the shape every 1.0-audit bug had. This pins them together:
+    /// for every node, `distance_to_node` (arena bit-planes + shared SIMD kernel) must
+    /// equal `TurboRabitQuantizer::estimate_dist_sq` (reference, allocating) on a fresh
+    /// encode of the same input. Odd dim stresses the plane-packing tail; both metrics
+    /// because their dispatch differs.
+    #[test]
+    fn turborabit_packed_walk_matches_module_estimator() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let dim = 97; // not a multiple of 8: partial final byte in every bit-plane
+        let base: Vec<Vec<f32>> = (0..80)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        for metric in [DistanceMetric::Cosine, DistanceMetric::L2] {
+            let config = HNSWConfig {
+                metric,
+                storage: Storage::TurboRabit,
+                rabit_bits: 3,
+                rerank_candidates: 10, // keep `full` so get_embedding works
+                seed: Some(5),
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(base.clone(), config);
+            let tr = index.turborabit.as_ref().expect("quantizer fitted");
+            let prep = index.prepare_turborabit_query(&query).expect("prepared");
+            let qprep = QueryPrep {
+                norm: crate::vector::simd::norm_simd(&query),
+                rabitq: None,
+                turboquant: None,
+                turborabit: Some(&prep),
+            };
+            for node_id in 0..index.len() {
+                let packed = index.distance_to_node(&query, node_id, &qprep);
+                // Re-encode the same input push_node saw (get_embedding returns the
+                // original; the cosine path encodes a unit-normalized copy of it).
+                let stored = index.get_embedding(node_id).to_vec();
+                let code = tr.encode(&index.rabitq_cosine_input(&stored));
+                let raw = tr.estimate_dist_sq(&prep, &code);
+                let expected = match metric {
+                    DistanceMetric::L2 => raw,
+                    DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
+                };
+                let rel = (packed - expected).abs() / expected.abs().max(1e-4);
+                // 1e-4, not 1e-3: both paths run the same f32 algebra, so the only honest
+                // difference is summation order (~1e-5). A loose tolerance let a 1%-of-one-
+                // term sabotage through; this one catches it.
+                assert!(
+                    rel < 1e-4,
+                    "{metric:?} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
+                );
+            }
+        }
+    }
+
+    /// Same pin for TurboQuant: arena `[gamma][qjl][nibbles]` + LUT/signed-sum kernels
+    /// must equal `TurboQuantizer::estimate_ip` on a fresh encode. Odd dim stresses the
+    /// half-used final nibble byte; b=4 exercises the full 8-entry LUT, b=1 the
+    /// no-nibble-section layout.
+    #[test]
+    fn turboquant_packed_walk_matches_module_estimator() {
+        let mut rng = StdRng::seed_from_u64(78);
+        let dim = 97;
+        let base: Vec<Vec<f32>> = (0..80)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        for bits in [1usize, 2, 4] {
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                storage: Storage::TurboQuant,
+                turbo_bits: bits,
+                rerank_candidates: 10,
+                seed: Some(5),
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(base.clone(), config);
+            let tq = index.turboquant.as_ref().expect("quantizer fitted");
+            let prep = index.prepare_turboquant_query(&query).expect("prepared");
+            let qprep = QueryPrep {
+                norm: crate::vector::simd::norm_simd(&query),
+                rabitq: None,
+                turboquant: Some(&prep),
+                turborabit: None,
+            };
+            for node_id in 0..index.len() {
+                let packed = index.distance_to_node(&query, node_id, &qprep);
+                let mut unit = index.get_embedding(node_id).to_vec();
+                crate::vector::ops::normalize(&mut unit);
+                let ip = tq.estimate_ip(&prep, &tq.encode(&unit));
+                let expected = (1.0 - ip).clamp(0.0, 2.0);
+                let rel = (packed - expected).abs() / expected.abs().max(1e-4);
+                assert!(
+                    rel < 1e-3,
+                    "b={bits} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
+                );
+            }
+        }
+    }
+
+    /// `reorder_for_locality` is a pure layout change: it must return **byte-identical search
+    /// results** (same ids, same scores, same order) as the source for every query, in every
+    /// storage. That is the whole contract — if a relabel is wrong it shows up here as a
+    /// changed result, not a crash. Also checks the permutation is a bijection (every id
+    /// still present exactly once).
+    #[test]
+    fn reorder_for_locality_preserves_search_results() {
+        let mut rng = StdRng::seed_from_u64(41);
+        let dim = 80;
+        let centers: Vec<Vec<f32>> = (0..10)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..500)
+            .map(|i| {
+                centers[i % 10]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..50)
+            .map(|i| {
+                centers[i % 10]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+
+        for (storage, tb, rb) in [
+            (Storage::F32, 2, 3),
+            (Storage::SQ8, 2, 3),
+            (Storage::TurboRabit, 2, 4),
+            (Storage::TurboQuant, 3, 3),
+        ] {
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 16,
+                m0: 32,
+                ef_construction: 200,
+                ef_search: 100,
+                storage,
+                turbo_bits: tb,
+                rabit_bits: rb,
+                rerank_candidates: if storage == Storage::F32 { 0 } else { 50 },
+                seed: Some(5),
+                ..Default::default()
+            };
+            let src = HNSWIndex::build_parallel(base.clone(), config);
+            let re = src.reorder_for_locality();
+
+            assert_eq!(re.len(), src.len(), "{storage:?}: node count changed");
+            // Bijection: the multiset of document ids is unchanged.
+            let mut a = src.ids.clone();
+            let mut b = re.ids.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "{storage:?}: reorder is not a bijection over ids");
+
+            // Byte-identical results per query — ids, scores, order.
+            for q in &queries {
+                let rs = src.search(q, 10).expect("src search");
+                let rr = re.search(q, 10).expect("reordered search");
+                let sv: Vec<(String, u32)> =
+                    rs.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                let rv: Vec<(String, u32)> =
+                    rr.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                assert_eq!(sv, rv, "{storage:?}: reorder changed a query's results");
+            }
+        }
+    }
+
+    /// `requantize` must preserve the graph EXACTLY (that is its whole claim) and produce a
+    /// working index in every target storage. Graph identity is asserted structurally —
+    /// layer-0 neighbour lists, upper layers, entry point — not via a recall proxy
+    /// (measure-the-output applies to the *quantizer*; the graph has an exact answer).
+    #[test]
+    fn requantize_preserves_graph_and_searches_in_every_storage() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let dim = 96;
+        let centers: Vec<Vec<f32>> = (0..12)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..600)
+            .map(|i| {
+                centers[i % 12]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|i| {
+                centers[i % 12]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
+                    .collect()
+            })
+            .collect();
+
+        let src_config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 16,
+            m0: 32,
+            ef_construction: 200,
+            ef_search: 100,
+            storage: Storage::F32,
+            rerank_candidates: 0,
+            seed: Some(3),
+            ..Default::default()
+        };
+        let src = HNSWIndex::build_parallel(base.clone(), src_config.clone());
+
+        // Exact cosine ground truth for a recall floor per target.
+        let k = 10;
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for (x, y) in a.iter().zip(b) {
+                d += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            d / (na.sqrt() * nb.sqrt()).max(1e-9)
+        };
+        let truth: Vec<HashSet<usize>> = queries
+            .iter()
+            .map(|q| {
+                let mut s: Vec<(f32, usize)> = base
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (cos(v, q), i))
+                    .collect();
+                s.sort_by(|a, b| b.0.total_cmp(&a.0));
+                s.into_iter().take(k).map(|(_, i)| i).collect()
+            })
+            .collect();
+
+        for (storage, tb, rb, floor) in [
+            (Storage::SQ8, 2, 3, 0.85),
+            (Storage::RaBitQ, 2, 3, 0.35), // 1-bit is legitimately coarse; floor is non-vacuous
+            (Storage::TurboQuant, 3, 3, 0.55),
+            (Storage::TurboRabit, 2, 3, 0.80),
+        ] {
+            let new_config = HNSWConfig {
+                storage,
+                turbo_bits: tb,
+                rabit_bits: rb,
+                rerank_candidates: 50,
+                ..src_config.clone()
+            };
+            let re = src.requantize(new_config).expect("requantize");
+
+            // Graph identity — exact, node by node.
+            assert_eq!(re.len(), src.len());
+            assert_eq!(
+                re.entry_point, src.entry_point,
+                "{storage:?}: entry point moved"
+            );
+            assert_eq!(re.max_layer, src.max_layer, "{storage:?}: max layer moved");
+            for i in 0..src.len() {
+                assert_eq!(
+                    re.get_neighbors_l0(i),
+                    src.get_neighbors_l0(i),
+                    "{storage:?}: node {i} layer-0 links differ"
+                );
+            }
+            assert_eq!(
+                re.connections, src.connections,
+                "{storage:?}: upper layers differ"
+            );
+
+            // And it actually searches.
+            let mut hits = 0usize;
+            for (q, gt) in queries.iter().zip(&truth) {
+                let got: HashSet<usize> = re
+                    .search(q, k)
+                    .expect("search")
+                    .into_iter()
+                    .filter_map(|r| r.id.parse::<usize>().ok())
+                    .collect();
+                hits += gt.intersection(&got).count();
+            }
+            let recall = hits as f32 / (queries.len() * k) as f32;
+            assert!(
+                recall > floor,
+                "{storage:?}: requantized recall {recall} below floor {floor}"
+            );
+        }
+    }
+
+    /// The contract errors: quantized source, and graph-relevant config changes.
+    #[test]
+    fn requantize_rejects_bad_inputs() {
+        let mut rng = StdRng::seed_from_u64(32);
+        let base: Vec<Vec<f32>> = (0..200)
+            .map(|_| (0..32).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let config = HNSWConfig {
+            m: 8,
+            m0: 16,
+            seed: Some(1),
+            ..Default::default()
+        };
+        let f32_idx = HNSWIndex::build_parallel(base.clone(), config.clone());
+
+        // Non-F32 source.
+        let sq8 = f32_idx
+            .requantize(HNSWConfig {
+                storage: Storage::SQ8,
+                ..config.clone()
+            })
+            .expect("f32 -> sq8");
+        assert!(
+            sq8.requantize(HNSWConfig {
+                storage: Storage::RaBitQ,
+                ..config.clone()
+            })
+            .is_err(),
+            "requantizing a quantized source must be rejected"
+        );
+
+        // Graph-relevant change.
+        assert!(
+            f32_idx
+                .requantize(HNSWConfig {
+                    m: 12,
+                    storage: Storage::SQ8,
+                    ..config.clone()
+                })
+                .is_err(),
+            "changing m must be rejected"
+        );
+    }
+
+    /// The snapshot's whole claim is *verbatim*: the loaded index is bit-identical where the
+    /// JSON path is merely equivalent-ish (file.rs re-inserts through `add()`, so the parallel
+    /// builder hands back a different graph). Every config field is set off its default —
+    /// the save/load bug-class this guards against is a field silently dropped on one side
+    /// (the wasm path shipped exactly that: `turbo_bits` was never serialized).
+    #[test]
+    fn snapshot_round_trip_is_verbatim_in_every_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rng = StdRng::seed_from_u64(77);
+        let dim = 48;
+        let base: Vec<Vec<f32>> = (0..400)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+            .collect();
+
+        for (label, storage) in [
+            ("f32", Storage::F32),
+            ("sq8", Storage::SQ8),
+            ("rabitq", Storage::RaBitQ),
+            ("turboquant", Storage::TurboQuant),
+            ("turborabit", Storage::TurboRabit),
+        ] {
+            // Every field non-default, so a dropped field cannot hide behind its default.
+            let config = HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 12,
+                m0: 24,
+                ef_construction: 150,
+                ef_search: 80,
+                storage,
+                turbo_bits: 4,
+                rabit_bits: 2,
+                rerank_candidates: if storage == Storage::F32 { 0 } else { 40 },
+                seed: Some(9),
+                ..Default::default()
+            };
+            let mut src = HNSWIndex::build_parallel(base.clone(), config);
+            // One incremental add with metadata, so `metadata` round-trips something real.
+            src.add(crate::Document {
+                id: "meta-doc".into(),
+                content: "has metadata".into(),
+                embedding: base[0].clone(),
+                metadata: Some(serde_json::json!({"k": 1})),
+            })
+            .expect("add");
+
+            let path = dir.path().join(format!("{label}.snap"));
+            src.snapshot_to_file(&path).expect("snapshot");
+            let re = HNSWIndex::snapshot_from_file(&path).expect("load");
+
+            // Verbatim: the arena and every sibling structure, bit for bit.
+            assert_eq!(re.nodes, src.nodes, "{label}: arena differs");
+            assert_eq!(
+                re.connections, src.connections,
+                "{label}: upper layers differ"
+            );
+            assert_eq!(re.stride, src.stride, "{label}: derived stride differs");
+            assert_eq!(re.hdr, src.hdr, "{label}: derived hdr differs");
+            assert_eq!(
+                re.entry_point, src.entry_point,
+                "{label}: entry point differs"
+            );
+            assert_eq!(re.max_layer, src.max_layer, "{label}: max layer differs");
+            assert_eq!(re.q_min, src.q_min, "{label}: q_min differs");
+            assert_eq!(re.q_scale, src.q_scale, "{label}: q_scale differs");
+            assert_eq!(re.full, src.full, "{label}: full vectors differ");
+            assert_eq!(re.ids, src.ids, "{label}: ids differ");
+            assert_eq!(re.contents, src.contents, "{label}: contents differ");
+            assert_eq!(re.metadata, src.metadata, "{label}: metadata differs");
+            assert_eq!(re.embedding_dim, src.embedding_dim);
+
+            // And behaviourally: identical results, scores included (same arena, same
+            // codebooks, same kernels — any difference is a load bug, not noise).
+            for q in &queries {
+                let a = src.search(q, 10).expect("src search");
+                let b = re.search(q, 10).expect("re search");
+                let a: Vec<(String, u32)> =
+                    a.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                let b: Vec<(String, u32)> =
+                    b.into_iter().map(|r| (r.id, r.score.to_bits())).collect();
+                assert_eq!(a, b, "{label}: search results differ after load");
+            }
+        }
+    }
+
+    /// A snapshot is a same-version cache: a stamp from any other version (or a truncated
+    /// arena) must refuse to load with a clear error, never misread.
+    #[test]
+    fn snapshot_rejects_version_mismatch_and_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rng = StdRng::seed_from_u64(78);
+        let base: Vec<Vec<f32>> = (0..100)
+            .map(|_| (0..16).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let src = HNSWIndex::build_parallel(
+            base,
+            HNSWConfig {
+                m: 8,
+                m0: 16,
+                seed: Some(1),
+                ..Default::default()
+            },
+        );
+        let path = dir.path().join("good.snap");
+        src.snapshot_to_file(&path).expect("snapshot");
+
+        let good = std::fs::read(&path).expect("read");
+        let mut snap: HNSWSnapshot = bincode::deserialize(&good).expect("decode");
+
+        // Wrong crate version.
+        snap.crate_version = "0.0.0-other".into();
+        let bad = dir.path().join("bad-version.snap");
+        std::fs::write(&bad, bincode::serialize(&snap).unwrap()).unwrap();
+        match HNSWIndex::snapshot_from_file(&bad) {
+            Err(err) => assert!(
+                err.to_string().contains("0.0.0-other"),
+                "error should name the offending version, got: {err}"
+            ),
+            Ok(_) => panic!("wrong crate version must be rejected"),
+        }
+
+        // Wrong format version.
+        snap.crate_version = env!("CARGO_PKG_VERSION").into();
+        snap.format_version = SNAPSHOT_FORMAT_VERSION + 1;
+        std::fs::write(&bad, bincode::serialize(&snap).unwrap()).unwrap();
+        assert!(HNSWIndex::snapshot_from_file(&bad).is_err());
+
+        // Truncated arena (valid bincode, wrong length for the config's stride).
+        snap.format_version = SNAPSHOT_FORMAT_VERSION;
+        snap.nodes.pop();
+        std::fs::write(&bad, bincode::serialize(&snap).unwrap()).unwrap();
+        assert!(
+            HNSWIndex::snapshot_from_file(&bad).is_err(),
+            "arena not a multiple of stride must be rejected"
+        );
+
+        // The untampered file still loads.
+        assert!(HNSWIndex::snapshot_from_file(&path).is_ok());
+    }
+
     #[test]
     fn rabitq_recall_on_clustered_data_with_held_out_queries() {
         let mut rng = StdRng::seed_from_u64(2024);
@@ -4398,7 +5836,11 @@ mod tests {
             ),
             "raising the rerank pool on a vectors-dropped index must be an error"
         );
-        assert_eq!(dropped.rerank_candidates(), 0, "the refused set must not take effect");
+        assert_eq!(
+            dropped.rerank_candidates(),
+            0,
+            "the refused set must not take effect"
+        );
         // Lowering to 0 is always fine — nothing to rescore against is what it already wants.
         assert!(dropped.set_rerank_candidates(0).is_ok());
 
@@ -4981,9 +6423,9 @@ mod tests {
             let mut index = HNSWIndex::new(2, config);
             index.push_node(&d); // id 0
             index.push_node(&e); // id 1
-            // D's only layer-0 neighbour is E. `candidates` passed to `select_neighbors` below
-            // is `[0]` (D) only — E is reachable exclusively by walking this link, which only
-            // happens when `extend_candidates` is set.
+                                 // D's only layer-0 neighbour is E. `candidates` passed to `select_neighbors` below
+                                 // is `[0]` (D) only — E is reachable exclusively by walking this link, which only
+                                 // happens when `extend_candidates` is set.
             index.l0_push(0, 1);
             index
         };
@@ -5247,7 +6689,10 @@ mod tests {
             norm(&mut v);
             v
         };
-        let sample_from = |rng: &mut StdRng, centers: &[Vec<f32>], gauss: &mut dyn FnMut(&mut StdRng) -> f32| -> Vec<f32> {
+        let sample_from = |rng: &mut StdRng,
+                           centers: &[Vec<f32>],
+                           gauss: &mut dyn FnMut(&mut StdRng) -> f32|
+         -> Vec<f32> {
             let c = &centers[rng.random::<u64>() as usize % centers.len()];
             let mut v: Vec<f32> = c.iter().map(|x| x + 0.05 * gauss(rng)).collect();
             norm(&mut v);
@@ -5259,10 +6704,12 @@ mod tests {
         // both builders ~100% and hide the gap.)
         let base_centers: Vec<Vec<f32>> = (0..100).map(|_| unit(&mut rng)).collect();
         let query_centers: Vec<Vec<f32>> = (0..100).map(|_| unit(&mut rng)).collect();
-        let base: Vec<Vec<f32>> =
-            (0..10_000).map(|_| sample_from(&mut rng, &base_centers, &mut gauss)).collect();
-        let queries: Vec<Vec<f32>> =
-            (0..200).map(|_| sample_from(&mut rng, &query_centers, &mut gauss)).collect();
+        let base: Vec<Vec<f32>> = (0..10_000)
+            .map(|_| sample_from(&mut rng, &base_centers, &mut gauss))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..200)
+            .map(|_| sample_from(&mut rng, &query_centers, &mut gauss))
+            .collect();
 
         const K: usize = 10;
         let truth: Vec<Vec<usize>> = queries
@@ -5272,7 +6719,10 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(j, v)| {
-                        (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j)
+                        (
+                            q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(),
+                            j,
+                        )
                     })
                     .collect();
                 d.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -5467,11 +6917,7 @@ mod tests {
         // And the unwelcome half of the truth, pinned so it cannot rot silently.
         let par_a = graph_of(BuildStrategy::Parallel);
         let par_b = graph_of(BuildStrategy::Parallel);
-        let differing = par_a
-            .iter()
-            .zip(&par_b)
-            .filter(|(x, y)| x != y)
-            .count();
+        let differing = par_a.iter().zip(&par_b).filter(|(x, y)| x != y).count();
         assert!(
             differing > 0,
             "the parallel builder has become reproducible under a fixed seed ({differing} nodes \

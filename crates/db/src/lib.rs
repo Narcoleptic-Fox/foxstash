@@ -43,9 +43,13 @@ pub mod store;
 // ── Desktop-only imports and types ──
 
 #[cfg(not(target_arch = "wasm32"))]
-use foxstash_core::index::{HNSWConfig, Storage};
-#[cfg(not(target_arch = "wasm32"))]
 use crate::inverted_index::BM25Config;
+#[cfg(not(target_arch = "wasm32"))]
+use foxstash_core::index::{HNSWConfig, Storage};
+// `IncrementalConfig` is filesystem-backed and core gates it off wasm32; the gate was missing
+// here, so `foxstash-db` (and thus `foxstash-wasm`) failed to compile for wasm even though every
+// *use* of it below is already wasm-gated. The import must carry the same gate.
+#[cfg(not(target_arch = "wasm32"))]
 use foxstash_core::storage::IncrementalConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use thiserror::Error;

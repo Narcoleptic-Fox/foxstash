@@ -51,6 +51,8 @@
 pub mod ops;
 pub mod rabitq;
 pub mod simd;
+pub mod turboquant;
+pub mod turborabit;
 
 use crate::{RagError, Result};
 

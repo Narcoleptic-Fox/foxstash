@@ -38,7 +38,6 @@
 use rand::{rngs::StdRng, RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 
-
 /// Default seed for the rotation, so builds are reproducible by default.
 const DEFAULT_SEED: u64 = 0x5241_4249_5451_5121; // "RABITQ!" ish
 
@@ -128,7 +127,6 @@ impl RaBitQuantizer {
             rotation,
         }
     }
-
 
     /// Dimensionality.
     pub fn dim(&self) -> usize {

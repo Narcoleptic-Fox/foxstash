@@ -11,7 +11,7 @@
 # idempotent — it skips any dataset already present and valid.
 #
 # Builds:
-#   sift10k    10,000 base x 128d,     1,000 queries   (TEXMEX siftsmall, authors' GT)
+#   sift10k    10,000 base x 128d,       100 queries   (TEXMEX siftsmall, authors' GT)
 #   sift100k   100,000 base x 128d,   10,000 queries   (prefix of sift1m, GT recomputed)
 #   sift1m     1,000,000 base x 128d, 10,000 queries   (TEXMEX ANN_SIFT1M, authors' GT)
 #   gist1m     1,000,000 base x 960d,  1,000 queries   (TEXMEX ANN_GIST1M, authors' GT)
@@ -129,7 +129,7 @@ echo "==> verifying (exact-L2 control — a corpus that fails this is unusable)"
 python3 - <<'PY'
 import numpy as np, os, sys
 
-EXPECT = {"sift10k": (10_000, 1_000), "sift100k": (100_000, 10_000), "sift1m": (1_000_000, 10_000),
+EXPECT = {"sift10k": (10_000, 100), "sift100k": (100_000, 10_000), "sift1m": (1_000_000, 10_000),
           "gist1m": (1_000_000, 1_000)}
 ok = True
 for name, (nb, nq) in EXPECT.items():
