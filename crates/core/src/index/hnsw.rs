@@ -2236,8 +2236,19 @@ impl HNSWIndex {
     /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not
     /// this index's dimension.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        let mut ctx = SearchContext::new(self.len());
-        self.search_inner(query, k, &mut ctx)
+        // Reuse a per-thread scratch context across calls. A plain `search()` otherwise
+        // allocates and zero-inits a fresh visited-bitset + two candidate heaps on *every*
+        // query — ~184 KB on a 1.5M-node index, a per-query cost that grows with the corpus and
+        // is pure overhead. `search_inner` resizes the context if this index is larger than the
+        // last one this thread searched (line ~2291), and `search_layer` resets the visited set,
+        // so reuse is transparent — the search sees a clean context regardless. `search_batch`
+        // and `Searcher` already reuse; this brings the same to the single-query path the
+        // Python/wasm bindings call once per query.
+        thread_local! {
+            static CTX: std::cell::RefCell<SearchContext> =
+                std::cell::RefCell::new(SearchContext::new(0));
+        }
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut()))
     }
 
     /// Search many queries in parallel, across all rayon worker threads.
