@@ -89,9 +89,9 @@ impl Foxstash {
     }
 
     fn built_mut(&mut self) -> PyResult<&mut HNSWIndex> {
-        self.index
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("foxstash: call fit() before set_query_arguments()"))
+        self.index.as_mut().ok_or_else(|| {
+            PyValueError::new_err("foxstash: call fit() before set_query_arguments()")
+        })
     }
 
     /// The full `HNSWConfig` this instance's constructor args imply — what `fit()` builds.
@@ -122,6 +122,10 @@ impl Foxstash {
             } else {
                 HNSWConfig::default().rabit_bits
             },
+            // Reflect the shipped default: the BFS locality relabel is a real query-QPS win, so
+            // VIBE should measure foxstash as it actually ships. The build-cache (fit_cached)
+            // reorders the F32 build once; requantize carries that order into every storage arm.
+            reorder_for_locality: HNSWConfig::default().reorder_for_locality,
         }
     }
 
@@ -338,7 +342,12 @@ impl Foxstash {
     fn __str__(&self) -> String {
         format!(
             "Foxstash(metric={}, storage={}, M={}, efConstruction={}, efSearch={}, rerank={})",
-            self.metric_arg, self.storage_arg, self.m, self.ef_construction, self.ef_query, self.rerank_candidates
+            self.metric_arg,
+            self.storage_arg,
+            self.m,
+            self.ef_construction,
+            self.ef_query,
+            self.rerank_candidates
         )
     }
 }

@@ -1057,6 +1057,9 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             turbo_bits: crate::index::HNSWConfig::default().turbo_bits,
             // Same status as `turbo_bits` directly above: TurboRabit save/load is not wired yet.
             rabit_bits: crate::index::HNSWConfig::default().rabit_bits,
+            // Inert on this path regardless: `to_index` rebuilds via `add()`, which does not
+            // reorder. Defaulted so the config is valid.
+            reorder_for_locality: crate::index::HNSWConfig::default().reorder_for_locality,
             seed: wrapper.seed,
             // NOT persisted, and that is deliberate rather than an oversight: `to_index`
             // rebuilds the graph by looping `add()`, which never consults `build_strategy`.

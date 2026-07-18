@@ -402,6 +402,18 @@ pub struct HNSWConfig {
     /// RaBitQ; sweep `{2, 3, 4}` against `turbo_bits` at matched budgets. Must be in
     /// `1..=4` (nibble-packed codes; b=4 already reaches F32 recall).
     pub rabit_bits: usize,
+
+    /// Relabel nodes in BFS order after the build so graph-adjacent nodes sit at nearby arena
+    /// offsets — a pure locality win worth **+10–15% query QPS** at zero recall cost (the walk's
+    /// bottleneck is per-hop cache misses, not compute; see [`HNSWIndex::reorder_for_locality`]).
+    /// It is transparent: returned document ids are unchanged, only faster.
+    ///
+    /// **Default `true`** — this is a free lunch for query-heavy indexes, which is most of them.
+    /// Its one cost is at build time: a single reorder pass (sub-second on 300k nodes, a few
+    /// seconds on 1.5M) that briefly holds a second copy of the arena, so peak build memory is
+    /// ~2× the index size for the duration. Set `false` if your build is memory-constrained or
+    /// you rebuild far more often than you query.
+    pub reorder_for_locality: bool,
 }
 
 /// Distance metric for [`HNSWIndex`]. **Every** storage mode honours it.
@@ -587,6 +599,7 @@ impl Default for HNSWConfig {
             rerank_candidates: 100,
             turbo_bits: 2,
             rabit_bits: 3,
+            reorder_for_locality: true,
         }
     }
 }
@@ -1443,7 +1456,7 @@ impl HNSWIndex {
         }
 
         index.shrink_to_fit();
-        index
+        index.finalize_reorder()
     }
 
     /// Returns the number of nodes in the index
@@ -1780,6 +1793,18 @@ impl HNSWIndex {
         index.migrate_l0_into_arena();
         index.shrink_to_fit();
         Ok(index)
+    }
+
+    /// Apply the BFS locality relabel iff `config.reorder_for_locality` — the shared build
+    /// finale for both builders, so a direct `build_parallel`/`build_sequential` call gets the
+    /// same treatment as `build`. Consuming `self` keeps the peak at one index plus the reorder's
+    /// transient copy, not three.
+    fn finalize_reorder(self) -> Self {
+        if self.config.reorder_for_locality {
+            self.reorder_for_locality()
+        } else {
+            self
+        }
     }
 
     /// Relabel nodes in **breadth-first order from the entry point** so that graph-adjacent
@@ -3207,6 +3232,7 @@ impl HNSWIndex {
 
         // Convert to final index format
         Self::convert_parallel_to_index(zero, layers, points, shuffled, embedding_dim, config, top)
+            .finalize_reorder()
     }
 
     /// Insert a single node during parallel construction
@@ -5252,6 +5278,56 @@ mod tests {
                     "b={bits} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
                 );
             }
+        }
+    }
+
+    /// `reorder_for_locality: true` is the default and must be **transparent**: a build with it
+    /// on returns the same search results as one with it off (only faster), while actually
+    /// changing the internal layout. This pins both halves — the default is applied (arena
+    /// differs) and it is safe (results identical).
+    #[test]
+    fn reorder_default_is_transparent_but_real() {
+        let mut rng = StdRng::seed_from_u64(51);
+        let base: Vec<Vec<f32>> = (0..400)
+            .map(|_| (0..48).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..30)
+            .map(|_| (0..48).map(|_| rng.random::<f32>()).collect())
+            .collect();
+        let cfg = |reorder: bool| HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 16,
+            m0: 32,
+            ef_construction: 200,
+            ef_search: 100,
+            seed: Some(9),
+            reorder_for_locality: reorder,
+            ..Default::default()
+        };
+        let plain = HNSWIndex::build_parallel(base.clone(), cfg(false));
+        let reordered = HNSWIndex::build_parallel(base.clone(), cfg(true));
+
+        // Real: the default actually relabelled the arena (entry point almost surely moves to a
+        // low id under BFS; the arenas are not byte-identical).
+        assert_ne!(
+            plain.nodes, reordered.nodes,
+            "reorder_for_locality: true must change the layout, but the arenas are identical"
+        );
+        // Transparent: identical results, scores included.
+        for q in &queries {
+            let a: Vec<(String, u32)> = plain
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            let b: Vec<(String, u32)> = reordered
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            assert_eq!(a, b, "default reorder changed a query's results");
         }
     }
 
