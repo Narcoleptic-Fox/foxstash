@@ -805,6 +805,13 @@ pub fn sq8_asymmetric_l2_simd(query: &[f32], codes: &[u8], min: &[f32], scale: &
 
     #[cfg(target_arch = "x86_64")]
     {
+        // AVX-512 widens 16 codes/iter (vs AVX2's 8) — the u8->f32 widening and the FMA both
+        // double width. On Zen 4 (7840HS) this is the most-executed distance path under SQ8.
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: feature-detected; slices are equal length (checked) and the loop reads
+            // at most `i + 16 <= n`, with a scalar tail for the remainder.
+            return unsafe { sq8_asymmetric_l2_avx512(query, codes, min, scale) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: guarded by runtime feature detection; all four slices are the same
             // length (checked above) and the loop never reads past `n - n % 8`.
@@ -812,6 +819,36 @@ pub fn sq8_asymmetric_l2_simd(query: &[f32], codes: &[u8], min: &[f32], scale: &
         }
     }
     sq8_asymmetric_l2_scalar(query, codes, min, scale)
+}
+
+/// AVX-512 sibling of [`sq8_asymmetric_l2_avx2`]: 16 dims/iter. Widens 16 `u8` codes from a
+/// 128-bit load via `cvtepu8_epi32`, dequantizes `min + code*scale`, accumulates `(q-deq)²`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq8_asymmetric_l2_avx512(query: &[f32], codes: &[u8], min: &[f32], scale: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = codes.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let c16 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
+        let cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
+        let s = _mm512_loadu_ps(scale.as_ptr().add(i));
+        let m = _mm512_loadu_ps(min.as_ptr().add(i));
+        let q = _mm512_loadu_ps(query.as_ptr().add(i));
+        let deq = _mm512_fmadd_ps(cf, s, m);
+        let d = _mm512_sub_ps(q, deq);
+        acc = _mm512_fmadd_ps(d, d, acc);
+        i += 16;
+    }
+    let mut total = _mm512_reduce_add_ps(acc);
+    for j in i..n {
+        let deq = min[j] + codes[j] as f32 * scale[j];
+        let d = query[j] - deq;
+        total += d * d;
+    }
+    total
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -887,6 +924,10 @@ pub fn sq8_asymmetric_dot_simd(query: &[f32], codes: &[u8], min: &[f32], scale: 
 
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: feature-detected; equal-length slices, loop reads at most `i + 16 <= n`.
+            return unsafe { sq8_asymmetric_dot_avx512(query, codes, min, scale) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: guarded by runtime feature detection; all four slices are the same
             // length (checked above) and the loop never reads past `n - n % 8`.
@@ -894,6 +935,38 @@ pub fn sq8_asymmetric_dot_simd(query: &[f32], codes: &[u8], min: &[f32], scale: 
         }
     }
     sq8_asymmetric_dot_scalar(query, codes, min, scale)
+}
+
+/// AVX-512 sibling of [`sq8_asymmetric_dot_avx2`]: 16 dims/iter, `q * (min + code*scale)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq8_asymmetric_dot_avx512(
+    query: &[f32],
+    codes: &[u8],
+    min: &[f32],
+    scale: &[f32],
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let n = codes.len();
+    let mut acc = _mm512_setzero_ps();
+    let mut i = 0;
+    while i + 16 <= n {
+        let c16 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
+        let cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
+        let s = _mm512_loadu_ps(scale.as_ptr().add(i));
+        let m = _mm512_loadu_ps(min.as_ptr().add(i));
+        let q = _mm512_loadu_ps(query.as_ptr().add(i));
+        let deq = _mm512_fmadd_ps(cf, s, m);
+        acc = _mm512_fmadd_ps(q, deq, acc);
+        i += 16;
+    }
+    let mut total = _mm512_reduce_add_ps(acc);
+    for j in i..n {
+        let deq = min[j] + codes[j] as f32 * scale[j];
+        total += query[j] * deq;
+    }
+    total
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1472,5 +1545,37 @@ mod sq8_asymmetric_tests {
             rel < 1e-5,
             "AVX2 dot kernel disagrees with scalar: {dispatched} vs {scalar} (rel {rel:.2e})"
         );
+    }
+
+    /// The AVX-512 SQ8 kernels (16 dims/iter) must match scalar directly, across the 16-lane
+    /// boundary — 16 (exact), 17/31 (1- and 15-wide tails), 768 (the real embedding dim).
+    #[test]
+    fn avx512_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !std::arch::is_x86_feature_detected!("avx512f") {
+                eprintln!("avx512f unavailable; skipping direct SQ8 AVX-512 check");
+                return;
+            }
+            for dim in [16usize, 17, 31, 32, 131, 384, 768] {
+                let query: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.37).sin() * 12.0).collect();
+                let codes: Vec<u8> = (0..dim).map(|i| ((i * 7 + 3) % 256) as u8).collect();
+                let min: Vec<f32> = (0..dim).map(|i| -(i as f32) * 0.11).collect();
+                let scale: Vec<f32> = (0..dim).map(|i| 0.01 + (i % 5) as f32 * 0.03).collect();
+                // SAFETY: avx512f feature-detected just above.
+                let l2 = unsafe { sq8_asymmetric_l2_avx512(&query, &codes, &min, &scale) };
+                let l2s = sq8_asymmetric_l2_scalar(&query, &codes, &min, &scale);
+                let dot = unsafe { sq8_asymmetric_dot_avx512(&query, &codes, &min, &scale) };
+                let dots = sq8_asymmetric_dot_scalar(&query, &codes, &min, &scale);
+                assert!(
+                    (l2 - l2s).abs() / l2s.abs().max(1e-6) < 1e-5,
+                    "dim {dim}: L2 AVX-512 {l2} vs scalar {l2s}"
+                );
+                assert!(
+                    (dot - dots).abs() / dots.abs().max(1e-6) < 1e-5,
+                    "dim {dim}: dot AVX-512 {dot} vs scalar {dots}"
+                );
+            }
+        }
     }
 }
