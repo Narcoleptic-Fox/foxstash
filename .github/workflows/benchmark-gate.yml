@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: benchmarks/data/sift10k
-          key: sift10k-data-v1
+          key: sift10k-data-v2
 
       # Deliberately narrower than benchmarks/fetch-data.sh: that script also
       # pulls the 168 MB ANN_SIFT1M archive to build sift100k/sift1m, which
@@ -120,10 +120,17 @@ jobs:
           q = np.load("benchmarks/data/sift10k/query.npy", mmap_mode="r")
           g = np.load("benchmarks/data/sift10k/groundtruth.npy", mmap_mode="r")
 
-          if (b.shape[0], q.shape[0]) != (10_000, 1_000):
+          # sift10k IS TEXMEX siftsmall (ANN_SIFT10K): 10,000 base, 100 queries, authors' GT.
+          # (The earlier "1000 queries" here was a copy-paste error — siftsmall only ships 100,
+          # and the fetch step builds from it. q/g row counts must agree for the control below.)
+          if b.shape[0] != 10_000 or q.shape[0] != 100:
               sys.exit(
-                  f"sift10k: FAIL — expected 10000 base / 1000 queries, "
+                  f"sift10k: FAIL — expected 10000 base / 100 queries, "
                   f"got {b.shape[0]} / {q.shape[0]}"
+              )
+          if q.shape[0] != g.shape[0]:
+              sys.exit(
+                  f"sift10k: FAIL — {q.shape[0]} queries but {g.shape[0]} ground-truth rows"
               )
           if g.max() >= b.shape[0]:
               sys.exit(
@@ -131,7 +138,7 @@ jobs:
                   f"{b.shape[0]}-vector base"
               )
 
-          n = 300
+          n = min(300, q.shape[0])
           B = np.asarray(b, dtype=np.float32)
           Q = np.asarray(q[:n], dtype=np.float32)
           d = (B * B).sum(1)[None, :] - 2.0 * (Q @ B.T) + (Q * Q).sum(1)[:, None]

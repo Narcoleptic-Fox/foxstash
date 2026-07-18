@@ -36,7 +36,7 @@ pub mod sift {
         Spec {
             name: "sift10k",
             base: 10_000,
-            queries: 1_000,
+            queries: 100,
             dim: 128,
         },
         Spec {
