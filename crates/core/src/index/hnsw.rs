@@ -926,7 +926,12 @@ pub struct HNSWIndex {
 /// Bump when the meaning of any [`HNSWSnapshot`] field changes. Belt-and-braces on top of the
 /// crate-version check: two builds of the *same* crate version can still disagree if a field is
 /// reinterpreted on a dev branch.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+///
+/// v2: `HNSWConfig` gained `reorder_for_locality` (serialized in the snapshot's `config`) without a
+/// crate-version bump, so a v1 snapshot's bincode layout no longer matches — it must be rejected
+/// cleanly here rather than deserialized into garbage (bincode read a stray byte as a bool and
+/// panicked with `InvalidBoolEncoding`).
+const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// The verbatim on-disk image behind [`HNSWIndex::snapshot_to_file`]. Every field is a direct
 /// clone of the corresponding `HNSWIndex` field except the two version stamps; `stride`, `hdr`

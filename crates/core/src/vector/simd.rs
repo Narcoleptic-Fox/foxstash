@@ -829,20 +829,35 @@ unsafe fn sq8_asymmetric_l2_avx512(query: &[f32], codes: &[u8], min: &[f32], sca
     use std::arch::x86_64::*;
 
     let n = codes.len();
-    let mut acc = _mm512_setzero_ps();
+    // Two independent accumulators (32 dims/iter) so the squared-diff FMA chain isn't
+    // latency-bound on a single register; combined after the loop.
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
     let mut i = 0;
-    while i + 16 <= n {
-        let c16 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
-        let cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
-        let s = _mm512_loadu_ps(scale.as_ptr().add(i));
-        let m = _mm512_loadu_ps(min.as_ptr().add(i));
-        let q = _mm512_loadu_ps(query.as_ptr().add(i));
-        let deq = _mm512_fmadd_ps(cf, s, m);
-        let d = _mm512_sub_ps(q, deq);
-        acc = _mm512_fmadd_ps(d, d, acc);
+    let l2_block = |off: usize| -> __m512 {
+        let c = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(
+            codes.as_ptr().add(off) as *const __m128i,
+        )));
+        let deq = _mm512_fmadd_ps(
+            c,
+            _mm512_loadu_ps(scale.as_ptr().add(off)),
+            _mm512_loadu_ps(min.as_ptr().add(off)),
+        );
+        _mm512_sub_ps(_mm512_loadu_ps(query.as_ptr().add(off)), deq)
+    };
+    while i + 32 <= n {
+        let d0 = l2_block(i);
+        let d1 = l2_block(i + 16);
+        acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+        i += 32;
+    }
+    if i + 16 <= n {
+        let d0 = l2_block(i);
+        acc0 = _mm512_fmadd_ps(d0, d0, acc0);
         i += 16;
     }
-    let mut total = _mm512_reduce_add_ps(acc);
+    let mut total = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     for j in i..n {
         let deq = min[j] + codes[j] as f32 * scale[j];
         let d = query[j] - deq;
@@ -949,19 +964,34 @@ unsafe fn sq8_asymmetric_dot_avx512(
     use std::arch::x86_64::*;
 
     let n = codes.len();
-    let mut acc = _mm512_setzero_ps();
+    // Two independent accumulators (32 dims/iter) to hide FMA latency; combined after the loop.
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
     let mut i = 0;
-    while i + 16 <= n {
-        let c16 = _mm_loadu_si128(codes.as_ptr().add(i) as *const __m128i);
-        let cf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
-        let s = _mm512_loadu_ps(scale.as_ptr().add(i));
-        let m = _mm512_loadu_ps(min.as_ptr().add(i));
-        let q = _mm512_loadu_ps(query.as_ptr().add(i));
-        let deq = _mm512_fmadd_ps(cf, s, m);
-        acc = _mm512_fmadd_ps(q, deq, acc);
+    let qdeq = |off: usize| -> (__m512, __m512) {
+        let c = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(
+            codes.as_ptr().add(off) as *const __m128i,
+        )));
+        let deq = _mm512_fmadd_ps(
+            c,
+            _mm512_loadu_ps(scale.as_ptr().add(off)),
+            _mm512_loadu_ps(min.as_ptr().add(off)),
+        );
+        (_mm512_loadu_ps(query.as_ptr().add(off)), deq)
+    };
+    while i + 32 <= n {
+        let (q0, deq0) = qdeq(i);
+        let (q1, deq1) = qdeq(i + 16);
+        acc0 = _mm512_fmadd_ps(q0, deq0, acc0);
+        acc1 = _mm512_fmadd_ps(q1, deq1, acc1);
+        i += 32;
+    }
+    if i + 16 <= n {
+        let (q0, deq0) = qdeq(i);
+        acc0 = _mm512_fmadd_ps(q0, deq0, acc0);
         i += 16;
     }
-    let mut total = _mm512_reduce_add_ps(acc);
+    let mut total = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     for j in i..n {
         let deq = min[j] + codes[j] as f32 * scale[j];
         total += query[j] * deq;
@@ -1264,27 +1294,40 @@ unsafe fn nibble_uint_dot_avx512(rq: &[f32], nibbles: &[u8]) -> f32 {
     use std::arch::x86_64::*;
 
     let n = rq.len();
-    let mut acc = _mm512_setzero_ps();
+    // Two independent accumulators (32 dims/iter): this kernel is ALU-bound (few bytes read per
+    // FMA), so breaking the single-register FMA dependency chain hides the ~4-cycle latency.
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
     // lane 0..7: shifts 0,4,..,28 applied to w0; lane 8..15: same applied to w1.
     // _mm512_set_epi32 takes lane 15 first, lane 0 last.
     let shifts = _mm512_set_epi32(28, 24, 20, 16, 12, 8, 4, 0, 28, 24, 20, 16, 12, 8, 4, 0);
     let nib_mask = _mm512_set1_epi32(0xF);
-
-    let mut i = 0;
-    while i + 16 <= n {
-        let w0 = unsafe { (nibbles.as_ptr().add(i / 2) as *const u32).read_unaligned() } as i32;
-        let w1 = unsafe { (nibbles.as_ptr().add(i / 2 + 4) as *const u32).read_unaligned() } as i32;
+    let uf_at = |off: usize| -> __m512 {
+        let w0 = unsafe { (nibbles.as_ptr().add(off / 2) as *const u32).read_unaligned() } as i32;
+        let w1 =
+            unsafe { (nibbles.as_ptr().add(off / 2 + 4) as *const u32).read_unaligned() } as i32;
         let words = _mm512_set_epi32(
             w1, w1, w1, w1, w1, w1, w1, w1, w0, w0, w0, w0, w0, w0, w0, w0,
         );
-        let u = _mm512_and_si512(_mm512_srlv_epi32(words, shifts), nib_mask);
-        let uf = _mm512_cvtepi32_ps(u);
-        let rq_vec = _mm512_loadu_ps(rq.as_ptr().add(i));
-        acc = _mm512_fmadd_ps(rq_vec, uf, acc);
+        _mm512_cvtepi32_ps(_mm512_and_si512(_mm512_srlv_epi32(words, shifts), nib_mask))
+    };
+
+    let mut i = 0;
+    while i + 32 <= n {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(rq.as_ptr().add(i)), uf_at(i), acc0);
+        acc1 = _mm512_fmadd_ps(
+            _mm512_loadu_ps(rq.as_ptr().add(i + 16)),
+            uf_at(i + 16),
+            acc1,
+        );
+        i += 32;
+    }
+    if i + 16 <= n {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(rq.as_ptr().add(i)), uf_at(i), acc0);
         i += 16;
     }
 
-    let mut total = _mm512_reduce_add_ps(acc);
+    let mut total = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
     for j in i..n {
         let nib = (nibbles[j / 2] >> (4 * (j % 2))) & 0xF;
         total += nib as f32 * rq[j];
