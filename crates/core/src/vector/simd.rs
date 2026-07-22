@@ -1047,6 +1047,96 @@ fn sq8_asymmetric_dot_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[
     acc
 }
 
+/// Raw asymmetric dot of a full-precision query with a node's per-coordinate `u8` codes:
+/// `Σ query[d] * codes[d]`.
+///
+/// A plain integer-code dot `Σ query[i]·codes[i]`, behind [`Storage::Warren`]'s residual rerank.
+/// Unlike [`sq8_asymmetric_dot_simd`] there is NO per-dimension min/scale — the residual affine is
+/// *per-vector* (`min`/`step` scalars), so it folds out of the sum and the caller applies it once.
+/// Used for Warren's two 8-bit residual levels (codes `0..=255`, one per byte).
+///
+/// [`Storage::Warren`]: crate::index::hnsw::Storage::Warren
+pub fn byte_uint_dot_simd(query: &[f32], codes: &[u8]) -> f32 {
+    debug_assert_eq!(query.len(), codes.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: feature-detected; equal-length slices, loop reads at most `i + 16 <= n`.
+            return unsafe { byte_uint_dot_avx512(query, codes) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: feature-detected; equal-length slices, loop never reads past `n - n % 8`.
+            return unsafe { byte_uint_dot_avx2(query, codes) };
+        }
+    }
+    byte_uint_dot_scalar(query, codes)
+}
+
+/// AVX-512 sibling: 32 dims/iter across two accumulators, `q * code` (no dequant).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn byte_uint_dot_avx512(query: &[f32], codes: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = codes.len();
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    let mut i = 0;
+    let load = |off: usize| -> (__m512, __m512) {
+        let c = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(
+            codes.as_ptr().add(off) as *const __m128i,
+        )));
+        (_mm512_loadu_ps(query.as_ptr().add(off)), c)
+    };
+    while i + 32 <= n {
+        let (q0, c0) = load(i);
+        let (q1, c1) = load(i + 16);
+        acc0 = _mm512_fmadd_ps(q0, c0, acc0);
+        acc1 = _mm512_fmadd_ps(q1, c1, acc1);
+        i += 32;
+    }
+    if i + 16 <= n {
+        let (q0, c0) = load(i);
+        acc0 = _mm512_fmadd_ps(q0, c0, acc0);
+        i += 16;
+    }
+    let mut total = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    for j in i..n {
+        total += query[j] * codes[j] as f32;
+    }
+    total
+}
+
+/// AVX2 sibling: 8 dims/iter, `q * code`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn byte_uint_dot_avx2(query: &[f32], codes: &[u8]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = codes.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= n {
+        let c8 = _mm_loadl_epi64(codes.as_ptr().add(i) as *const __m128i);
+        let cf = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(c8));
+        let q = _mm256_loadu_ps(query.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(q, cf, acc);
+        i += 8;
+    }
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let mut sum128 = _mm_add_ps(hi, lo);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    sum128 = _mm_hadd_ps(sum128, sum128);
+    let mut total = _mm_cvtss_f32(sum128);
+    for j in i..n {
+        total += query[j] * codes[j] as f32;
+    }
+    total
+}
+
+fn byte_uint_dot_scalar(query: &[f32], codes: &[u8]) -> f32 {
+    query.iter().zip(codes).map(|(&q, &c)| q * c as f32).sum()
+}
+
 /// Asymmetric RaBitQ estimate of squared L2 between a prepared query and a node's 1-bit code.
 ///
 /// "Asymmetric" in the same sense as [`sq8_asymmetric_l2_simd`]: the query stays `f32`
@@ -1617,6 +1707,28 @@ mod sq8_asymmetric_tests {
                 assert!(
                     (dot - dots).abs() / dots.abs().max(1e-6) < 1e-5,
                     "dim {dim}: dot AVX-512 {dot} vs scalar {dots}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn byte_uint_dot_simd_matches_scalar() {
+        // The dispatched kernel (AVX-512/AVX2/scalar on this host) must equal the scalar
+        // reference across odd tails and both code ranges (4-bit 0..=15, 8-bit 0..=255).
+        for dim in [1usize, 7, 8, 15, 16, 17, 31, 32, 33, 96, 131, 384, 768] {
+            let query: Vec<f32> = (0..dim)
+                .map(|i| (i as f32 * 0.41).cos() * 9.0 - 2.0)
+                .collect();
+            for hi in [15u16, 255u16] {
+                let codes: Vec<u8> = (0..dim)
+                    .map(|i| ((i * 13 + 5) as u16 % (hi + 1)) as u8)
+                    .collect();
+                let simd = byte_uint_dot_simd(&query, &codes);
+                let scalar = byte_uint_dot_scalar(&query, &codes);
+                assert!(
+                    (simd - scalar).abs() / scalar.abs().max(1e-6) < 1e-5,
+                    "dim {dim}, hi {hi}: byte_uint_dot SIMD {simd} vs scalar {scalar}"
                 );
             }
         }

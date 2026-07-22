@@ -412,6 +412,116 @@ impl Ord for NotNanF64 {
 
 impl TurboRabitQuantizer {
     /// `R · v` (row-major matrix-vector product).
+    /// The fitted centroid `c`.
+    pub fn centroid(&self) -> &[f32] {
+        &self.centroid
+    }
+
+    /// Apply the rotation: `R·v`. Public so callers can move their own vectors into the rotated
+    /// space the codes live in — see [`Self::reconstruct_rotated`].
+    pub fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        self.matvec(v)
+    }
+
+    /// Reconstruct the **rotated residual** `r ≈ R·(x − c)` — i.e. [`Self::reconstruct`] stopped
+    /// one step early, before the inverse rotation and re-centring.
+    ///
+    /// This exists because the inverse rotation is `O(dim²)`, which is unaffordable per rerank
+    /// candidate. Staying in rotated space keeps everything `O(dim)`:
+    ///
+    /// ```text
+    /// ⟨q, x⟩ = ⟨q, c⟩ + ⟨R·q, r⟩
+    /// ```
+    ///
+    /// and `R·q` is already available per query (`prepare_query`'s `rq`, plus the constant `R·c`).
+    pub fn reconstruct_rotated(&self, code: &TurboRabitCode) -> Vec<f32> {
+        let d = self.dim;
+        let ex_bits = (self.total_bits - 1) as u32;
+        let l = code.dtc_sq.sqrt();
+        if l <= f32::EPSILON {
+            return vec![0.0; d];
+        }
+        let mask = if ex_bits == 0 {
+            0
+        } else {
+            (1u8 << ex_bits) - 1
+        };
+        let mut v = vec![0.0f32; d];
+        for (i, &c) in code.codes.iter().enumerate().take(d) {
+            let positive = ((c >> ex_bits) & 1) == 1;
+            let m = if positive { c & mask } else { (!c) & mask };
+            let g = m as f32 + 0.5;
+            v[i] = if positive { g } else { -g };
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm <= f32::EPSILON {
+            return vec![0.0; d];
+        }
+        let s = l / norm;
+        for x in v.iter_mut() {
+            *x *= s;
+        }
+        v
+    }
+
+    /// Reconstruct an approximation of the original vector from its code.
+    ///
+    /// TurboRabit is normally used as a distance *estimator*, not a codec — but the code does
+    /// determine a reconstruction, and Warren needs one so an 8-bit residual can be taken against
+    /// it. Inverting [`Self::encode`]:
+    ///
+    /// - the packed sign + magnitude give the grid value `±(m + ½)`, i.e. the **direction** of the
+    ///   rotated residual;
+    /// - `dtc_sq` gives its **magnitude** `ℓ = ‖x − c‖`;
+    /// - the encoder's rescale factor `t` is *not* stored and does not need to be — it scales the
+    ///   whole grid uniformly, so it cancels when the direction is renormalised;
+    /// - the rotation is orthonormal, so its inverse is its transpose.
+    pub fn reconstruct(&self, code: &TurboRabitCode) -> Vec<f32> {
+        let d = self.dim;
+        let ex_bits = (self.total_bits - 1) as u32;
+        let l = code.dtc_sq.sqrt();
+        if l <= f32::EPSILON {
+            return self.centroid.clone();
+        }
+        let mask = if ex_bits == 0 {
+            0
+        } else {
+            (1u8 << ex_bits) - 1
+        };
+
+        // Unpack to the signed grid value the encoder folded in.
+        let mut v = vec![0.0f32; d];
+        for (i, &c) in code.codes.iter().enumerate().take(d) {
+            let positive = ((c >> ex_bits) & 1) == 1;
+            let m = if positive { c & mask } else { (!c) & mask };
+            let g = m as f32 + 0.5;
+            v[i] = if positive { g } else { -g };
+        }
+
+        // Renormalise to unit (killing `t`) and rescale to ℓ.
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm <= f32::EPSILON {
+            return self.centroid.clone();
+        }
+        let s = l / norm;
+        for x in v.iter_mut() {
+            *x *= s;
+        }
+
+        // R is orthonormal ⇒ R⁻¹ = Rᵀ. Then un-centre.
+        let mut out = vec![0.0f32; d];
+        for (r, col) in v.iter().enumerate() {
+            let row = &self.rotation[r * d..(r + 1) * d];
+            for (o, &m) in out.iter_mut().zip(row) {
+                *o += m * col;
+            }
+        }
+        for (o, &c) in out.iter_mut().zip(&self.centroid) {
+            *o += c;
+        }
+        out
+    }
+
     fn matvec(&self, v: &[f32]) -> Vec<f32> {
         let d = self.dim;
         let mut out = vec![0.0f32; d];
