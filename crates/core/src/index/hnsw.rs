@@ -629,6 +629,17 @@ pub enum Storage {
     /// codebook **derived** from the known post-rotation Gaussian (no k-means on the data). The
     /// bit budget `b` is set by [`HNSWConfig::turbo_bits`]. Correctness-first integration stores
     /// codes in a parallel array; arena-packing is a later QPS optimization.
+    ///
+    /// **Deprecated (0.7, removal in 0.8).** [`Storage::TurboRabit`] (Extended RaBitQ) dominates it
+    /// at every matched bit budget and, unlike plain TurboQuant, holds on out-of-distribution data
+    /// where TurboQuant collapses — recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set
+    /// (see `docs/projects/foxstash/experiments.md` § Phase 4). Prefer `TurboRabit`, or `SQ8` for a
+    /// robust default.
+    #[deprecated(
+        since = "0.7.0",
+        note = "dominated by Storage::TurboRabit at every bit budget and collapses on OOD data; \
+                scheduled for removal in 0.8 — use Storage::TurboRabit or Storage::SQ8"
+    )]
     TurboQuant,
     /// Extended RaBitQ — B-bit codes with the RaBitQ unbiased estimator (see
     /// [`crate::vector::turborabit`]).
@@ -710,6 +721,7 @@ impl HNSWConfig {
     /// The arena layout ([`vec_words`]) is a function of this, so it must be resolved the
     /// same way everywhere — one accessor, not per-call-site matches that could drift.
     #[inline]
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     pub(crate) fn quant_bits(&self) -> usize {
         match self.storage {
             Storage::TurboQuant => self.turbo_bits,
@@ -880,6 +892,7 @@ const fn nibble_words(dim: usize) -> usize {
 /// `rabit_bits` under `TurboRabit`, ignored (pass 0) otherwise — see
 /// [`HNSWConfig::quant_bits`].
 #[inline(always)]
+#[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
 const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
     match storage {
         Storage::F32 => dim,
@@ -1208,6 +1221,7 @@ impl HNSWIndex {
     /// `RaBitQ`: fits [`RaBitQuantizer`](crate::vector::rabitq::RaBitQuantizer) — a corpus
     /// centroid plus a shared random rotation — used by [`Self::push_node`] to encode each
     /// vector and by [`Self::distance_to_node`] to prepare each query.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn fit_codebook(&mut self, embeddings: &[Vec<f32>]) {
         if embeddings.is_empty() {
             return;
@@ -1356,6 +1370,7 @@ impl HNSWIndex {
     /// (via `build()`/`build_parallel()`, or [`Self::train`]) — checked by looking at the
     /// codebook state itself rather than a separate `bool` flag, so there is no second
     /// source of truth that could drift out of sync with it.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn is_trained(&self) -> bool {
         match self.config.storage {
             Storage::F32 => true,
@@ -1682,6 +1697,7 @@ impl HNSWIndex {
     /// +1.3% on SIFT1M — inside run-to-run noise, and not worth `unsafe` in the hottest
     /// accessor in the library. The bounds check is not what separates us from hnswlib.
     #[inline(always)]
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn get_embedding(&self, node_id: usize) -> &[f32] {
         match self.config.storage {
             Storage::F32 => {
@@ -1814,6 +1830,7 @@ impl HNSWIndex {
     /// Every construction path must go through this. The sequential builder previously
     /// pushed the vector and forgot to grow the layer-0 storage, which panicked on every
     /// input; a single append keeps the arena's invariant impossible to half-satisfy.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn push_node(&mut self, embedding: &[f32]) {
         debug_assert_eq!(embedding.len(), self.embedding_dim);
         let base = self.nodes.len();
@@ -3372,6 +3389,7 @@ impl HNSWIndex {
     /// Prepare a query for [`Storage::TurboQuant`] traversal: rotate + sketch a unit-normalized
     /// copy so both sides of the estimator share the same (unit-sphere) geometry the codes use.
     /// `None` under any other storage.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn prepare_turboquant_query(
         &self,
         query: &[f32],
@@ -3422,6 +3440,7 @@ impl HNSWIndex {
     /// No test ever constructed a quantized index with the default metric, so nothing caught
     /// it — classic could-not-fail.
     #[inline]
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn distance_to_node(&self, query: &[f32], node_id: usize, qprep: &QueryPrep) -> f32 {
         // Under SQ8 the walk reads 8-bit codes straight out of the node's own block and
         // never touches `full`. This is the whole point of the storage mode: the block
@@ -5719,6 +5738,7 @@ mod tests {
     /// floor: with the estimator sabotaged this recall collapses (verified separately). Also checks
     /// that more bits ⇒ at least as much recall, end to end.
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn turboquant_recall_on_clustered_data_with_held_out_queries() {
         let mut rng = StdRng::seed_from_u64(2025);
         let dim = 96;
@@ -5971,6 +5991,7 @@ mod tests {
     /// half-used final nibble byte; b=4 exercises the full 8-entry LUT, b=1 the
     /// no-nibble-section layout.
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn turboquant_packed_walk_matches_module_estimator() {
         let mut rng = StdRng::seed_from_u64(78);
         let dim = 97;
@@ -6169,6 +6190,7 @@ mod tests {
     /// changed result, not a crash. Also checks the permutation is a bijection (every id
     /// still present exactly once).
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn reorder_for_locality_preserves_search_results() {
         let mut rng = StdRng::seed_from_u64(41);
         let dim = 80;
@@ -6240,6 +6262,7 @@ mod tests {
     /// layer-0 neighbour lists, upper layers, entry point — not via a recall proxy
     /// (measure-the-output applies to the *quantizer*; the graph has an exact answer).
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn requantize_preserves_graph_and_searches_in_every_storage() {
         let mut rng = StdRng::seed_from_u64(31);
         let dim = 96;
@@ -6403,6 +6426,7 @@ mod tests {
     /// the save/load bug-class this guards against is a field silently dropped on one side
     /// (the wasm path shipped exactly that: `turbo_bits` was never serialized).
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn snapshot_round_trip_is_verbatim_in_every_storage() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut rng = StdRng::seed_from_u64(77);

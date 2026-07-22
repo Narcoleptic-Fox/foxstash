@@ -34,6 +34,7 @@ fn parse_metric(s: &str) -> PyResult<DistanceMetric> {
 /// modes: `"turboquant"` defaults to 2 total bits, `"turboquant3"` requests 3; `"turborabit"`
 /// defaults to 3 total bits, `"turborabit4"` requests 4. Encoding the bit budget in the string
 /// keeps the positional constructor (and VIBE's caller) unchanged.
+#[allow(deprecated)] // still accepts Storage::TurboQuant until its 0.8 removal
 fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
     match s {
         "f32" => Ok((Storage::F32, 0)),
@@ -109,6 +110,7 @@ impl Foxstash {
     }
 
     /// The full `HNSWConfig` this instance's constructor args imply — what `fit()` builds.
+    #[allow(deprecated)] // routes turbo_bits for Storage::TurboQuant until its 0.8 removal
     fn target_config(&self) -> HNSWConfig {
         HNSWConfig {
             metric: self.metric,
