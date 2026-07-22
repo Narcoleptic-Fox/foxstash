@@ -178,13 +178,16 @@ struct QueryPrep<'a> {
     rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
     turboquant: Option<&'a crate::vector::turboquant::PreparedQuery>,
     turborabit: Option<&'a crate::vector::turborabit::PreparedQuery>,
-    /// Filtered search's allow-list. `Some` only from [`HNSWIndex::search_filtered`]. Unlike the
-    /// other fields this is *not* distance-computation prep — it gates which nodes enter the result
-    /// heap, and `search_layer` applies it **only at layer 0** (upper-layer descent must navigate
-    /// freely through excluded nodes or the walk disconnects). It rides in `QueryPrep` because
-    /// `search_layer` is already at clippy's argument ceiling and this struct is the documented
-    /// place to add per-query state without growing every call site.
-    filter: Option<&'a FilterMask>,
+    /// Filtered search's admit gate: `Some(f)` ⇒ a node enters the result heap only if `f(node_id)`.
+    /// `Some` only from [`HNSWIndex::search_filtered`] (a prebuilt [`FilterMask`], `|id| mask.contains(id)`)
+    /// and [`HNSWIndex::search_filtered_by`] (a caller predicate over the node's id/metadata). Unlike
+    /// the other fields this is *not* distance-computation prep — it gates which nodes are *returned*,
+    /// and `search_layer` applies it **only at layer 0** (upper-layer descent must navigate freely
+    /// through excluded nodes or the walk disconnects). A single `dyn Fn(usize) -> bool` unifies the
+    /// mask and predicate paths onto one gating mechanism. It rides in `QueryPrep` because
+    /// `search_layer` is already at clippy's argument ceiling and this struct is the documented place
+    /// to add per-query state without growing every call site.
+    filter: Option<&'a dyn Fn(usize) -> bool>,
 }
 
 /// Per-query scratch space: the visited bitset and the two heaps.
@@ -2615,11 +2618,44 @@ impl HNSWIndex {
         k: usize,
         filter: &FilterMask,
     ) -> Result<Vec<SearchResult>> {
+        let admit = |id: usize| filter.contains(id);
         thread_local! {
             static CTX: std::cell::RefCell<SearchContext> =
                 std::cell::RefCell::new(SearchContext::new(0));
         }
-        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(filter)))
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(&admit)))
+    }
+
+    /// Filtered search against a **predicate**, for one-off filters that aren't worth a
+    /// [`FilterMask`] — the metadata queries a `Collection` runs, where each search carries a
+    /// different filter. `allow` is evaluated **lazily, during the walk**, only on the nodes the
+    /// traversal actually visits (it receives each candidate's external id and metadata), so unlike
+    /// a mask there is no O(n) up-front pass, and unlike post-filtering an over-fetched result set
+    /// there is no repeated widening: one graph walk collects up to `k` allowed neighbours directly.
+    ///
+    /// Prefer [`HNSWIndex::search_filtered`] when the *same* filter is reused across many queries (a
+    /// prebuilt mask is a bit-test per candidate rather than a predicate call). Same layer-0 gating,
+    /// same "cost scales with selectivity" behaviour, same `ef_search` recall lever — see
+    /// [`HNSWIndex::search_filtered`].
+    ///
+    /// # Errors
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not this
+    /// index's dimension.
+    pub fn search_filtered_by<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        allow: F,
+    ) -> Result<Vec<SearchResult>>
+    where
+        F: Fn(&str, Option<&serde_json::Value>) -> bool,
+    {
+        let admit = |id: usize| allow(&self.ids[id], self.metadata[id].as_ref());
+        thread_local! {
+            static CTX: std::cell::RefCell<SearchContext> =
+                std::cell::RefCell::new(SearchContext::new(0));
+        }
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(&admit)))
     }
 
     /// Build a reusable [`FilterMask`] by testing every document against `pred` once (O(n)).
@@ -2670,6 +2706,35 @@ impl HNSWIndex {
             .collect()
     }
 
+    /// [`HNSWIndex::search_batch`] with the predicate gate of [`HNSWIndex::search_filtered_by`]:
+    /// each query is a single filtered graph walk, fanned across rayon workers with a per-worker
+    /// reusable context. `allow(id, metadata)` is evaluated lazily on visited nodes and must be
+    /// `Sync` (it runs on every worker). This is what a `Collection`'s parallel filtered batch uses
+    /// instead of re-running the whole batch at escalating over-fetch sizes.
+    ///
+    /// # Errors
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if any query is not this
+    /// index's dimension.
+    pub fn search_batch_filtered_by<F>(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        allow: F,
+    ) -> Result<Vec<Vec<SearchResult>>>
+    where
+        F: Fn(&str, Option<&serde_json::Value>) -> bool + Sync,
+    {
+        use rayon::prelude::*;
+        let admit = |id: usize| allow(&self.ids[id], self.metadata[id].as_ref());
+        queries
+            .par_iter()
+            .map_init(
+                || SearchContext::new(self.len()),
+                |ctx, query| self.search_inner(query, k, ctx, Some(&admit)),
+            )
+            .collect()
+    }
+
     /// A [`Searcher`]: a cursor that holds its scratch space across queries and counts the
     /// distance computations it performs.
     ///
@@ -2686,7 +2751,7 @@ impl HNSWIndex {
         query: &[f32],
         k: usize,
         ctx: &mut SearchContext,
-        filter: Option<&FilterMask>,
+        filter: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<Vec<SearchResult>> {
         if query.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
@@ -3162,7 +3227,7 @@ impl HNSWIndex {
         // navigate freely to reach the right layer-0 neighbourhood. `None` here ⇒ zero-cost
         // (one perfectly-predicted branch per candidate) for every unfiltered search.
         let filter = if layer == 0 { qprep.filter } else { None };
-        let admit = |id: usize| filter.is_none_or(|f| f.contains(id));
+        let admit = |id: usize| filter.is_none_or(|f| f(id));
 
         // Initialize with entry points
         for &ep in entry_points {
@@ -4712,6 +4777,76 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(plain, filtered);
+    }
+
+    /// `search_filtered_by` (predicate walk) must return the same results as `search_filtered` (mask)
+    /// for an equivalent filter — the two are one gating mechanism — and both must equal the
+    /// brute-force top-k over the allowed set. Guards the unification: a one-off predicate filter and
+    /// a prebuilt mask cannot diverge.
+    #[test]
+    fn search_filtered_by_matches_mask_and_bruteforce() {
+        let n = 300usize;
+        let dim = 16usize;
+        let embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|i| generate_random_vector(dim, i as u64))
+            .collect();
+        let config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            ef_search: n, // exhaustive → exact
+            ..HNSWConfig::default()
+        };
+        let index = HNSWIndex::build(embeddings.clone(), config);
+
+        // Same filter expressed two ways: a prebuilt mask, and a live predicate over the id.
+        let allow = |i: usize| i % 3 == 0;
+        let mask = index.filter_mask(|id, _c, _m| allow(id.parse::<usize>().unwrap()));
+
+        let k = 10usize;
+        for qseed in [11u64, 22, 33] {
+            let q = generate_random_vector(dim, qseed);
+            let via_mask: Vec<String> = index
+                .search_filtered(&q, k, &mask)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            let via_pred: Vec<String> = index
+                .search_filtered_by(&q, k, |id, _meta| allow(id.parse::<usize>().unwrap()))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(
+                via_pred, via_mask,
+                "predicate walk != mask walk (seed {qseed})"
+            );
+            for id in &via_pred {
+                assert!(
+                    allow(id.parse::<usize>().unwrap()),
+                    "returned excluded id {id}"
+                );
+            }
+
+            // ...and both are the true top-k over the allowed set.
+            let qn = crate::vector::simd::norm_simd(&q);
+            let mut scored: Vec<(f32, usize)> = (0..n)
+                .filter(|&i| allow(i))
+                .map(|i| {
+                    let e = &embeddings[i];
+                    let dot: f32 = q.iter().zip(e).map(|(a, b)| a * b).sum();
+                    (dot / (qn * crate::vector::simd::norm_simd(e)), i)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let want: std::collections::HashSet<usize> =
+                scored.iter().take(k).map(|&(_, i)| i).collect();
+            let got: std::collections::HashSet<usize> =
+                via_pred.iter().map(|s| s.parse().unwrap()).collect();
+            assert_eq!(
+                got, want,
+                "predicate walk != brute force over allowed (seed {qseed})"
+            );
+        }
     }
 
     #[test]
