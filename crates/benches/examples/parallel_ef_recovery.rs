@@ -75,7 +75,12 @@ fn exact_gt(q: &[f32], base: &[Vec<f32>]) -> HashSet<usize> {
     let mut d: Vec<(f32, usize)> = base
         .iter()
         .enumerate()
-        .map(|(j, v)| (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j))
+        .map(|(j, v)| {
+            (
+                q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(),
+                j,
+            )
+        })
         .collect();
     d.sort_by(|a, b| a.0.total_cmp(&b.0));
     d.iter().take(K).map(|(_, j)| *j).collect()
@@ -123,7 +128,10 @@ fn main() {
         // The bar: sequential at the default ef_construction=200.
         let (mut seq, seq_ms) = build(base.clone(), 200, BuildStrategy::Sequential);
         let seq_r = recall(&mut seq, &truth, &queries);
-        println!("dim={dim}  SEQUENTIAL ef_c=200 -> {:.2}%  ({seq_ms} ms)  <- the bar", seq_r * 100.0);
+        println!(
+            "dim={dim}  SEQUENTIAL ef_c=200 -> {:.2}%  ({seq_ms} ms)  <- the bar",
+            seq_r * 100.0
+        );
 
         for ef_c in EF_CONSTRUCTION_SWEEP {
             let (mut par, par_ms) = build(base.clone(), ef_c, BuildStrategy::Parallel);

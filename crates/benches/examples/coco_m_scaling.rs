@@ -16,11 +16,17 @@ use std::time::Instant;
 
 fn read_f32(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 fn read_i32(path: &str) -> Vec<i32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    bytes.chunks_exact(4).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 fn main() {
@@ -49,14 +55,15 @@ fn main() {
     // Graphs at matched efc, f32 storage. Parallel-M32 vs Sequential-M48 conflates degree with
     // builder; Sequential-M32 is the control that isolates each (same builder as M48 / same
     // degree as the parallel run). Set COCO_SEQ32_ONLY=1 to run just that control.
-    let configs: Vec<(&str, usize, usize, BuildStrategy)> = if std::env::var("COCO_SEQ32_ONLY").is_ok() {
-        vec![("sequential M=32", 32, 64, BuildStrategy::Sequential)]
-    } else {
-        vec![
-            ("parallel M=32", 32, 64, BuildStrategy::Parallel),
-            ("sequential M=48", 48, 96, BuildStrategy::Sequential),
-        ]
-    };
+    let configs: Vec<(&str, usize, usize, BuildStrategy)> =
+        if std::env::var("COCO_SEQ32_ONLY").is_ok() {
+            vec![("sequential M=32", 32, 64, BuildStrategy::Sequential)]
+        } else {
+            vec![
+                ("parallel M=32", 32, 64, BuildStrategy::Parallel),
+                ("sequential M=48", 48, 96, BuildStrategy::Sequential),
+            ]
+        };
     for (label, m, m0, strat) in configs {
         let config = HNSWConfig {
             metric: DistanceMetric::Cosine,

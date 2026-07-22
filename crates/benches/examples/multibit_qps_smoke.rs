@@ -25,7 +25,10 @@ const DIM: usize = 768;
 // Override via SMOKE_EF / SMOKE_RERANK to probe other operating points
 // (the frontier's max-recall configs run ef=500/rerank=500).
 fn env_or(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 struct Rng(u64);

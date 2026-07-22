@@ -27,13 +27,13 @@
 //! cargo bench -p foxstash-benches -- --ignored
 //! ```
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
 use foxstash_core::{cosine_similarity, dot_product, l2_distance, normalize, Document};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::hint::black_box;
 
 // ============================================================================
 // Helper Functions

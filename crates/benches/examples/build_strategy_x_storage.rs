@@ -77,7 +77,12 @@ fn exact_gt(q: &[f32], base: &[Vec<f32>]) -> HashSet<usize> {
     let mut d: Vec<(f32, usize)> = base
         .iter()
         .enumerate()
-        .map(|(j, v)| (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j))
+        .map(|(j, v)| {
+            (
+                q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(),
+                j,
+            )
+        })
         .collect();
     d.sort_by(|a, b| a.0.total_cmp(&b.0));
     d.iter().take(K).map(|(_, j)| *j).collect()
@@ -97,7 +102,13 @@ fn recall(idx: &mut HNSWIndex, truth: &[HashSet<usize>], queries: &[Vec<f32>]) -
     t / queries.len() as f32
 }
 
-fn build(base: Vec<Vec<f32>>, dim: usize, storage: Storage, rerank: usize, strat: BuildStrategy) -> (HNSWIndex, u128) {
+fn build(
+    base: Vec<Vec<f32>>,
+    dim: usize,
+    storage: Storage,
+    rerank: usize,
+    strat: BuildStrategy,
+) -> (HNSWIndex, u128) {
     let _ = dim;
     let cfg = HNSWConfig {
         metric: DistanceMetric::L2,
@@ -135,10 +146,17 @@ fn main() {
             (Storage::SQ8, 100, "SQ8"),
             (Storage::RaBitQ, 100, "RaBitQ"),
         ] {
-            let (mut seq, seq_ms) = build(base.clone(), dim, storage, rerank, BuildStrategy::Sequential);
+            let (mut seq, seq_ms) = build(
+                base.clone(),
+                dim,
+                storage,
+                rerank,
+                BuildStrategy::Sequential,
+            );
             let r_seq = recall(&mut seq, &truth, &queries);
 
-            let (mut par_a, par_ms) = build(base.clone(), dim, storage, rerank, BuildStrategy::Parallel);
+            let (mut par_a, par_ms) =
+                build(base.clone(), dim, storage, rerank, BuildStrategy::Parallel);
             let r_par_a = recall(&mut par_a, &truth, &queries);
 
             let (mut par_b, _) = build(base.clone(), dim, storage, rerank, BuildStrategy::Parallel);
@@ -158,6 +176,8 @@ fn main() {
         }
         println!();
     }
-    println!("Seq-Par > 0 => sequential recalls higher (parallel's f32 graph hurt the quantized index).");
+    println!(
+        "Seq-Par > 0 => sequential recalls higher (parallel's f32 graph hurt the quantized index)."
+    );
     println!("Par-A vs Par-B spread => the non-reproducible builder changes graph quality, not just node order.");
 }
