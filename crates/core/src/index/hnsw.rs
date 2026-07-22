@@ -108,6 +108,61 @@ impl BitsetVisited {
     }
 }
 
+/// An immutable allow-list over internal node slots, for filtered search.
+///
+/// One bit per node — `contains(slot)` is a single word load, cheap enough to call on every
+/// candidate in the layer-0 walk. Build it **once** with [`HNSWIndex::filter_mask`] or
+/// [`HNSWIndex::filter_mask_ids`] and reuse it across many queries: the mask is what keeps
+/// filtered search sub-linear. Rebuilding it per query (an O(n) scan of every document's
+/// metadata) would erase the graph's advantage and make a flat scan the better choice — which
+/// is precisely the flat-index niche this feature exists to *not* cede.
+///
+/// The mask is tied to the node numbering of the index that produced it. Slots shift on
+/// [`HNSWIndex::clear`] or a rebuild, so a mask outlives its index only until the next
+/// structural change; treat it as derived state, not a durable handle.
+#[derive(Clone, Debug)]
+pub struct FilterMask {
+    bits: Vec<u64>,
+    allowed: usize,
+}
+
+impl FilterMask {
+    /// Every slot in `0..n` denied. Callers flip the ones they want with [`FilterMask::allow`].
+    fn empty(n: usize) -> Self {
+        Self {
+            bits: vec![0u64; (n + 63) / 64],
+            allowed: 0,
+        }
+    }
+
+    #[inline]
+    fn allow(&mut self, node: usize) {
+        let w = node >> 6;
+        let bit = 1u64 << (node & 63);
+        if self.bits[w] & bit == 0 {
+            self.bits[w] |= bit;
+            self.allowed += 1;
+        }
+    }
+
+    /// Is `node` in the allowed set? Out-of-range slots read as denied.
+    #[inline(always)]
+    pub fn contains(&self, node: usize) -> bool {
+        match self.bits.get(node >> 6) {
+            Some(word) => word & (1u64 << (node & 63)) != 0,
+            None => false,
+        }
+    }
+
+    /// How many nodes the mask admits. A search cannot return more than this many results,
+    /// regardless of `k` — and a very small count means the walk may traverse most of the graph
+    /// to collect them (see [`HNSWIndex::search_filtered`]).
+    #[inline]
+    pub fn allowed_count(&self) -> usize {
+        self.allowed
+    }
+}
+
 /// Per-query state computed once and threaded through [`HNSWIndex::search_layer`] and
 /// [`HNSWIndex::distance_to_node`] for the whole search (or the whole `insert_node` call).
 ///
@@ -123,6 +178,13 @@ struct QueryPrep<'a> {
     rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
     turboquant: Option<&'a crate::vector::turboquant::PreparedQuery>,
     turborabit: Option<&'a crate::vector::turborabit::PreparedQuery>,
+    /// Filtered search's allow-list. `Some` only from [`HNSWIndex::search_filtered`]. Unlike the
+    /// other fields this is *not* distance-computation prep — it gates which nodes enter the result
+    /// heap, and `search_layer` applies it **only at layer 0** (upper-layer descent must navigate
+    /// freely through excluded nodes or the walk disconnects). It rides in `QueryPrep` because
+    /// `search_layer` is already at clippy's argument ceiling and this struct is the documented
+    /// place to add per-query state without growing every call site.
+    filter: Option<&'a FilterMask>,
 }
 
 /// Per-query scratch space: the visited bitset and the two heaps.
@@ -235,7 +297,7 @@ impl Searcher<'_> {
     /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not
     /// the index's dimension.
     pub fn search(&mut self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.index.search_inner(query, k, &mut self.ctx)
+        self.index.search_inner(query, k, &mut self.ctx, None)
     }
 
     /// Distance computations performed since the last [`Self::reset_stats`].
@@ -2253,7 +2315,67 @@ impl HNSWIndex {
             static CTX: std::cell::RefCell<SearchContext> =
                 std::cell::RefCell::new(SearchContext::new(0));
         }
-        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut()))
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), None))
+    }
+
+    /// Search, returning only results whose node is allowed by `filter` — up to `k` of them.
+    ///
+    /// The graph is walked in full — excluded nodes are still *traversed*, because they are
+    /// load-bearing for connectivity — but only allowed nodes enter the result set. You get up to
+    /// `k` allowed nearest neighbours with no over-fetch and no separate post-filter step. Build
+    /// `filter` once with [`HNSWIndex::filter_mask`] / [`HNSWIndex::filter_mask_ids`] and reuse it
+    /// across queries.
+    ///
+    /// **Cost scales with selectivity.** A permissive filter costs about the same as an unfiltered
+    /// search. A very selective one (few allowed nodes, scattered through the graph) forces the walk
+    /// to explore widely to collect `k` of them — in the limit, most of the graph. When the allowed
+    /// set is a *tiny* fraction of the corpus a brute-force scan of just those nodes is cheaper;
+    /// [`FilterMask::allowed_count`] lets the caller pick the strategy. Raising `ef_search` recovers
+    /// recall lost to a selective filter, at proportional cost.
+    ///
+    /// # Errors
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not this
+    /// index's dimension.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &FilterMask,
+    ) -> Result<Vec<SearchResult>> {
+        thread_local! {
+            static CTX: std::cell::RefCell<SearchContext> =
+                std::cell::RefCell::new(SearchContext::new(0));
+        }
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(filter)))
+    }
+
+    /// Build a reusable [`FilterMask`] by testing every document against `pred` once (O(n)).
+    ///
+    /// `pred` receives each document's `(id, content, metadata)` and returns `true` to allow it.
+    /// This is the O(n) step; amortise it by caching the mask and reusing it across every query
+    /// that shares the predicate — see [`FilterMask`] and [`HNSWIndex::search_filtered`].
+    pub fn filter_mask<F>(&self, mut pred: F) -> FilterMask
+    where
+        F: FnMut(&str, &str, Option<&serde_json::Value>) -> bool,
+    {
+        let mut mask = FilterMask::empty(self.len());
+        for i in 0..self.len() {
+            if pred(&self.ids[i], &self.contents[i], self.metadata[i].as_ref()) {
+                mask.allow(i);
+            }
+        }
+        mask
+    }
+
+    /// Build a [`FilterMask`] allowing exactly the documents whose external id is in `allowed`.
+    pub fn filter_mask_ids(&self, allowed: &std::collections::HashSet<String>) -> FilterMask {
+        let mut mask = FilterMask::empty(self.len());
+        for i in 0..self.len() {
+            if allowed.contains(&self.ids[i]) {
+                mask.allow(i);
+            }
+        }
+        mask
     }
 
     /// Search many queries in parallel, across all rayon worker threads.
@@ -2270,7 +2392,7 @@ impl HNSWIndex {
             .par_iter()
             .map_init(
                 || SearchContext::new(self.len()),
-                |ctx, query| self.search_inner(query, k, ctx),
+                |ctx, query| self.search_inner(query, k, ctx, None),
             )
             .collect()
     }
@@ -2291,6 +2413,7 @@ impl HNSWIndex {
         query: &[f32],
         k: usize,
         ctx: &mut SearchContext,
+        filter: Option<&FilterMask>,
     ) -> Result<Vec<SearchResult>> {
         if query.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
@@ -2322,6 +2445,7 @@ impl HNSWIndex {
             rabitq: rq_prepared.as_ref(),
             turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
+            filter,
         };
 
         let entry_point = self.entry_point.unwrap();
@@ -2586,6 +2710,7 @@ impl HNSWIndex {
             rabitq: rq_prepared.as_ref(),
             turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
+            filter: None, // builds are never filtered
         };
         let mut ctx = SearchContext::new(self.len());
 
@@ -2707,12 +2832,23 @@ impl HNSWIndex {
     ) -> Vec<(f32, usize)> {
         ctx.reset();
 
+        // Filtered search gates only the *result* heap (`best`), and only at layer 0. The frontier
+        // (`candidates`) still expands through excluded nodes — they are load-bearing for graph
+        // connectivity, and dropping them from the walk would disconnect the allowed nodes behind
+        // them and collapse recall. Upper-layer descent (layer > 0) is never filtered: it must
+        // navigate freely to reach the right layer-0 neighbourhood. `None` here ⇒ zero-cost
+        // (one perfectly-predicted branch per candidate) for every unfiltered search.
+        let filter = if layer == 0 { qprep.filter } else { None };
+        let admit = |id: usize| filter.is_none_or(|f| f.contains(id));
+
         // Initialize with entry points
         for &ep in entry_points {
             let dist = self.distance_to_node(query, ep, qprep);
             ctx.distance_calls += 1;
             ctx.candidates.push(Reverse((OrderedFloat(dist), ep)));
-            ctx.best.push((OrderedFloat(dist), ep));
+            if admit(ep) {
+                ctx.best.push((OrderedFloat(dist), ep));
+            }
             ctx.mark_visited(ep);
         }
 
@@ -2797,17 +2933,27 @@ impl HNSWIndex {
                 // Phase 2: Batch heap updates from the computed distances.
                 let mut consider = |dist: f32, neighbor_id: usize| {
                     let dist_ord = OrderedFloat(dist);
+                    let allowed = admit(neighbor_id);
 
+                    // The frontier bound is set by the *result* heap. Under a filter `best` holds
+                    // only allowed nodes, so a selective filter keeps `best.len() < ef` and every
+                    // neighbour is pushed to `candidates` — the walk widens until it has collected
+                    // `ef` allowed nodes (or drained the frontier). That is the intended cost of a
+                    // selective filter on a graph; the excluded nodes are still expanded, only never
+                    // returned.
                     if ctx.best.len() < ef {
                         ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
-                        ctx.best.push((dist_ord, neighbor_id));
+                        if allowed {
+                            ctx.best.push((dist_ord, neighbor_id));
+                        }
                     } else if let Some(&(furthest_dist, _)) = ctx.best.peek() {
                         if dist_ord < furthest_dist {
                             ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
-                            ctx.best.push((dist_ord, neighbor_id));
-
-                            if ctx.best.len() > ef {
-                                ctx.best.pop();
+                            if allowed {
+                                ctx.best.push((dist_ord, neighbor_id));
+                                if ctx.best.len() > ef {
+                                    ctx.best.pop();
+                                }
                             }
                         }
                     }
@@ -4117,6 +4263,100 @@ mod tests {
         assert!(index.is_empty());
     }
 
+    /// Filtered search must return the true top-k *within the allowed set* — not the unfiltered
+    /// top-k with excluded nodes dropped afterward (which would under-fill k), and never an excluded
+    /// node. Asserts the user-visible OUTPUT against brute force, with `ef_search >= n` so the walk
+    /// is exhaustive and the comparison is exact (no graph-miss slack to hide a logic bug).
+    #[test]
+    fn filtered_search_matches_bruteforce_over_allowed() {
+        let n = 300usize;
+        let dim = 16usize;
+        let embeddings: Vec<Vec<f32>> = (0..n).map(|i| generate_random_vector(dim, i as u64)).collect();
+        let config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            ef_search: n, // exhaustive walk → exact
+            ..HNSWConfig::default()
+        };
+        let index = HNSWIndex::build(embeddings.clone(), config);
+
+        // Allow even-id nodes only. `build` assigns ids "0".."n-1".
+        let allow = |i: usize| i % 2 == 0;
+        let mask = index.filter_mask(|id, _content, _meta| allow(id.parse::<usize>().unwrap()));
+        assert_eq!(mask.allowed_count(), n / 2);
+
+        let k = 10usize;
+        for qseed in [1000u64, 2000, 3000] {
+            let q = generate_random_vector(dim, qseed);
+            let got = index.search_filtered(&q, k, &mask).unwrap();
+
+            // Never an excluded node; exactly k results (allowed_count >> k here).
+            assert_eq!(got.len(), k);
+            for r in &got {
+                assert!(allow(r.id.parse::<usize>().unwrap()), "returned excluded id {}", r.id);
+            }
+
+            // Brute-force true top-k over the ALLOWED set (cosine == -distance ordering).
+            let qn = crate::vector::simd::norm_simd(&q);
+            let mut scored: Vec<(f32, usize)> = (0..n)
+                .filter(|&i| allow(i))
+                .map(|i| {
+                    let e = &embeddings[i];
+                    let en = crate::vector::simd::norm_simd(e);
+                    let dot: f32 = q.iter().zip(e).map(|(a, b)| a * b).sum();
+                    (dot / (qn * en), i)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let want: std::collections::HashSet<usize> =
+                scored.iter().take(k).map(|&(_, i)| i).collect();
+            let got_ids: std::collections::HashSet<usize> =
+                got.iter().map(|r| r.id.parse::<usize>().unwrap()).collect();
+            assert_eq!(got_ids, want, "filtered top-{k} != brute force over allowed (seed {qseed})");
+        }
+    }
+
+    /// A filter more selective than `k` yields exactly the allowed nodes ("up to k"), all of them,
+    /// and `filter_mask_ids` selects by external id.
+    #[test]
+    fn filtered_search_fewer_than_k_and_by_id() {
+        let n = 100usize;
+        let dim = 8usize;
+        let embeddings: Vec<Vec<f32>> = (0..n).map(|i| generate_random_vector(dim, i as u64)).collect();
+        let config = HNSWConfig { ef_search: n, ..HNSWConfig::default() };
+        let index = HNSWIndex::build(embeddings, config);
+
+        let allowed: std::collections::HashSet<String> =
+            ["7", "42", "99"].iter().map(|s| s.to_string()).collect();
+        let mask = index.filter_mask_ids(&allowed);
+        assert_eq!(mask.allowed_count(), 3);
+
+        let q = generate_random_vector(dim, 555);
+        let got = index.search_filtered(&q, 10, &mask).unwrap();
+        // Only 3 allowed → at most 3 back, and exactly the allowed ids.
+        assert_eq!(got.len(), 3);
+        let got_ids: std::collections::HashSet<String> = got.into_iter().map(|r| r.id).collect();
+        assert_eq!(got_ids, allowed);
+    }
+
+    /// Unfiltered `search` must be byte-for-byte unchanged by the filter plumbing: an all-allowed
+    /// mask returns the same ids as a plain search. Guards the "None ⇒ zero-cost" claim's correctness.
+    #[test]
+    fn all_allowed_mask_equals_unfiltered() {
+        let n = 200usize;
+        let dim = 12usize;
+        let embeddings: Vec<Vec<f32>> = (0..n).map(|i| generate_random_vector(dim, i as u64 + 9)).collect();
+        let config = HNSWConfig { metric: DistanceMetric::Cosine, ef_search: 120, ..HNSWConfig::default() };
+        let index = HNSWIndex::build(embeddings, config);
+        let mask = index.filter_mask(|_, _, _| true);
+        assert_eq!(mask.allowed_count(), n);
+
+        let q = generate_random_vector(dim, 77);
+        let plain: Vec<String> = index.search(&q, 10).unwrap().into_iter().map(|r| r.id).collect();
+        let filtered: Vec<String> =
+            index.search_filtered(&q, 10, &mask).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(plain, filtered);
+    }
+
     #[test]
     fn search_layer_considers_neighbors_beyond_fixed_stack_batch() {
         let mut config = HNSWConfig::default().with_m(64);
@@ -4147,6 +4387,7 @@ mod tests {
             rabitq: None,
             turboquant: None,
             turborabit: None,
+            filter: None,
         };
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, &qprep);
         assert!(
@@ -4407,7 +4648,7 @@ mod tests {
         let mut stale = SearchContext::new(1);
         assert!(stale.capacity < index.len());
 
-        let results = index.search_inner(&[1.0, 0.0, 0.0], 5, &mut stale).unwrap();
+        let results = index.search_inner(&[1.0, 0.0, 0.0], 5, &mut stale, None).unwrap();
 
         assert_eq!(results.len(), 5);
         assert!(
@@ -5277,6 +5518,7 @@ mod tests {
                 rabitq: None,
                 turboquant: None,
                 turborabit: Some(&prep),
+                filter: None,
             };
             for node_id in 0..index.len() {
                 let packed = index.distance_to_node(&query, node_id, &qprep);
@@ -5331,6 +5573,7 @@ mod tests {
                 rabitq: None,
                 turboquant: Some(&prep),
                 turborabit: None,
+                filter: None,
             };
             for node_id in 0..index.len() {
                 let packed = index.distance_to_node(&query, node_id, &qprep);
