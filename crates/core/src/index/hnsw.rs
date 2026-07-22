@@ -108,6 +108,61 @@ impl BitsetVisited {
     }
 }
 
+/// An immutable allow-list over internal node slots, for filtered search.
+///
+/// One bit per node — `contains(slot)` is a single word load, cheap enough to call on every
+/// candidate in the layer-0 walk. Build it **once** with [`HNSWIndex::filter_mask`] or
+/// [`HNSWIndex::filter_mask_ids`] and reuse it across many queries: the mask is what keeps
+/// filtered search sub-linear. Rebuilding it per query (an O(n) scan of every document's
+/// metadata) would erase the graph's advantage and make a flat scan the better choice — which
+/// is precisely the flat-index niche this feature exists to *not* cede.
+///
+/// The mask is tied to the node numbering of the index that produced it. Slots shift on
+/// [`HNSWIndex::clear`] or a rebuild, so a mask outlives its index only until the next
+/// structural change; treat it as derived state, not a durable handle.
+#[derive(Clone, Debug)]
+pub struct FilterMask {
+    bits: Vec<u64>,
+    allowed: usize,
+}
+
+impl FilterMask {
+    /// Every slot in `0..n` denied. Callers flip the ones they want with [`FilterMask::allow`].
+    fn empty(n: usize) -> Self {
+        Self {
+            bits: vec![0u64; (n + 63) / 64],
+            allowed: 0,
+        }
+    }
+
+    #[inline]
+    fn allow(&mut self, node: usize) {
+        let w = node >> 6;
+        let bit = 1u64 << (node & 63);
+        if self.bits[w] & bit == 0 {
+            self.bits[w] |= bit;
+            self.allowed += 1;
+        }
+    }
+
+    /// Is `node` in the allowed set? Out-of-range slots read as denied.
+    #[inline(always)]
+    pub fn contains(&self, node: usize) -> bool {
+        match self.bits.get(node >> 6) {
+            Some(word) => word & (1u64 << (node & 63)) != 0,
+            None => false,
+        }
+    }
+
+    /// How many nodes the mask admits. A search cannot return more than this many results,
+    /// regardless of `k` — and a very small count means the walk may traverse most of the graph
+    /// to collect them (see [`HNSWIndex::search_filtered`]).
+    #[inline]
+    pub fn allowed_count(&self) -> usize {
+        self.allowed
+    }
+}
+
 /// Per-query state computed once and threaded through [`HNSWIndex::search_layer`] and
 /// [`HNSWIndex::distance_to_node`] for the whole search (or the whole `insert_node` call).
 ///
@@ -123,6 +178,13 @@ struct QueryPrep<'a> {
     rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
     turboquant: Option<&'a crate::vector::turboquant::PreparedQuery>,
     turborabit: Option<&'a crate::vector::turborabit::PreparedQuery>,
+    /// Filtered search's allow-list. `Some` only from [`HNSWIndex::search_filtered`]. Unlike the
+    /// other fields this is *not* distance-computation prep — it gates which nodes enter the result
+    /// heap, and `search_layer` applies it **only at layer 0** (upper-layer descent must navigate
+    /// freely through excluded nodes or the walk disconnects). It rides in `QueryPrep` because
+    /// `search_layer` is already at clippy's argument ceiling and this struct is the documented
+    /// place to add per-query state without growing every call site.
+    filter: Option<&'a FilterMask>,
 }
 
 /// Per-query scratch space: the visited bitset and the two heaps.
@@ -235,7 +297,7 @@ impl Searcher<'_> {
     /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not
     /// the index's dimension.
     pub fn search(&mut self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.index.search_inner(query, k, &mut self.ctx)
+        self.index.search_inner(query, k, &mut self.ctx, None)
     }
 
     /// Distance computations performed since the last [`Self::reset_stats`].
@@ -567,6 +629,17 @@ pub enum Storage {
     /// codebook **derived** from the known post-rotation Gaussian (no k-means on the data). The
     /// bit budget `b` is set by [`HNSWConfig::turbo_bits`]. Correctness-first integration stores
     /// codes in a parallel array; arena-packing is a later QPS optimization.
+    ///
+    /// **Deprecated (0.7, removal in 0.8).** [`Storage::TurboRabit`] (Extended RaBitQ) dominates it
+    /// at every matched bit budget and, unlike plain TurboQuant, holds on out-of-distribution data
+    /// where TurboQuant collapses — recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set
+    /// (see `docs/projects/foxstash/experiments.md` § Phase 4). Prefer `TurboRabit`, or `SQ8` for a
+    /// robust default.
+    #[deprecated(
+        since = "0.7.0",
+        note = "dominated by Storage::TurboRabit at every bit budget and collapses on OOD data; \
+                scheduled for removal in 0.8 — use Storage::TurboRabit or Storage::SQ8"
+    )]
     TurboQuant,
     /// Extended RaBitQ — B-bit codes with the RaBitQ unbiased estimator (see
     /// [`crate::vector::turborabit`]).
@@ -578,6 +651,44 @@ pub enum Storage {
     /// Correctness-first integration stores codes in a parallel array; arena-packing is the
     /// same later QPS optimization as TurboQuant's.
     TurboRabit,
+    /// **Warren** — TurboRabit's 4-bit walk + an 8-bit residual rerank, and **no retained f32**.
+    ///
+    /// The combination the profile asked for. `dist/query` is dominated by the *walk* (~2,400
+    /// visits/query against ~200 rerank candidates, roughly 6:1 in bytes), so the hot path must be
+    /// the cheapest code we have — TurboRabit's 384 B at 768-d.
+    ///
+    /// Warren keeps TurboRabit's arena block **byte-identical**, so the walk is literally the same
+    /// code, and replaces the retained f32 with an 8-bit residual taken against TurboRabit's own
+    /// reconstruction. Measured on coco/nomic-768 against an f32 ceiling of 0.9930: residual rerank
+    /// reaches **0.9905** at a third of TurboRabit's vector memory (1,152 B vs 3,456 B).
+    ///
+    /// Rerank stays in **rotated space** — `⟨q,x⟩ = ⟨q,c⟩ + ⟨R·q, r⟩` — because the inverse
+    /// rotation is `O(dim²)` and unaffordable per candidate. `R·q` is `prepare_query`'s `rq` plus
+    /// the constant `R·c`.
+    ///
+    /// Bulk-build only: incremental `add()` selects edges with exact f32 distances that this mode
+    /// does not retain.
+    Warren,
+}
+
+impl Storage {
+    /// Whether reranking under this mode needs the retained full-precision vectors (`full`).
+    ///
+    /// True for every mode whose rerank rescores against f32 — `SQ8`, `RaBitQ`, `TurboQuant`,
+    /// `TurboRabit`. False for:
+    ///
+    /// - [`Storage::F32`], which never reranks (the walk is already exact), and
+    /// - [`Storage::Warren`], whose **8-bit residual code *is* the rerank representation** — it
+    ///   retains no f32 at all and reranks perfectly well without it.
+    ///
+    /// This distinction exists because "`full` is empty" and "cannot rerank" were the same
+    /// statement until the no-f32 modes, and code that conflated them rejected a legal configuration:
+    /// `set_rerank_candidates` returned `FullPrecisionDropped` on every no-f32 (Warren) index, which killed
+    /// the whole arm on its first query group in the 2026-07-19 sweep.
+    #[inline]
+    fn rerank_needs_full(self) -> bool {
+        !matches!(self, Storage::F32 | Storage::Warren)
+    }
 }
 
 impl Default for HNSWConfig {
@@ -610,6 +721,7 @@ impl HNSWConfig {
     /// The arena layout ([`vec_words`]) is a function of this, so it must be resolved the
     /// same way everywhere — one accessor, not per-call-site matches that could drift.
     #[inline]
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     pub(crate) fn quant_bits(&self) -> usize {
         match self.storage {
             Storage::TurboQuant => self.turbo_bits,
@@ -780,6 +892,7 @@ const fn nibble_words(dim: usize) -> usize {
 /// `rabit_bits` under `TurboRabit`, ignored (pass 0) otherwise — see
 /// [`HNSWConfig::quant_bits`].
 #[inline(always)]
+#[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
 const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
     match storage {
         Storage::F32 => dim,
@@ -804,6 +917,9 @@ const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
         // coordinate replaces the earlier B bit-plane passes. `quant_bits` no longer
         // affects the block size, only the values inside the slots.
         Storage::TurboRabit => 2 + nibble_words(dim),
+        // Byte-identical to TurboRabit: Warren's walk IS TurboRabit's walk. Its extra 8-bit
+        // residual lives in a cold side array, not the hot block.
+        Storage::Warren => 2 + nibble_words(dim),
     }
 }
 
@@ -892,6 +1008,13 @@ pub struct HNSWIndex {
     /// Codes are arena-packed per node as `[dtc_sq][f_rescale][B bit-planes]`.
     turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
 
+    // === Warren storage (empty unless Storage::Warren) ===
+    /// Per-node 8-bit residual against TurboRabit's reconstruction, in ROTATED space, flat-packed
+    /// as `[min f32][step f32][dim bytes]`. Cold — read only during rerank, never in the walk.
+    warren_res: Vec<u8>,
+    /// `R·c`, precomputed once: rerank needs `R·q = rq + R·c` and `rq` is per-query.
+    warren_rc: Vec<f32>,
+
     // === GRAPH STRUCTURE (layers >= 1 only) ===
     /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
     ///
@@ -931,7 +1054,10 @@ pub struct HNSWIndex {
 /// crate-version bump, so a v1 snapshot's bincode layout no longer matches — it must be rejected
 /// cleanly here rather than deserialized into garbage (bincode read a stray byte as a bool and
 /// panicked with `InvalidBoolEncoding`).
-const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+///
+/// v3: `HNSWSnapshot` gained `warren_res` + `warren_rc` (for `Storage::Warren`) mid-struct, shifting
+/// the positional bincode layout — a v2 snapshot must be rejected, not misparsed.
+const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// The verbatim on-disk image behind [`HNSWIndex::snapshot_to_file`]. Every field is a direct
 /// clone of the corresponding `HNSWIndex` field except the two version stamps; `stride`, `hdr`
@@ -952,6 +1078,8 @@ struct HNSWSnapshot {
     rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
     turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
     turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
+    warren_res: Vec<u8>,
+    warren_rc: Vec<f32>,
     ids: Vec<String>,
     contents: Vec<String>,
     /// `serde_json::Value` cannot ride bincode (its `Deserialize` is self-describing —
@@ -1072,6 +1200,8 @@ impl HNSWIndex {
             rabitq: None,
             turboquant: None,
             turborabit: None,
+            warren_res: Vec::new(),
+            warren_rc: Vec::new(),
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -1091,6 +1221,7 @@ impl HNSWIndex {
     /// `RaBitQ`: fits [`RaBitQuantizer`](crate::vector::rabitq::RaBitQuantizer) — a corpus
     /// centroid plus a shared random rotation — used by [`Self::push_node`] to encode each
     /// vector and by [`Self::distance_to_node`] to prepare each query.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn fit_codebook(&mut self, embeddings: &[Vec<f32>]) {
         if embeddings.is_empty() {
             return;
@@ -1179,6 +1310,31 @@ impl HNSWIndex {
                     ));
                 }
             }
+            // Same fit as TurboRabit (the walk is TurboRabit's), plus the constant `R·c` the
+            // rotated-space rerank needs.
+            Storage::Warren => {
+                assert!(
+                    (1..=4).contains(&self.config.rabit_bits),
+                    "rabit_bits must be in 1..=4, got {}",
+                    self.config.rabit_bits
+                );
+                let bits = self.config.rabit_bits;
+                let q = if self.config.metric == DistanceMetric::Cosine {
+                    let normalized: Vec<Vec<f32>> = embeddings
+                        .iter()
+                        .map(|v| {
+                            let mut n = v.clone();
+                            crate::vector::ops::normalize(&mut n);
+                            n
+                        })
+                        .collect();
+                    crate::vector::turborabit::TurboRabitQuantizer::fit(&normalized, bits)
+                } else {
+                    crate::vector::turborabit::TurboRabitQuantizer::fit(embeddings, bits)
+                };
+                self.warren_rc = q.rotate(q.centroid());
+                self.turborabit = Some(q);
+            }
         }
     }
 
@@ -1214,6 +1370,7 @@ impl HNSWIndex {
     /// (via `build()`/`build_parallel()`, or [`Self::train`]) — checked by looking at the
     /// codebook state itself rather than a separate `bool` flag, so there is no second
     /// source of truth that could drift out of sync with it.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn is_trained(&self) -> bool {
         match self.config.storage {
             Storage::F32 => true,
@@ -1221,6 +1378,7 @@ impl HNSWIndex {
             Storage::RaBitQ => self.rabitq.is_some(),
             Storage::TurboQuant => self.turboquant.is_some(),
             Storage::TurboRabit => self.turborabit.is_some(),
+            Storage::Warren => self.turborabit.is_some(),
         }
     }
 
@@ -1328,7 +1486,10 @@ impl HNSWIndex {
     /// codebase keeps shipping. Lowering to 0, or any value on an index that kept its vectors,
     /// is fine.
     pub fn set_rerank_candidates(&mut self, n: usize) -> Result<()> {
-        if n > 0 && self.config.storage != Storage::F32 && self.full.is_empty() && !self.is_empty()
+        if n > 0
+            && self.config.storage.rerank_needs_full()
+            && self.full.is_empty()
+            && !self.is_empty()
         {
             return Err(crate::RagError::FullPrecisionDropped);
         }
@@ -1536,6 +1697,7 @@ impl HNSWIndex {
     /// +1.3% on SIFT1M — inside run-to-run noise, and not worth `unsafe` in the hottest
     /// accessor in the library. The bounds check is not what separates us from hnswlib.
     #[inline(always)]
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn get_embedding(&self, node_id: usize) -> &[f32] {
         match self.config.storage {
             Storage::F32 => {
@@ -1551,6 +1713,12 @@ impl HNSWIndex {
                 let start = node_id * self.embedding_dim;
                 &self.full[start..start + self.embedding_dim]
             }
+            // Warren keeps no f32 and returns early in the walk/rerank, so this is off its path.
+            // `get_all_documents`/`requantize` would reach it — reconstruct via the codebook there
+            // rather than paying to retain f32. Experimental mode, not yet exposed to bindings.
+            Storage::Warren => panic!(
+                "Storage::Warren retains no exact f32 vectors; rerank uses the residual code"
+            ),
         }
     }
 
@@ -1583,8 +1751,6 @@ impl HNSWIndex {
         f32::from_bits(self.nodes[node_id * self.stride + 1])
     }
 
-    /// Get layer 0 neighbours. Same cache lines as the node's vector.
-    #[inline(always)]
     fn get_neighbors_l0(&self, node_id: usize) -> &[u32] {
         let base = node_id * self.stride;
         let count = self.nodes[base] as usize;
@@ -1619,11 +1785,52 @@ impl HNSWIndex {
         self.nodes[base] = count as u32;
     }
 
+    /// Byte stride of one node's Warren residual block:
+    /// `[min1 f32][step1 f32][scale f32][min2 f32][step2 f32][dim bytes L1][dim bytes L2]`.
+    ///
+    /// **Two 8-bit levels, not one.** A single 8-bit residual left Warren 0.002 recall short of
+    /// exact f32 rerank — enough to miss the 0.99 threshold and, via the cliff, read as a 25% QPS
+    /// loss. Measured on coco at pool=500 against an f32 ceiling of 0.9948: 8 bits → 0.9935,
+    /// 10 → 0.9944, **12 → 0.9948 (exact match)**, 16 → no further gain.
+    ///
+    /// 12 bits flat would need bit-packing; 16 flat would need a `u16` SIMD kernel. Two 8-bit
+    /// levels reuse `byte_uint_dot_simd` untouched and, because each level rescales to its own
+    /// range, are typically *better* than flat 16 for the same bits — the same reason Warren's
+    /// 4+8 beat a standalone 8.
+    ///
+    /// `scale = ℓ/‖v‖` is stored rather than recomputed because deriving it needs a pass over the
+    /// nibbles, and a scalar per-dimension pass costs more than the two SIMD dots the rest of the
+    /// rerank takes. Four bytes to delete a loop.
+    #[inline]
+    fn warren_res_stride(&self) -> usize {
+        20 + 2 * self.embedding_dim
+    }
+
+    /// `(min1, step1, scale, min2, step2, level1, level2)` — cold path, rerank only.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    fn warren_res_at(&self, node_id: usize) -> (f32, f32, f32, f32, f32, &[u8], &[u8]) {
+        let st = self.warren_res_stride();
+        let d = self.embedding_dim;
+        let b = &self.warren_res[node_id * st..node_id * st + st];
+        let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        (
+            f(0),
+            f(4),
+            f(8),
+            f(12),
+            f(16),
+            &b[20..20 + d],
+            &b[20 + d..20 + 2 * d],
+        )
+    }
+
     /// Append a node block: zero neighbours, norm and vector filled in.
     ///
     /// Every construction path must go through this. The sequential builder previously
     /// pushed the vector and forgot to grow the layer-0 storage, which panicked on every
     /// input; a single append keeps the arena's invariant impossible to half-satisfy.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn push_node(&mut self, embedding: &[f32]) {
         debug_assert_eq!(embedding.len(), self.embedding_dim);
         let base = self.nodes.len();
@@ -1730,6 +1937,91 @@ impl HNSWIndex {
                     self.full.extend_from_slice(embedding);
                 }
             }
+            // Parallel-array encode: the arena block is header-only (`vec_words == 0`), and there
+            // is NO retained f32 — the 8-bit residual code IS the rerank representation. `node_id`
+            // grows in id order because `push_node` is called in id order by every build
+            // path, keeping the array index-aligned with the arena.
+            // Warren writes TurboRabit's arena block VERBATIM (so the walk is the same code) and,
+            // instead of the f32 copy, an 8-bit residual against TurboRabit's own reconstruction —
+            // taken in ROTATED space, which is where the rerank consumes it.
+            Storage::Warren => {
+                let tr = self
+                    .turborabit
+                    .as_ref()
+                    .expect("Storage::Warren requires fit_codebook before push_node");
+                let encode_input = self.rabitq_cosine_input(embedding);
+                let code = tr.encode(&encode_input);
+                self.nodes[v] = code.dtc_sq.to_bits();
+                self.nodes[v + 1] = code.f_rescale.to_bits();
+                let nw = nibble_words(self.embedding_dim);
+                let nib: &mut [u8] = bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + nw]);
+                for (i, &c) in code.codes.iter().enumerate() {
+                    nib[i / 2] |= c << (4 * (i % 2));
+                }
+                // residual = R·(x − c) − r_recon, quantized per-vector to 8 bits
+                let r_recon = tr.reconstruct_rotated(&code);
+                let centred: Vec<f32> = encode_input
+                    .iter()
+                    .zip(tr.centroid())
+                    .map(|(a, b)| a - b)
+                    .collect();
+                let r_true = tr.rotate(&centred);
+                let e: Vec<f32> = r_true.iter().zip(&r_recon).map(|(a, b)| a - b).collect();
+                // Level 1 over the residual, then level 2 over what level 1 leaves. Each level
+                // rescales to its own range, which is why 8+8 reaches the f32 ceiling where a
+                // single 8 does not.
+                let quant = |v: &[f32]| -> (f32, f32, Vec<u8>) {
+                    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for &x in v {
+                        lo = lo.min(x);
+                        hi = hi.max(x);
+                    }
+                    let step = if hi > lo { (hi - lo) / 255.0 } else { 0.0 };
+                    let codes = v
+                        .iter()
+                        .map(|&x| {
+                            if step > 0.0 {
+                                (((x - lo) / step) + 0.5).floor().clamp(0.0, 255.0) as u8
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                    (lo, step, codes)
+                };
+                let (lo1, step1, c1) = quant(&e);
+                let e2: Vec<f32> = e
+                    .iter()
+                    .zip(&c1)
+                    .map(|(&x, &c)| x - (lo1 + c as f32 * step1))
+                    .collect();
+                let (lo2, step2, c2) = quant(&e2);
+                // scale = ℓ/‖grid‖ — the factor `reconstruct_rotated` applies. Precomputed here so
+                // rerank never has to walk the nibbles to find it.
+                let l = code.dtc_sq.sqrt();
+                let cb = -(((1u32 << self.config.rabit_bits) - 1) as f32) / 2.0;
+                let gnorm = code
+                    .codes
+                    .iter()
+                    .map(|&u| {
+                        let g = u as f32 + cb;
+                        g * g
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                let scale = if gnorm > 0.0 && l > f32::EPSILON {
+                    l / gnorm
+                } else {
+                    0.0
+                };
+                self.warren_res.extend_from_slice(&lo1.to_le_bytes());
+                self.warren_res.extend_from_slice(&step1.to_le_bytes());
+                self.warren_res.extend_from_slice(&scale.to_le_bytes());
+                self.warren_res.extend_from_slice(&lo2.to_le_bytes());
+                self.warren_res.extend_from_slice(&step2.to_le_bytes());
+                self.warren_res.extend_from_slice(&c1);
+                self.warren_res.extend_from_slice(&c2);
+            }
         }
     }
 
@@ -1831,6 +2123,8 @@ impl HNSWIndex {
             rabitq: None,
             turboquant: None,
             turborabit: None,
+            warren_res: Vec::new(),
+            warren_rc: Vec::new(),
             ids: self.ids.clone(),
             contents: self.contents.clone(),
             metadata: self.metadata.clone(),
@@ -1962,6 +2256,20 @@ impl HNSWIndex {
             rabitq: self.rabitq.clone(),
             turboquant: self.turboquant.clone(),
             turborabit: self.turborabit.clone(),
+            warren_res: if self.warren_res.is_empty() {
+                Vec::new()
+            } else {
+                let ws = self.warren_res_stride();
+                let mut packed = vec![0u8; n * ws];
+                for (new, &old) in order.iter().enumerate() {
+                    packed[new * ws..new * ws + ws]
+                        .copy_from_slice(&self.warren_res[old * ws..old * ws + ws]);
+                }
+                packed
+            },
+            warren_rc: self.warren_rc.clone(),
+            // Flat code buffer follows the same node permutation as the arena blocks, copied one
+            // fixed-stride block at a time (NOT byte-by-byte — this is a Vec<u8> of stride blocks).
             ids: permute(&self.ids),
             contents: permute(&self.contents),
             metadata: order.iter().map(|&o| self.metadata[o].clone()).collect(),
@@ -1996,6 +2304,8 @@ impl HNSWIndex {
             rabitq: self.rabitq.clone(),
             turboquant: self.turboquant.clone(),
             turborabit: self.turborabit.clone(),
+            warren_res: self.warren_res.clone(),
+            warren_rc: self.warren_rc.clone(),
             ids: self.ids.clone(),
             contents: self.contents.clone(),
             metadata: self
@@ -2090,6 +2400,8 @@ impl HNSWIndex {
             rabitq: snap.rabitq,
             turboquant: snap.turboquant,
             turborabit: snap.turborabit,
+            warren_res: snap.warren_res,
+            warren_rc: snap.warren_rc,
             ids: snap.ids,
             contents: snap.contents,
             metadata,
@@ -2122,6 +2434,19 @@ impl HNSWIndex {
                 "Storage::{:?} requires a fitted codebook before add() — call \
                  `index.train(&sample)` first, or build the index via `HNSWIndex::build`/ \
                  `build_parallel`, which trains internally from the full corpus",
+                self.config.storage
+            )));
+        }
+
+        // Warren retains no f32, and incremental edge selection (`insert_node`) computes EXACT
+        // f32 distances between the new node and existing ones — which it cannot read. So it is a
+        // bulk-build-only mode: fail clearly here rather than deep in `get_embedding`. Build the
+        // whole corpus at once (`build`/`build_parallel`), which has the f32 vectors in hand.
+        if matches!(self.config.storage, Storage::Warren) {
+            return Err(crate::RagError::InvalidInput(format!(
+                "Storage::{:?} does not support incremental add() — it retains no f32 for exact \
+                 graph construction. Build the whole corpus at once via HNSWIndex::build / \
+                 build_parallel.",
                 self.config.storage
             )));
         }
@@ -2196,6 +2521,16 @@ impl HNSWIndex {
             )));
         }
 
+        // Bulk-build-only — see the identical guard in `add()`.
+        if matches!(self.config.storage, Storage::Warren) {
+            return Err(crate::RagError::InvalidInput(format!(
+                "Storage::{:?} does not support incremental add() — it retains no f32 for exact \
+                 graph construction. Build the whole corpus at once via HNSWIndex::build / \
+                 build_parallel.",
+                self.config.storage
+            )));
+        }
+
         if embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
                 "embedding contains non-finite values (NaN or Inf)".into(),
@@ -2253,7 +2588,67 @@ impl HNSWIndex {
             static CTX: std::cell::RefCell<SearchContext> =
                 std::cell::RefCell::new(SearchContext::new(0));
         }
-        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut()))
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), None))
+    }
+
+    /// Search, returning only results whose node is allowed by `filter` — up to `k` of them.
+    ///
+    /// The graph is walked in full — excluded nodes are still *traversed*, because they are
+    /// load-bearing for connectivity — but only allowed nodes enter the result set. You get up to
+    /// `k` allowed nearest neighbours with no over-fetch and no separate post-filter step. Build
+    /// `filter` once with [`HNSWIndex::filter_mask`] / [`HNSWIndex::filter_mask_ids`] and reuse it
+    /// across queries.
+    ///
+    /// **Cost scales with selectivity.** A permissive filter costs about the same as an unfiltered
+    /// search. A very selective one (few allowed nodes, scattered through the graph) forces the walk
+    /// to explore widely to collect `k` of them — in the limit, most of the graph. When the allowed
+    /// set is a *tiny* fraction of the corpus a brute-force scan of just those nodes is cheaper;
+    /// [`FilterMask::allowed_count`] lets the caller pick the strategy. Raising `ef_search` recovers
+    /// recall lost to a selective filter, at proportional cost.
+    ///
+    /// # Errors
+    /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not this
+    /// index's dimension.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: &FilterMask,
+    ) -> Result<Vec<SearchResult>> {
+        thread_local! {
+            static CTX: std::cell::RefCell<SearchContext> =
+                std::cell::RefCell::new(SearchContext::new(0));
+        }
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(filter)))
+    }
+
+    /// Build a reusable [`FilterMask`] by testing every document against `pred` once (O(n)).
+    ///
+    /// `pred` receives each document's `(id, content, metadata)` and returns `true` to allow it.
+    /// This is the O(n) step; amortise it by caching the mask and reusing it across every query
+    /// that shares the predicate — see [`FilterMask`] and [`HNSWIndex::search_filtered`].
+    pub fn filter_mask<F>(&self, mut pred: F) -> FilterMask
+    where
+        F: FnMut(&str, &str, Option<&serde_json::Value>) -> bool,
+    {
+        let mut mask = FilterMask::empty(self.len());
+        for i in 0..self.len() {
+            if pred(&self.ids[i], &self.contents[i], self.metadata[i].as_ref()) {
+                mask.allow(i);
+            }
+        }
+        mask
+    }
+
+    /// Build a [`FilterMask`] allowing exactly the documents whose external id is in `allowed`.
+    pub fn filter_mask_ids(&self, allowed: &std::collections::HashSet<String>) -> FilterMask {
+        let mut mask = FilterMask::empty(self.len());
+        for i in 0..self.len() {
+            if allowed.contains(&self.ids[i]) {
+                mask.allow(i);
+            }
+        }
+        mask
     }
 
     /// Search many queries in parallel, across all rayon worker threads.
@@ -2270,7 +2665,7 @@ impl HNSWIndex {
             .par_iter()
             .map_init(
                 || SearchContext::new(self.len()),
-                |ctx, query| self.search_inner(query, k, ctx),
+                |ctx, query| self.search_inner(query, k, ctx, None),
             )
             .collect()
     }
@@ -2291,6 +2686,7 @@ impl HNSWIndex {
         query: &[f32],
         k: usize,
         ctx: &mut SearchContext,
+        filter: Option<&FilterMask>,
     ) -> Result<Vec<SearchResult>> {
         if query.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
@@ -2322,6 +2718,7 @@ impl HNSWIndex {
             rabitq: rq_prepared.as_ref(),
             turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
+            filter,
         };
 
         let entry_point = self.entry_point.unwrap();
@@ -2356,20 +2753,69 @@ impl HNSWIndex {
             // which dominates the high-recall operating points. Only the head lines are
             // issued; `exact_distance` reads the vector sequentially, so the hardware
             // streamer covers the tail (same rationale as VECTOR_LINES above).
-            const RERANK_PREFETCH_AHEAD: usize = 4;
-            const RERANK_HEAD_LINES: usize = 8; // 512 B of a 3 KB vector at 768-d
-            let dim = self.embedding_dim;
-            for i in 0..found.len() {
-                let ahead = i + RERANK_PREFETCH_AHEAD;
-                if ahead < found.len() {
-                    // SAFETY: prefetch is a hint — `wrapping_add` cannot leave the
-                    // allocation for a valid node id, and a stale line costs nothing.
-                    unsafe {
-                        let p = self.full.as_ptr().wrapping_add(found[ahead].1 * dim) as *const u8;
-                        prefetch_embedding(p, RERANK_HEAD_LINES);
-                    }
+            if self.config.storage == Storage::Warren {
+                // No f32: rescore against TurboRabit's reconstruction plus the 8-bit residual,
+                // entirely in ROTATED space so nothing here is O(dim²):
+                //     ⟨q,x⟩ = ⟨q,c⟩ + ⟨R·q, r_recon + e⟩,   R·q = rq + R·c
+                let tr = self
+                    .turborabit
+                    .as_ref()
+                    .expect("Storage::Warren rerank requires a fitted codebook");
+                let prepared = qprep
+                    .turborabit
+                    .expect("Storage::Warren rerank requires prepare_turborabit_query");
+                let dim = self.embedding_dim;
+                let cos_in = self.rabitq_cosine_input(query);
+                let rq_full: Vec<f32> = prepared
+                    .rq()
+                    .iter()
+                    .zip(&self.warren_rc)
+                    .map(|(a, b)| a + b)
+                    .collect();
+                let qc: f32 = cos_in.iter().zip(tr.centroid()).map(|(a, b)| a * b).sum();
+                // Three SIMD dots per candidate, no scalar per-dimension loop. Using turborabit's
+                // own identity `grid = u + c_B`:
+                //   ⟨rq, recon⟩ = scale·(⟨rq,u⟩ + c_B·Σrq) + (lo1+lo2)·Σrq
+                //                 + step1·⟨rq,L1⟩ + step2·⟨rq,L2⟩
+                // A hand-rolled scalar unpack here cost 5.4 µs/candidate and made Warren 3x
+                // slower than TurboRabit despite an identical walk.
+                let cb = -(((1u32 << self.config.rabit_bits) - 1) as f32) / 2.0;
+                let sum_rq: f32 = rq_full.iter().sum();
+                let nw = nibble_words(dim);
+                for entry in found.iter_mut() {
+                    let v = entry.1 * self.stride + self.hdr;
+                    let nib: &[u8] = bytemuck::cast_slice(&self.nodes[v + 2..v + 2 + nw]);
+                    let (lo1, step1, scale, lo2, step2, l1, l2) = self.warren_res_at(entry.1);
+                    let nibble_dot = crate::vector::simd::nibble_uint_dot_simd(&rq_full, nib);
+                    let d1 = crate::vector::simd::byte_uint_dot_simd(&rq_full, l1);
+                    let d2 = crate::vector::simd::byte_uint_dot_simd(&rq_full, l2);
+                    let acc = qc
+                        + scale * (nibble_dot + cb * sum_rq)
+                        + (lo1 + lo2) * sum_rq
+                        + step1 * d1
+                        + step2 * d2;
+                    entry.0 = match self.config.metric {
+                        DistanceMetric::L2 => (2.0 - 2.0 * acc).max(0.0),
+                        DistanceMetric::Cosine => (1.0 - acc).clamp(0.0, 2.0),
+                    };
                 }
-                found[i].0 = self.exact_distance(query, found[i].1);
+            } else {
+                const RERANK_PREFETCH_AHEAD: usize = 4;
+                const RERANK_HEAD_LINES: usize = 8; // 512 B of a 3 KB vector at 768-d
+                let dim = self.embedding_dim;
+                for i in 0..found.len() {
+                    let ahead = i + RERANK_PREFETCH_AHEAD;
+                    if ahead < found.len() {
+                        // SAFETY: prefetch is a hint — `wrapping_add` cannot leave the
+                        // allocation for a valid node id, and a stale line costs nothing.
+                        unsafe {
+                            let p =
+                                self.full.as_ptr().wrapping_add(found[ahead].1 * dim) as *const u8;
+                            prefetch_embedding(p, RERANK_HEAD_LINES);
+                        }
+                    }
+                    found[i].0 = self.exact_distance(query, found[i].1);
+                }
             }
             found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         }
@@ -2586,6 +3032,8 @@ impl HNSWIndex {
             rabitq: rq_prepared.as_ref(),
             turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
+            // Insert path never runs under Warren (bulk-build-only; add() is rejected).
+            filter: None, // builds are never filtered
         };
         let mut ctx = SearchContext::new(self.len());
 
@@ -2707,12 +3155,23 @@ impl HNSWIndex {
     ) -> Vec<(f32, usize)> {
         ctx.reset();
 
+        // Filtered search gates only the *result* heap (`best`), and only at layer 0. The frontier
+        // (`candidates`) still expands through excluded nodes — they are load-bearing for graph
+        // connectivity, and dropping them from the walk would disconnect the allowed nodes behind
+        // them and collapse recall. Upper-layer descent (layer > 0) is never filtered: it must
+        // navigate freely to reach the right layer-0 neighbourhood. `None` here ⇒ zero-cost
+        // (one perfectly-predicted branch per candidate) for every unfiltered search.
+        let filter = if layer == 0 { qprep.filter } else { None };
+        let admit = |id: usize| filter.is_none_or(|f| f.contains(id));
+
         // Initialize with entry points
         for &ep in entry_points {
             let dist = self.distance_to_node(query, ep, qprep);
             ctx.distance_calls += 1;
             ctx.candidates.push(Reverse((OrderedFloat(dist), ep)));
-            ctx.best.push((OrderedFloat(dist), ep));
+            if admit(ep) {
+                ctx.best.push((OrderedFloat(dist), ep));
+            }
             ctx.mark_visited(ep);
         }
 
@@ -2797,17 +3256,27 @@ impl HNSWIndex {
                 // Phase 2: Batch heap updates from the computed distances.
                 let mut consider = |dist: f32, neighbor_id: usize| {
                     let dist_ord = OrderedFloat(dist);
+                    let allowed = admit(neighbor_id);
 
+                    // The frontier bound is set by the *result* heap. Under a filter `best` holds
+                    // only allowed nodes, so a selective filter keeps `best.len() < ef` and every
+                    // neighbour is pushed to `candidates` — the walk widens until it has collected
+                    // `ef` allowed nodes (or drained the frontier). That is the intended cost of a
+                    // selective filter on a graph; the excluded nodes are still expanded, only never
+                    // returned.
                     if ctx.best.len() < ef {
                         ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
-                        ctx.best.push((dist_ord, neighbor_id));
+                        if allowed {
+                            ctx.best.push((dist_ord, neighbor_id));
+                        }
                     } else if let Some(&(furthest_dist, _)) = ctx.best.peek() {
                         if dist_ord < furthest_dist {
                             ctx.candidates.push(Reverse((dist_ord, neighbor_id)));
-                            ctx.best.push((dist_ord, neighbor_id));
-
-                            if ctx.best.len() > ef {
-                                ctx.best.pop();
+                            if allowed {
+                                ctx.best.push((dist_ord, neighbor_id));
+                                if ctx.best.len() > ef {
+                                    ctx.best.pop();
+                                }
                             }
                         }
                     }
@@ -2920,6 +3389,7 @@ impl HNSWIndex {
     /// Prepare a query for [`Storage::TurboQuant`] traversal: rotate + sketch a unit-normalized
     /// copy so both sides of the estimator share the same (unit-sphere) geometry the codes use.
     /// `None` under any other storage.
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn prepare_turboquant_query(
         &self,
         query: &[f32],
@@ -2944,7 +3414,9 @@ impl HNSWIndex {
         &self,
         query: &[f32],
     ) -> Option<crate::vector::turborabit::PreparedQuery> {
-        if self.config.storage != Storage::TurboRabit {
+        // Warren's walk IS TurboRabit's, so it needs the same prepared query — and its rerank
+        // additionally needs `rq` to build `R·q`.
+        if !matches!(self.config.storage, Storage::TurboRabit | Storage::Warren) {
             return None;
         }
         let tr = self
@@ -2968,6 +3440,7 @@ impl HNSWIndex {
     /// No test ever constructed a quantized index with the default metric, so nothing caught
     /// it — classic could-not-fail.
     #[inline]
+    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn distance_to_node(&self, query: &[f32], node_id: usize, qprep: &QueryPrep) -> f32 {
         // Under SQ8 the walk reads 8-bit codes straight out of the node's own block and
         // never touches `full`. This is the whole point of the storage mode: the block
@@ -3072,7 +3545,7 @@ impl HNSWIndex {
         // under L2, halved under cosine (both sides unit-normalized before encoding,
         // making `raw = 2·cosine_distance`). Must match
         // `TurboRabitQuantizer::estimate_dist_sq` exactly — guarded by the same tests.
-        if self.config.storage == Storage::TurboRabit {
+        if matches!(self.config.storage, Storage::TurboRabit | Storage::Warren) {
             let prepared = qprep.turborabit.expect(
                 "Storage::TurboRabit traversal requires a query prepared via prepare_turborabit_query",
             );
@@ -3617,6 +4090,8 @@ impl HNSWIndex {
             rabitq: None,
             turboquant: None,
             turborabit: None,
+            warren_res: Vec::new(),
+            warren_rc: Vec::new(),
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],
@@ -3694,7 +4169,6 @@ impl crate::index::VectorIndexSnapshot for HNSWIndex {
 // Uses fixed-size arrays and layer-copying for safe parallelization
 // ============================================================================
 
-/// Maximum connections per node in layer 0 (M * 2)
 const M0_MAX: usize = 64;
 /// Maximum connections per node in upper layers (M)
 const M_MAX: usize = 32;
@@ -4117,6 +4591,129 @@ mod tests {
         assert!(index.is_empty());
     }
 
+    /// Filtered search must return the true top-k *within the allowed set* — not the unfiltered
+    /// top-k with excluded nodes dropped afterward (which would under-fill k), and never an excluded
+    /// node. Asserts the user-visible OUTPUT against brute force, with `ef_search >= n` so the walk
+    /// is exhaustive and the comparison is exact (no graph-miss slack to hide a logic bug).
+    #[test]
+    fn filtered_search_matches_bruteforce_over_allowed() {
+        let n = 300usize;
+        let dim = 16usize;
+        let embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|i| generate_random_vector(dim, i as u64))
+            .collect();
+        let config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            ef_search: n, // exhaustive walk → exact
+            ..HNSWConfig::default()
+        };
+        let index = HNSWIndex::build(embeddings.clone(), config);
+
+        // Allow even-id nodes only. `build` assigns ids "0".."n-1".
+        let allow = |i: usize| i % 2 == 0;
+        let mask = index.filter_mask(|id, _content, _meta| allow(id.parse::<usize>().unwrap()));
+        assert_eq!(mask.allowed_count(), n / 2);
+
+        let k = 10usize;
+        for qseed in [1000u64, 2000, 3000] {
+            let q = generate_random_vector(dim, qseed);
+            let got = index.search_filtered(&q, k, &mask).unwrap();
+
+            // Never an excluded node; exactly k results (allowed_count >> k here).
+            assert_eq!(got.len(), k);
+            for r in &got {
+                assert!(
+                    allow(r.id.parse::<usize>().unwrap()),
+                    "returned excluded id {}",
+                    r.id
+                );
+            }
+
+            // Brute-force true top-k over the ALLOWED set (cosine == -distance ordering).
+            let qn = crate::vector::simd::norm_simd(&q);
+            let mut scored: Vec<(f32, usize)> = (0..n)
+                .filter(|&i| allow(i))
+                .map(|i| {
+                    let e = &embeddings[i];
+                    let en = crate::vector::simd::norm_simd(e);
+                    let dot: f32 = q.iter().zip(e).map(|(a, b)| a * b).sum();
+                    (dot / (qn * en), i)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let want: std::collections::HashSet<usize> =
+                scored.iter().take(k).map(|&(_, i)| i).collect();
+            let got_ids: std::collections::HashSet<usize> =
+                got.iter().map(|r| r.id.parse::<usize>().unwrap()).collect();
+            assert_eq!(
+                got_ids, want,
+                "filtered top-{k} != brute force over allowed (seed {qseed})"
+            );
+        }
+    }
+
+    /// A filter more selective than `k` yields exactly the allowed nodes ("up to k"), all of them,
+    /// and `filter_mask_ids` selects by external id.
+    #[test]
+    fn filtered_search_fewer_than_k_and_by_id() {
+        let n = 100usize;
+        let dim = 8usize;
+        let embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|i| generate_random_vector(dim, i as u64))
+            .collect();
+        let config = HNSWConfig {
+            ef_search: n,
+            ..HNSWConfig::default()
+        };
+        let index = HNSWIndex::build(embeddings, config);
+
+        let allowed: std::collections::HashSet<String> =
+            ["7", "42", "99"].iter().map(|s| s.to_string()).collect();
+        let mask = index.filter_mask_ids(&allowed);
+        assert_eq!(mask.allowed_count(), 3);
+
+        let q = generate_random_vector(dim, 555);
+        let got = index.search_filtered(&q, 10, &mask).unwrap();
+        // Only 3 allowed → at most 3 back, and exactly the allowed ids.
+        assert_eq!(got.len(), 3);
+        let got_ids: std::collections::HashSet<String> = got.into_iter().map(|r| r.id).collect();
+        assert_eq!(got_ids, allowed);
+    }
+
+    /// Unfiltered `search` must be byte-for-byte unchanged by the filter plumbing: an all-allowed
+    /// mask returns the same ids as a plain search. Guards the "None ⇒ zero-cost" claim's correctness.
+    #[test]
+    fn all_allowed_mask_equals_unfiltered() {
+        let n = 200usize;
+        let dim = 12usize;
+        let embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|i| generate_random_vector(dim, i as u64 + 9))
+            .collect();
+        let config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            ef_search: 120,
+            ..HNSWConfig::default()
+        };
+        let index = HNSWIndex::build(embeddings, config);
+        let mask = index.filter_mask(|_, _, _| true);
+        assert_eq!(mask.allowed_count(), n);
+
+        let q = generate_random_vector(dim, 77);
+        let plain: Vec<String> = index
+            .search(&q, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let filtered: Vec<String> = index
+            .search_filtered(&q, 10, &mask)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(plain, filtered);
+    }
+
     #[test]
     fn search_layer_considers_neighbors_beyond_fixed_stack_batch() {
         let mut config = HNSWConfig::default().with_m(64);
@@ -4147,6 +4744,7 @@ mod tests {
             rabitq: None,
             turboquant: None,
             turborabit: None,
+            filter: None,
         };
         let candidates = index.search_layer(&[1.0, 0.0], &[0], 66, 0, &mut ctx, &qprep);
         assert!(
@@ -4339,6 +4937,89 @@ mod tests {
         );
     }
 
+    /// Warren's defining properties: TurboRabit's walk, an 8-bit residual rerank, **no f32**.
+    ///
+    /// The arena assert is the load-bearing one — Warren's whole QPS case is that its hot path is
+    /// byte-identical to TurboRabit's. If the block ever diverges, the walk silently stops being
+    /// the cheap one and the mode's reason to exist is gone.
+    #[test]
+    fn warren_walks_like_turborabit_and_reranks_without_f32() {
+        let mut rng = StdRng::seed_from_u64(21);
+        let (dim, clusters, per) = (32, 6, 70);
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() * 5.0).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..clusters * per)
+            .map(|i| {
+                centers[i % clusters]
+                    .iter()
+                    .map(|x| x + rng.random::<f32>() * 0.3)
+                    .collect()
+            })
+            .collect();
+        let cfg = |storage| HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 12,
+            m0: 24,
+            ef_construction: 100,
+            ef_search: 100,
+            storage,
+            rabit_bits: 4,
+            rerank_candidates: 50,
+            seed: Some(4),
+            ..Default::default()
+        };
+        let warren = HNSWIndex::build_parallel(base.clone(), cfg(Storage::Warren));
+        let tr = HNSWIndex::build_parallel(base.clone(), cfg(Storage::TurboRabit));
+
+        // The hot block must match TurboRabit's exactly — same stride, same layout.
+        assert_eq!(
+            warren.stride, tr.stride,
+            "Warren's arena block must equal TurboRabit's"
+        );
+        assert!(warren.full.is_empty(), "Warren must retain no f32");
+        assert!(
+            !tr.full.is_empty(),
+            "TurboRabit does retain f32 (the thing Warren removes)"
+        );
+        assert_eq!(
+            warren.warren_res.len(),
+            base.len() * (20 + 2 * dim),
+            "one residual block per node"
+        );
+
+        // The rerank knob must work despite `full` being empty.
+        let mut w = warren;
+        w.set_rerank_candidates(100)
+            .expect("Warren reranks on its residual, not f32");
+
+        let k = 10;
+        let mut total = 0.0f32;
+        for (qi, q) in base.iter().enumerate().take(50) {
+            let got: HashSet<usize> = w
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+            assert!(got.contains(&qi), "query {qi} must retrieve itself");
+            let mut exact: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = v.iter().zip(q).map(|(a, b)| a * b).sum();
+                    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    (-d / n.max(1e-12), i)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: HashSet<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
+            total += truth.intersection(&got).count() as f32 / k as f32;
+        }
+        let recall = total / 50.0;
+        assert!(recall > 0.8, "Warren recall@10 = {:.3}", recall);
+    }
+
     /// `train()` on a non-empty index must refuse — retraining would desynchronize vectors
     /// already encoded under the old codebook.
     #[test]
@@ -4407,7 +5088,9 @@ mod tests {
         let mut stale = SearchContext::new(1);
         assert!(stale.capacity < index.len());
 
-        let results = index.search_inner(&[1.0, 0.0, 0.0], 5, &mut stale).unwrap();
+        let results = index
+            .search_inner(&[1.0, 0.0, 0.0], 5, &mut stale, None)
+            .unwrap();
 
         assert_eq!(results.len(), 5);
         assert!(
@@ -5055,6 +5738,7 @@ mod tests {
     /// floor: with the estimator sabotaged this recall collapses (verified separately). Also checks
     /// that more bits ⇒ at least as much recall, end to end.
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn turboquant_recall_on_clustered_data_with_held_out_queries() {
         let mut rng = StdRng::seed_from_u64(2025);
         let dim = 96;
@@ -5277,6 +5961,7 @@ mod tests {
                 rabitq: None,
                 turboquant: None,
                 turborabit: Some(&prep),
+                filter: None,
             };
             for node_id in 0..index.len() {
                 let packed = index.distance_to_node(&query, node_id, &qprep);
@@ -5306,6 +5991,7 @@ mod tests {
     /// half-used final nibble byte; b=4 exercises the full 8-entry LUT, b=1 the
     /// no-nibble-section layout.
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn turboquant_packed_walk_matches_module_estimator() {
         let mut rng = StdRng::seed_from_u64(78);
         let dim = 97;
@@ -5331,6 +6017,7 @@ mod tests {
                 rabitq: None,
                 turboquant: Some(&prep),
                 turborabit: None,
+                filter: None,
             };
             for node_id in 0..index.len() {
                 let packed = index.distance_to_node(&query, node_id, &qprep);
@@ -5503,6 +6190,7 @@ mod tests {
     /// changed result, not a crash. Also checks the permutation is a bijection (every id
     /// still present exactly once).
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn reorder_for_locality_preserves_search_results() {
         let mut rng = StdRng::seed_from_u64(41);
         let dim = 80;
@@ -5574,6 +6262,7 @@ mod tests {
     /// layer-0 neighbour lists, upper layers, entry point — not via a recall proxy
     /// (measure-the-output applies to the *quantizer*; the graph has an exact answer).
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn requantize_preserves_graph_and_searches_in_every_storage() {
         let mut rng = StdRng::seed_from_u64(31);
         let dim = 96;
@@ -5737,6 +6426,7 @@ mod tests {
     /// the save/load bug-class this guards against is a field silently dropped on one side
     /// (the wasm path shipped exactly that: `turbo_bits` was never serialized).
     #[test]
+    #[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
     fn snapshot_round_trip_is_verbatim_in_every_storage() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut rng = StdRng::seed_from_u64(77);
@@ -5754,6 +6444,8 @@ mod tests {
             ("rabitq", Storage::RaBitQ),
             ("turboquant", Storage::TurboQuant),
             ("turborabit", Storage::TurboRabit),
+            // Warren is bulk-build-only (no incremental add), and this test adds a doc — it has
+            // tested by the snapshot round-trip tests.
         ] {
             // Every field non-default, so a dropped field cannot hide behind its default.
             let config = HNSWConfig {

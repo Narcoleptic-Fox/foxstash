@@ -10,7 +10,9 @@ use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use foxstash_core::index::hnsw::{BuildStrategy, DistanceMetric, HNSWConfig, HNSWIndex, Storage};
+use foxstash_core::index::hnsw::{
+    BuildStrategy, DistanceMetric, FilterMask, HNSWConfig, HNSWIndex, Storage,
+};
 
 /// VIBE's metric vocabulary is `"euclidean" | "cosine" | "ip" | "normalized" | "hamming"`
 /// (see `vibe/distance.py` upstream — NOT ann-benchmarks' old `"angular"`). foxstash only
@@ -32,6 +34,7 @@ fn parse_metric(s: &str) -> PyResult<DistanceMetric> {
 /// modes: `"turboquant"` defaults to 2 total bits, `"turboquant3"` requests 3; `"turborabit"`
 /// defaults to 3 total bits, `"turborabit4"` requests 4. Encoding the bit budget in the string
 /// keeps the positional constructor (and VIBE's caller) unchanged.
+#[allow(deprecated)] // still accepts Storage::TurboQuant until its 0.8 removal
 fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
     match s {
         "f32" => Ok((Storage::F32, 0)),
@@ -57,9 +60,21 @@ fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
             }
             Ok((Storage::TurboRabit, bits))
         }
+        // Warren: turborabit's 4-bit walk + a two-level 8+8 residual rerank, no retained f32.
+        // The bit budget is turborabit's, so "warren4" style suffixes route the same way.
+        other if other.starts_with("warren") => {
+            let bits = other["warren".len()..].parse::<usize>().unwrap_or(4);
+            if !(1..=4).contains(&bits) {
+                return Err(PyValueError::new_err(
+                    "foxstash: warren bit budget must be in 1..=4 (e.g. \"warren4\") — it is \
+                     turborabit's walk code, which is nibble-packed.",
+                ));
+            }
+            Ok((Storage::Warren, bits))
+        }
         other => Err(PyValueError::new_err(format!(
             "foxstash: unsupported storage {other:?}. Expected \"f32\", \"sq8\", \"rabitq\", \
-             \"turboquant[N]\", or \"turborabit[N]\"."
+             \"turboquant[N]\", \"turborabit[N]\", or \"warren[N]\"."
         ))),
     }
 }
@@ -95,6 +110,7 @@ impl Foxstash {
     }
 
     /// The full `HNSWConfig` this instance's constructor args imply — what `fit()` builds.
+    #[allow(deprecated)] // routes turbo_bits for Storage::TurboQuant until its 0.8 removal
     fn target_config(&self) -> HNSWConfig {
         HNSWConfig {
             metric: self.metric,
@@ -117,7 +133,8 @@ impl Foxstash {
             } else {
                 HNSWConfig::default().turbo_bits
             },
-            rabit_bits: if self.storage == Storage::TurboRabit {
+            // Warren's walk IS turborabit's, so it reads the same bit budget.
+            rabit_bits: if matches!(self.storage, Storage::TurboRabit | Storage::Warren) {
                 self.turbo_bits
             } else {
                 HNSWConfig::default().rabit_bits
@@ -339,6 +356,54 @@ impl Foxstash {
         Ok(ids.into_pyarray(py))
     }
 
+    /// Build a reusable [`Filter`] admitting exactly the rows in `allowed` (indices into the `X`
+    /// passed to `fit()`). Building it scans every node once — do it ONCE per predicate and reuse
+    /// the returned object across `query_filtered` calls; rebuilding per query would erase the
+    /// graph's sub-linear advantage (the whole reason filtered search lives in the graph and not a
+    /// post-filter). The row→node-slot mapping (`build_parallel` shuffles internally) is handled by
+    /// matching on the row-index id core assigns, so the caller always speaks in fit()-row terms.
+    fn make_filter(&self, allowed: PyReadonlyArray1<'_, i64>) -> PyResult<Filter> {
+        let index = self.built()?;
+        let set: std::collections::HashSet<i64> = allowed.as_slice()?.iter().copied().collect();
+        let mask = index.filter_mask(|id, _content, _meta| {
+            set.contains(
+                &id.parse::<i64>()
+                    .expect("foxstash result ids are always the row index build_parallel assigned"),
+            )
+        });
+        Ok(Filter { mask })
+    }
+
+    /// Like [`Foxstash::query`], but returns only rows admitted by `filter` — up to `n` of them.
+    ///
+    /// The graph is walked in full (excluded nodes are traversed for connectivity); only the result
+    /// set is restricted, so there is no over-fetch and no separate post-filter. Cost scales with
+    /// `filter`'s selectivity — see [`HNSWIndex::search_filtered`].
+    fn query_filtered<'py>(
+        &self,
+        py: Python<'py>,
+        v: PyReadonlyArray1<'py, f32>,
+        n: usize,
+        filter: &Filter,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let index = self.built()?;
+        let query: Vec<f32> = v.as_slice()?.to_vec();
+
+        let results = py
+            .detach(move || index.search_filtered(&query, n, &filter.mask))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let ids: Vec<i64> = results
+            .iter()
+            .map(|r| {
+                r.id.parse::<i64>()
+                    .expect("foxstash result ids are always the row index build_parallel assigned")
+            })
+            .collect();
+
+        Ok(ids.into_pyarray(py))
+    }
+
     fn __str__(&self) -> String {
         format!(
             "Foxstash(metric={}, storage={}, M={}, efConstruction={}, efSearch={}, rerank={})",
@@ -352,8 +417,30 @@ impl Foxstash {
     }
 }
 
+/// A prebuilt allow-list over the rows passed to `fit()`, produced by [`Foxstash::make_filter`]
+/// and consumed by [`Foxstash::query_filtered`]. Opaque to Python beyond `allowed_count`; hold it
+/// and reuse it across queries that share the same predicate.
+#[pyclass(module = "foxstash")]
+struct Filter {
+    mask: FilterMask,
+}
+
+#[pymethods]
+impl Filter {
+    /// How many rows this filter admits. A `query_filtered` cannot return more than this many,
+    /// and a very small count means the walk may explore most of the graph to collect them.
+    fn allowed_count(&self) -> usize {
+        self.mask.allowed_count()
+    }
+
+    fn __str__(&self) -> String {
+        format!("Filter(allowed={})", self.mask.allowed_count())
+    }
+}
+
 #[pymodule]
 fn foxstash(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Foxstash>()?;
+    m.add_class::<Filter>()?;
     Ok(())
 }
