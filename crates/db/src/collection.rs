@@ -555,25 +555,6 @@ impl Collection {
         Ok(())
     }
 
-    #[inline]
-    fn filtered_fetch_sizes(&self, inner: &CollectionInner, k: usize) -> Vec<usize> {
-        let index_len = inner.index.len();
-        let candidates = [
-            k.saturating_mul(2).min(index_len),
-            k.saturating_mul(4).min(index_len),
-            k.saturating_mul(8).min(index_len),
-            index_len,
-        ];
-
-        let mut fetch_sizes = Vec::with_capacity(4);
-        for fetch in candidates {
-            if !fetch_sizes.contains(&fetch) {
-                fetch_sizes.push(fetch);
-            }
-        }
-        fetch_sizes
-    }
-
     fn search_batch_filtered_impl(
         &self,
         inner: &CollectionInner,
@@ -581,49 +562,15 @@ impl Collection {
         k: usize,
         filter: &Filter,
     ) -> Result<Vec<Vec<SearchResult>>> {
-        let fetch_sizes = self.filtered_fetch_sizes(inner, k);
-        let mut results: Vec<Option<Vec<SearchResult>>> = vec![None; queries.len()];
-        let mut pending: Vec<usize> = (0..queries.len()).collect();
-
-        for fetch in fetch_sizes {
-            if pending.is_empty() {
-                break;
-            }
-
-            let pending_queries: Vec<Vec<f32>> = pending
-                .iter()
-                .map(|&query_idx| queries[query_idx].clone())
-                .collect();
-
-            let raw_batch = inner
-                .index
-                .search_batch(&pending_queries, fetch)
-                .map_err(DbError::Core)?;
-
-            let mut next_pending = Vec::new();
-            let is_last_round = fetch >= inner.index.len();
-
-            for (query_idx, raw) in pending.into_iter().zip(raw_batch) {
-                let filtered: Vec<SearchResult> = raw
-                    .into_iter()
-                    .filter(|r| inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref()))
-                    .take(k)
-                    .collect();
-
-                if filtered.len() >= k || is_last_round {
-                    results[query_idx] = Some(filtered);
-                } else {
-                    next_pending.push(query_idx);
-                }
-            }
-
-            pending = next_pending;
-        }
-
-        Ok(results
-            .into_iter()
-            .map(|result| result.unwrap_or_default())
-            .collect())
+        // One native filtered graph walk per query, fanned across rayon workers by core — same
+        // predicate as the single-query path. Replaces the former progressive over-fetch (which
+        // re-ran the whole batch at 2×/4×/8×/full scan until every query filled `k`).
+        inner
+            .index
+            .search_batch_filtered_by(queries, k, |id, metadata| {
+                inner.id_map.is_live(id) && filter.matches(metadata)
+            })
+            .map_err(DbError::Core)
     }
 
     /// Unfiltered search: query HNSW, exclude tombstones.
@@ -647,7 +594,13 @@ impl Collection {
         Ok(results)
     }
 
-    /// Filtered search: progressive over-fetch (2x, 4x, 8x, then full scan).
+    /// Filtered search: a single graph walk that admits only live documents passing `filter`,
+    /// collecting up to `k` directly via [`HNSWIndex::search_filtered_by`]. The predicate is
+    /// evaluated during traversal, on visited nodes only.
+    ///
+    /// Replaces the former progressive over-fetch (`2×` → `4×` → `8×` → full scan), which re-ran the
+    /// walk up to four times and degraded to a full brute-force scan on selective filters. The graph
+    /// now filters natively in one pass — no over-fetch, no repeated walks.
     fn search_filtered(
         &self,
         inner: &CollectionInner,
@@ -655,23 +608,12 @@ impl Collection {
         k: usize,
         filter: &Filter,
     ) -> Result<Vec<SearchResult>> {
-        let fetch_sizes = [k * 2, k * 4, k * 8, inner.index.len()];
-
-        for fetch in fetch_sizes {
-            let raw = inner.index.search(query, fetch).map_err(DbError::Core)?;
-
-            let results: Vec<SearchResult> = raw
-                .into_iter()
-                .filter(|r| inner.id_map.is_live(&r.id) && filter.matches(r.metadata.as_ref()))
-                .take(k)
-                .collect();
-
-            if results.len() >= k || fetch >= inner.index.len() {
-                return Ok(results);
-            }
-        }
-
-        Ok(Vec::new())
+        inner
+            .index
+            .search_filtered_by(query, k, |id, metadata| {
+                inner.id_map.is_live(id) && filter.matches(metadata)
+            })
+            .map_err(DbError::Core)
     }
 
     /// Collect all live (non-tombstoned) documents, deduplicating by ID.

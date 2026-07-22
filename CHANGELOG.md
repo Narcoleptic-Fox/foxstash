@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Storage::Warren`** — TurboRabit's 4-bit walk plus a two-level 8+8-bit residual rerank, with **no retained f32**. The arena block is byte-identical to `TurboRabit` (the walk *is* the same code); the residual reranks in rotated space via the identity `grid = u + c_B` (three SIMD dots per candidate, no O(dim²) inverse rotation). Delivers TurboRabit's recall/QPS at ~⅓ the vector memory (1,152 B vs 3,456 B at 768-d). Bulk-build only. Exposed to the Python binding as `warren[N]`. Snapshot format bumped v2 → v3.
+- **Filtered search on `HNSWIndex`** — `search_filtered(query, k, &FilterMask)` walks the whole graph (excluded nodes are still traversed, for connectivity) but admits only allowed nodes to the result heap, gated at layer 0. Returns up to `k` allowed nearest neighbours with no over-fetch. Build a reusable `FilterMask` once with `filter_mask` (a predicate over id/content/metadata) or `filter_mask_ids`; reuse it across queries. Unfiltered `search` is unchanged (one predicted branch per candidate). Python: `Filter` + `query_filtered`.
+- **Predicate-gated filtered search** — `HNSWIndex::search_filtered_by(query, k, allow)` and `search_batch_filtered_by(..)` filter *during* the walk against a live predicate `allow(id, metadata)`, for one-off filters not worth a prebuilt `FilterMask`. Evaluated lazily on visited nodes only — no O(n) up-front pass, no over-fetch. The mask and predicate paths share one layer-0 gating mechanism (`dyn Fn(usize) -> bool`).
+
+### Changed
+
+- **`Collection` filtered search now uses the graph's native filtered walk** (`search_filtered_by` / `search_batch_filtered_by`) instead of progressive over-fetch (`2×` → `4×` → `8×` → full scan). A filtered query is now a single graph walk that collects up to `k` matching results directly, rather than re-running the walk up to four times and degrading to a full brute-force scan on selective filters.
+
+### Deprecated
+
+- **`Storage::TurboQuant`** (`#[deprecated(since = "0.7.0")]`, scheduled for removal in 0.8). Dominated by `Storage::TurboRabit` (Extended RaBitQ) at every matched bit budget, and — unlike plain TurboQuant — it collapses on out-of-distribution data (recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set). It remains fully functional through 0.7; migrate to `Storage::TurboRabit` or `Storage::SQ8`.
+
 ## [0.6.0] - 2026-07-15
 
 The "1.0 audit" release: one index, one config, one metric; −5,380 lines.
