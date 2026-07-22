@@ -16,9 +16,9 @@ jobs:
     steps:
       - uses: actions/first-interaction@v3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
 
-          issue-message: |
+          issue_message: |
             Welcome, and thank you for opening your first issue in foxstash!
 
             To help us address this as quickly as possible, please make sure your
@@ -31,7 +31,7 @@ jobs:
 
             We appreciate your contribution!
 
-          pr-message: |
+          pr_message: |
             Thank you for opening your first pull request in foxstash — we are glad
             you are here!
 
