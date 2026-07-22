@@ -103,24 +103,33 @@ fn main() {
         indexes.push(index);
     }
 
-    println!("build:  Sequential {:.1}s   Parallel {:.1}s   ({:.2}x faster)\n",
-        builds[0], builds[1], builds[0] / builds[1]);
+    println!(
+        "build:  Sequential {:.1}s   Parallel {:.1}s   ({:.2}x faster)\n",
+        builds[0],
+        builds[1],
+        builds[0] / builds[1]
+    );
 
-    println!("{:>6} {:>14} {:>14} {:>10}", "ef", "Sequential", "Parallel", "delta");
+    println!(
+        "{:>6} {:>14} {:>14} {:>10}",
+        "ef", "Sequential", "Parallel", "delta"
+    );
     println!("{:-<48}", "");
 
     for &ef in EFS {
         let mut r = Vec::new();
         for index in indexes.iter_mut() {
             index.set_ef_search(ef);
-            r.push(ds.recall_at(K, |q| {
-                index
-                    .search(q, K)
-                    .unwrap()
-                    .into_iter()
-                    .filter_map(|x| x.id.parse::<usize>().ok())
-                    .collect()
-            }) * 100.0);
+            r.push(
+                ds.recall_at(K, |q| {
+                    index
+                        .search(q, K)
+                        .unwrap()
+                        .into_iter()
+                        .filter_map(|x| x.id.parse::<usize>().ok())
+                        .collect()
+                }) * 100.0,
+            );
         }
         println!(
             "{:>6} {:>13.2}% {:>13.2}% {:>+9.2}",

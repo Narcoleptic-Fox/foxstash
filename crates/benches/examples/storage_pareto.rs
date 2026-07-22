@@ -98,69 +98,69 @@ fn main() {
         ("SQ8 + rerank", Storage::SQ8, 100),
         ("RaBitQ + rerank", Storage::RaBitQ, 400),
     ] {
-      for &(m, m0) in MS {
-        let t = Instant::now();
-        let mut index = HNSWIndex::build_parallel(
-            ds.base.clone(),
-            HNSWConfig {
-                metric: DistanceMetric::L2,
-                m,
-                m0,
-                ef_construction: 200,
-                storage,
-                rerank_candidates: rerank,
-                build_strategy: BuildStrategy::Parallel,
-                ..Default::default()
-            },
-        );
-        let build = t.elapsed();
-        let mem = index.memory_breakdown().total() as f64 / 1e6;
-
-        println!(
-            "\n=== {label}  M={m}/m0={m0} ===  build {:.0}s, {mem:.0} MB",
-            build.as_secs_f64()
-        );
-        println!(
-            "{:>6} {:>11} {:>10} {:>12} {:>9}",
-            "ef", "recall@10", "QPS", "dist/query", "ns/dist"
-        );
-
-        for &ef in EFS {
-            index.set_ef_search(ef);
-
-            let recall = ds.recall_at(K, |q| {
-                index
-                    .search(q, K)
-                    .unwrap()
-                    .into_iter()
-                    .filter_map(|r| r.id.parse::<usize>().ok())
-                    .collect()
-            });
-
-            let mut s = index.searcher();
-            for q in ds.queries.iter().take(50) {
-                std::hint::black_box(s.search(q, K).unwrap());
-            }
-
-            let mut s = index.searcher();
+        for &(m, m0) in MS {
             let t = Instant::now();
-            for q in &ds.queries {
-                std::hint::black_box(s.search(q, K).unwrap());
-            }
-            let el = t.elapsed();
-
-            let n = ds.queries.len() as f64;
-            let d = s.distance_calls() as f64;
-            println!(
-                "{:>6} {:>10.2}% {:>10.0} {:>12.0} {:>9.1}",
-                ef,
-                recall * 100.0,
-                n / el.as_secs_f64(),
-                d / n,
-                el.as_nanos() as f64 / d
+            let mut index = HNSWIndex::build_parallel(
+                ds.base.clone(),
+                HNSWConfig {
+                    metric: DistanceMetric::L2,
+                    m,
+                    m0,
+                    ef_construction: 200,
+                    storage,
+                    rerank_candidates: rerank,
+                    build_strategy: BuildStrategy::Parallel,
+                    ..Default::default()
+                },
             );
+            let build = t.elapsed();
+            let mem = index.memory_breakdown().total() as f64 / 1e6;
+
+            println!(
+                "\n=== {label}  M={m}/m0={m0} ===  build {:.0}s, {mem:.0} MB",
+                build.as_secs_f64()
+            );
+            println!(
+                "{:>6} {:>11} {:>10} {:>12} {:>9}",
+                "ef", "recall@10", "QPS", "dist/query", "ns/dist"
+            );
+
+            for &ef in EFS {
+                index.set_ef_search(ef);
+
+                let recall = ds.recall_at(K, |q| {
+                    index
+                        .search(q, K)
+                        .unwrap()
+                        .into_iter()
+                        .filter_map(|r| r.id.parse::<usize>().ok())
+                        .collect()
+                });
+
+                let mut s = index.searcher();
+                for q in ds.queries.iter().take(50) {
+                    std::hint::black_box(s.search(q, K).unwrap());
+                }
+
+                let mut s = index.searcher();
+                let t = Instant::now();
+                for q in &ds.queries {
+                    std::hint::black_box(s.search(q, K).unwrap());
+                }
+                let el = t.elapsed();
+
+                let n = ds.queries.len() as f64;
+                let d = s.distance_calls() as f64;
+                println!(
+                    "{:>6} {:>10.2}% {:>10.0} {:>12.0} {:>9.1}",
+                    ef,
+                    recall * 100.0,
+                    n / el.as_secs_f64(),
+                    d / n,
+                    el.as_nanos() as f64 / d
+                );
+            }
         }
-      }
     }
 
     println!(

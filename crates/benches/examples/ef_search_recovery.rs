@@ -79,12 +79,22 @@ fn exact_gt(q: &[f32], base: &[Vec<f32>]) -> HashSet<usize> {
     let mut d: Vec<(f32, usize)> = base
         .iter()
         .enumerate()
-        .map(|(j, v)| (q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(), j))
+        .map(|(j, v)| {
+            (
+                q.iter().zip(v).map(|(a, b)| (a - b).powi(2)).sum::<f32>(),
+                j,
+            )
+        })
         .collect();
     d.sort_by(|a, b| a.0.total_cmp(&b.0));
     d.iter().take(K).map(|(_, j)| *j).collect()
 }
-fn recall_at(idx: &mut HNSWIndex, ef: usize, truth: &[HashSet<usize>], queries: &[Vec<f32>]) -> f32 {
+fn recall_at(
+    idx: &mut HNSWIndex,
+    ef: usize,
+    truth: &[HashSet<usize>],
+    queries: &[Vec<f32>],
+) -> f32 {
     idx.set_ef_search(ef);
     let mut t = 0.0;
     for (qi, q) in queries.iter().enumerate() {
@@ -130,7 +140,10 @@ fn main() {
         let par_ms = t1.elapsed().as_millis();
 
         println!("dim={dim}  (build: seq {seq_ms} ms, par {par_ms} ms)");
-        println!("{:>10}  {:>10}  {:>10}  {:>8}", "ef_search", "Seq R@10", "Par R@10", "gap");
+        println!(
+            "{:>10}  {:>10}  {:>10}  {:>8}",
+            "ef_search", "Seq R@10", "Par R@10", "gap"
+        );
         println!("  {:-<42}", "");
         for ef in EF_SEARCH_SWEEP {
             let rs = recall_at(&mut seq, ef, &truth, &queries);
@@ -145,6 +158,8 @@ fn main() {
         }
         println!();
     }
-    println!("gap -> ~0 as ef_search grows => zero-layer graph is fine; only upper/entry nav is broken.");
+    println!(
+        "gap -> ~0 as ef_search grows => zero-layer graph is fine; only upper/entry nav is broken."
+    );
     println!("gap persists at high ef_search => the zero-layer graph is also worse.");
 }

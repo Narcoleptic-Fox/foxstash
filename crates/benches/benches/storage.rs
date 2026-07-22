@@ -36,7 +36,6 @@
 //! cargo bench -p foxstash-benches file_storage
 //! ```
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use foxstash_core::index::flat::FlatIndex;
 use foxstash_core::index::hnsw::HNSWIndex;
@@ -44,6 +43,7 @@ use foxstash_core::storage::file::{FlatIndexWrapper, HNSWIndexWrapper};
 use foxstash_core::{Document, Result};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use std::hint::black_box;
 use std::time::Duration;
 
 fn serialize_flat_index(index: &FlatIndex) -> Vec<u8> {
