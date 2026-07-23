@@ -423,6 +423,13 @@ impl TurboRabitQuantizer {
         self.matvec(v)
     }
 
+    /// The shared orthonormal rotation `R`, row-major `dim×dim` (`R[j*dim + d]`). Exposed so callers
+    /// can apply `R·(q−c)` themselves (e.g. batched on a GPU) instead of going through
+    /// [`Self::rotate`] per query.
+    pub fn rotation(&self) -> &[f32] {
+        &self.rotation
+    }
+
     /// Reconstruct the **rotated residual** `r ≈ R·(x − c)` — i.e. [`Self::reconstruct`] stopped
     /// one step early, before the inverse rotation and re-centring.
     ///
