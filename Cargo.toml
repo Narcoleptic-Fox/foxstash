@@ -6,6 +6,19 @@ members = [
     "crates/native",
     "crates/python",
     "crates/benches",
+    "crates/gpu",
+]
+# `foxstash-gpu` is an OPTIONAL GPU backend (pulls cubecl/wgpu — heavy) that nothing else depends on.
+# It stays a member so `cargo <cmd> -p foxstash-gpu` works, but is excluded from `default-members` so a
+# bare `cargo build` / `cargo test` (and thus the common dev loop) skips it. CI's `--workspace` steps
+# pass `--exclude foxstash-gpu` for the same reason — see `.github/workflows/ci.yml`.
+default-members = [
+    "crates/core",
+    "crates/db",
+    "crates/wasm",
+    "crates/native",
+    "crates/python",
+    "crates/benches",
 ]
 resolver = "2"
 
