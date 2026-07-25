@@ -262,6 +262,25 @@ impl Default for Manifest {
 /// Metadata for a checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMeta {
+    /// On-disk layout version for the checkpoint payload.
+    ///
+    /// Unlike an index snapshot — a same-version *cache* that can always be
+    /// rebuilt — a checkpoint is the durable copy of the user's documents. It
+    /// cannot be regenerated from anything, so a shape change that
+    /// deserializes into plausible-but-wrong data is unrecoverable.
+    ///
+    /// Checkpoints written before this field existed have no `format_version`
+    /// key at all; `serde(default)` gives them 0, which
+    /// [`CheckpointMeta::check_compatible`] reports as *older than versioning*
+    /// rather than as corruption.
+    #[serde(default)]
+    pub format_version: u32,
+    /// Crate version that wrote this checkpoint. Recorded for diagnostics, and
+    /// deliberately **not** part of the compatibility test: the payload is
+    /// self-describing JSON, so an unchanged layout stays readable across
+    /// releases. Only [`Self::format_version`] gates loading.
+    #[serde(default)]
+    pub crate_version: String,
     /// Checkpoint ID
     pub id: u64,
     /// WAL sequence at checkpoint time
@@ -280,6 +299,50 @@ pub struct CheckpointMeta {
     pub compressed_size: usize,
     /// Compression codec used
     pub codec: Codec,
+}
+
+/// Current checkpoint layout version.
+///
+/// Bump this whenever the serialized shape of a checkpoint payload changes in a
+/// way an older or newer reader would misinterpret. Adding an optional field
+/// with a `serde` default does not qualify — JSON tolerates that. Removing a
+/// field, changing a type, or changing what a field *means* does.
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+impl CheckpointMeta {
+    /// Reject a checkpoint this build cannot read correctly.
+    ///
+    /// The payload is JSON, so it is self-describing and survives most additive
+    /// change on its own — this guards the cases JSON cannot catch, where the
+    /// bytes still parse but no longer mean what they did.
+    pub fn check_compatible(&self) -> Result<()> {
+        if self.format_version == CHECKPOINT_FORMAT_VERSION {
+            return Ok(());
+        }
+        if self.format_version == 0 {
+            return Err(RagError::StorageError(format!(
+                "checkpoint {} predates checkpoint versioning (no format_version field). \
+                 This build writes format v{}. The data is not corrupt, but this build \
+                 cannot vouch for reading it: export with the version that wrote it, or \
+                 delete the checkpoint and re-ingest.",
+                self.id, CHECKPOINT_FORMAT_VERSION,
+            )));
+        }
+        Err(RagError::StorageError(format!(
+            "checkpoint {} is format v{}, this build reads v{} (foxstash {}, written by {}). \
+             A checkpoint is durable user data, not a rebuildable cache — refusing rather \
+             than risking a silent misread.",
+            self.id,
+            self.format_version,
+            CHECKPOINT_FORMAT_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            if self.crate_version.is_empty() {
+                "unknown"
+            } else {
+                &self.crate_version
+            },
+        )))
+    }
 }
 
 // ============================================================================
@@ -546,6 +609,8 @@ impl IncrementalStorage {
 
         // Create checkpoint metadata
         let checkpoint_meta = CheckpointMeta {
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
             id: checkpoint_id,
             wal_seq: self.manifest.wal_seq,
             document_count: meta.document_count,
@@ -617,6 +682,9 @@ impl IncrementalStorage {
         let meta: CheckpointMeta = serde_json::from_str(&meta_json).map_err(|e| {
             RagError::StorageError(format!("Failed to parse checkpoint meta: {}", e))
         })?;
+        // Check before reading the payload: an incompatible checkpoint should
+        // cost nothing and never be partially applied.
+        meta.check_compatible()?;
 
         // Load and decompress checkpoint
         let checkpoint_path = self
@@ -867,6 +935,75 @@ mod tests {
             embedding: vec![0.1; dim],
             metadata: None,
         }
+    }
+
+    /// A checkpoint written by this build round-trips; one claiming a different
+    /// format version is refused **before** its payload is read.
+    ///
+    /// The rejection matters more than the round-trip. A checkpoint is the only
+    /// copy of the user's documents — unlike an index snapshot, nothing can
+    /// regenerate it — so a shape change that parses into plausible-but-wrong
+    /// data is unrecoverable. This asserts the guard fires rather than assuming it.
+    #[test]
+    fn checkpoint_meta_is_versioned_and_incompatible_versions_are_refused() {
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+
+        let docs = vec![create_test_document("a", 4), create_test_document("b", 4)];
+        let meta = storage
+            .checkpoint(
+                &docs,
+                IndexMetadata {
+                    document_count: docs.len(),
+                    embedding_dim: 4,
+                    index_type: "test".into(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(meta.format_version, CHECKPOINT_FORMAT_VERSION);
+        assert_eq!(meta.crate_version, env!("CARGO_PKG_VERSION"));
+
+        // Round-trips at the current version.
+        let (loaded, _) = storage
+            .load_checkpoint::<Vec<Document>>()
+            .unwrap()
+            .expect("checkpoint present");
+        assert_eq!(loaded.len(), 2);
+
+        // A future version must be refused, not read.
+        let meta_path = dir.path().join(format!("checkpoint_{:05}.meta", meta.id));
+        let bumped = std::fs::read_to_string(&meta_path).unwrap().replace(
+            &format!("\"format_version\": {CHECKPOINT_FORMAT_VERSION}"),
+            &format!("\"format_version\": {}", CHECKPOINT_FORMAT_VERSION + 1),
+        );
+        std::fs::write(&meta_path, bumped).unwrap();
+        let err = storage
+            .load_checkpoint::<Vec<Document>>()
+            .expect_err("a newer format must be refused");
+        assert!(
+            format!("{err}").contains("format v"),
+            "error should name the version mismatch: {err}"
+        );
+
+        // A pre-versioning checkpoint (no field at all) is reported as such,
+        // not as corruption — this is what every existing on-disk collection
+        // looks like today.
+        let legacy = std::fs::read_to_string(&meta_path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains("format_version"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&meta_path, legacy).unwrap();
+        let err = storage
+            .load_checkpoint::<Vec<Document>>()
+            .expect_err("a pre-versioning checkpoint must be refused");
+        assert!(
+            format!("{err}").contains("predates checkpoint versioning"),
+            "error should distinguish 'old' from 'corrupt': {err}"
+        );
     }
 
     #[test]
