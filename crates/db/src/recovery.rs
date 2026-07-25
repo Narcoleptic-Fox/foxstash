@@ -32,7 +32,14 @@ pub fn recover(
     config: &DbConfig,
     base_path: &std::path::Path,
 ) -> Result<RecoveredState> {
-    let mut index = HNSWIndex::new(config.embedding_dim, config.hnsw.clone());
+    // Recovery rebuilds in STAGING (F32). A fitted collection is restored from its
+    // graph snapshot, which carries the trained codebook; if that snapshot is absent
+    // the collection re-fits once it crosses the threshold again. Rebuilding
+    // straight into a quantized storage is not possible here anyway — core's
+    // incremental `add` needs a codebook that only a corpus-wide build produces.
+    let mut staging = config.hnsw.clone();
+    staging.storage = foxstash_core::index::Storage::F32;
+    let mut index = HNSWIndex::new(config.embedding_dim, staging);
     let mut id_map = IdMap::new();
     let mut documents: Vec<Document> = Vec::new();
 

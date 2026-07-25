@@ -127,6 +127,17 @@ pub struct DbConfig {
     pub embedding_dim: usize,
     /// Whether to auto-checkpoint after threshold mutations.
     pub auto_checkpoint: bool,
+    /// Documents required before a collection quantizes itself.
+    ///
+    /// A quantizer needs a codebook fitted on a corpus *sample* before the first
+    /// vector is encoded, and a collection ingesting one document at a time has no
+    /// such sample at construction. So a collection starts in F32 ("staging") and
+    /// switches to `hnsw.storage` once it holds this many documents — see
+    /// [`Collection::fit`].
+    ///
+    /// Below the threshold nothing changes, and exact search on a small collection
+    /// is the right answer anyway. `0` disables auto-fitting; call `fit()` yourself.
+    pub fit_threshold: usize,
     /// Default hybrid search configuration.
     pub hybrid: HybridConfig,
 }
@@ -140,6 +151,7 @@ impl Default for DbConfig {
             bm25: BM25Config::default(),
             embedding_dim: 384,
             auto_checkpoint: true,
+            fit_threshold: 10_000,
             hybrid: HybridConfig::default(),
         }
     }
@@ -165,6 +177,12 @@ impl DbConfig {
 
     pub fn with_auto_checkpoint(mut self, auto: bool) -> Self {
         self.auto_checkpoint = auto;
+        self
+    }
+
+    /// Documents required before the collection quantizes itself. `0` disables it.
+    pub fn with_fit_threshold(mut self, docs: usize) -> Self {
+        self.fit_threshold = docs;
         self
     }
 

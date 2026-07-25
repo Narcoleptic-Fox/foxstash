@@ -97,7 +97,7 @@ impl Collection {
             name: name.to_string(),
             base_path: path.to_path_buf(),
             inner: RwLock::new(CollectionInner {
-                index: HNSWIndex::new(config.embedding_dim, config.hnsw.clone()),
+                index: HNSWIndex::new(config.embedding_dim, Self::staging_hnsw(&config)),
                 id_map: IdMap::new(),
                 documents: Vec::new(),
                 text_index: InvertedIndex::with_config(config.bm25.clone()),
@@ -156,6 +156,7 @@ impl Collection {
             inner.documents.push(doc);
         }
 
+        self.maybe_auto_fit()?;
         self.maybe_auto_checkpoint_locked()?;
         Ok(())
     }
@@ -231,6 +232,7 @@ impl Collection {
             }
         }
 
+        self.maybe_auto_fit()?;
         self.maybe_auto_checkpoint_locked()?;
         Ok(())
     }
@@ -377,7 +379,15 @@ impl Collection {
         let live_docs = self.collect_live_documents(&inner);
         let doc_count = live_docs.len();
 
-        let mut new_index = HNSWIndex::new(self.config.embedding_dim, self.config.hnsw.clone());
+        // Rebuild at the storage the collection is CURRENTLY using. Using the
+        // configured target would quietly quantize a collection still in staging,
+        // making compaction a semantic change rather than a cleanup.
+        let rebuild_cfg = if self.is_fitted(&inner) {
+            self.config.hnsw.clone()
+        } else {
+            Self::staging_hnsw(&self.config)
+        };
+        let mut new_index = HNSWIndex::new(self.config.embedding_dim, rebuild_cfg);
         let mut new_id_map = IdMap::new();
         let mut new_text_index = InvertedIndex::with_config(self.config.bm25.clone());
 
@@ -615,11 +625,91 @@ impl Collection {
     /// TODO: once `HNSWIndex::train(&mut self, sample)` lands (fits a codebook from a
     /// calibration sample instead of requiring the full corpus up front), `Collection` can
     /// train from an initial batch and this restriction can be lifted for that case.
+    /// Reject only the storage that genuinely cannot work incrementally.
+    ///
+    /// This used to reject *every* quantized storage, because a quantizer needs a
+    /// codebook fitted on a corpus sample before the first vector is encoded and a
+    /// collection has no sample at construction. That is solved by staging — see
+    /// [`Self::fit`] — so SQ8, RaBitQ and TurboRabit are now reachable.
+    ///
+    /// `Warren` is different and still refused: it retains no f32 at all, so core's
+    /// incremental `add()` cannot compute the exact distances edge selection needs.
+    /// It is a bulk-build-only mode, and no amount of staging changes that.
     fn reject_incremental_quantized_storage(config: &DbConfig) -> Result<()> {
-        if config.hnsw.storage != foxstash_core::index::Storage::F32 {
+        if config.hnsw.storage == foxstash_core::index::Storage::Warren {
             return Err(DbError::UnsupportedIncrementalStorage {
                 storage: config.hnsw.storage,
             });
+        }
+        Ok(())
+    }
+
+    /// HNSW config for the **staging** index: the caller's settings, forced to F32.
+    ///
+    /// Everything else — `m`, `ef_construction`, metric, reordering — is preserved,
+    /// so fitting later changes only how vectors are stored.
+    fn staging_hnsw(config: &DbConfig) -> foxstash_core::index::HNSWConfig {
+        let mut hnsw = config.hnsw.clone();
+        hnsw.storage = foxstash_core::index::Storage::F32;
+        hnsw
+    }
+
+    /// Whether this collection is configured to quantize at all.
+    fn has_quantized_target(&self) -> bool {
+        self.config.hnsw.storage != foxstash_core::index::Storage::F32
+    }
+
+    /// True once the live index is using the configured target storage.
+    fn is_fitted(&self, inner: &CollectionInner) -> bool {
+        inner.index.config().storage == self.config.hnsw.storage
+    }
+
+    /// Quantize the collection: fit a codebook over what it currently holds and
+    /// re-encode every vector into the configured storage.
+    ///
+    /// This is the transition a quantizer needs and an incrementally-written
+    /// collection cannot do at construction. `build_parallel_from_documents` trains
+    /// the codebook internally from the full corpus, so the sample is exactly the
+    /// data — not an approximation of it.
+    ///
+    /// Idempotent: a no-op if the collection is already fitted, or if the target is
+    /// F32 (nothing to fit). Safe to call at any size, though quantizing a handful
+    /// of vectors buys nothing — exact search on a small collection is already the
+    /// right answer, which is why `fit_threshold` exists.
+    pub fn fit(&self) -> Result<()> {
+        if !self.has_quantized_target() {
+            return Ok(());
+        }
+        let _mutation_guard = self.mutation_lock.lock();
+        let mut inner = self.inner.write();
+        if self.is_fitted(&inner) {
+            return Ok(());
+        }
+        let live_docs = self.collect_live_documents(&inner);
+        if live_docs.is_empty() {
+            return Ok(());
+        }
+        // Rebuild at the target storage. Trains from the whole corpus.
+        inner.index = HNSWIndex::build_parallel_from_documents(live_docs, self.config.hnsw.clone());
+        debug!(
+            storage = ?self.config.hnsw.storage,
+            docs = inner.index.len(),
+            "collection fitted"
+        );
+        Ok(())
+    }
+
+    /// Fit once the collection is large enough, if it is configured to.
+    fn maybe_auto_fit(&self) -> Result<()> {
+        if self.config.fit_threshold == 0 || !self.has_quantized_target() {
+            return Ok(());
+        }
+        let due = {
+            let inner = self.inner.read();
+            !self.is_fitted(&inner) && inner.id_map.live_count() >= self.config.fit_threshold
+        };
+        if due {
+            self.fit()?;
         }
         Ok(())
     }
@@ -837,50 +927,43 @@ mod tests {
     // `cargo test -p foxstash-db repro_sq8_storage_panics_on_insert -- --nocapture` before
     // the guard existed:
     //   thread '...' panicked at crates/core/src/index/hnsw.rs:978:41:
-    //   index out of bounds: the len is 0 but the index is 0
-    // `Collection::create`/`open` now reject non-F32 storage up front, so this asserts the
-    // clean `Err` instead.
+    // These three used to assert that SQ8/RaBitQ were REJECTED at construction —
+    // the old contract, when db was F32-only because a quantizer cannot encode
+    // before its codebook exists. Staging solves that (see `fit`), so the contract
+    // is now: quantized targets are ACCEPTED and start in F32. Rewritten rather
+    // than deleted, so the change of behaviour is asserted rather than merely
+    // untested.
     #[test]
-    fn sq8_storage_rejected_at_construction() {
+    fn sq8_storage_is_accepted_and_starts_in_staging() {
         let dir = TempDir::new().unwrap();
         let mut config = cfg(3);
         config.hnsw.storage = foxstash_core::index::Storage::SQ8;
 
-        match Collection::create("test", dir.path(), config) {
-            Err(DbError::UnsupportedIncrementalStorage {
-                storage: foxstash_core::index::Storage::SQ8,
-            }) => {}
-            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
-            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
-        }
+        let col = Collection::create("test", dir.path(), config)
+            .expect("SQ8 is reachable now: the collection stages in F32 and fits later");
+        col.insert("a".into(), "content".into(), vec![1.0, 2.0, 3.0], None)
+            .expect("staging accepts inserts with no codebook");
+        assert_eq!(col.len(), 1);
     }
 
     #[test]
-    fn rabitq_storage_rejected_at_construction() {
+    fn rabitq_storage_is_accepted_and_starts_in_staging() {
         let dir = TempDir::new().unwrap();
         let mut config = cfg(3);
         config.hnsw.storage = foxstash_core::index::Storage::RaBitQ;
 
-        match Collection::create("test", dir.path(), config) {
-            Err(DbError::UnsupportedIncrementalStorage {
-                storage: foxstash_core::index::Storage::RaBitQ,
-            }) => {}
-            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
-            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
-        }
+        let col = Collection::create("test", dir.path(), config).expect("RaBitQ stages too");
+        col.insert("a".into(), "content".into(), vec![1.0, 2.0, 3.0], None)
+            .unwrap();
+        assert_eq!(col.len(), 1);
     }
 
     #[test]
-    fn sq8_storage_rejected_at_open() {
+    fn sq8_storage_is_accepted_at_open() {
         let dir = TempDir::new().unwrap();
         let mut config = cfg(3);
         config.hnsw.storage = foxstash_core::index::Storage::SQ8;
-
-        match Collection::open("test", dir.path(), config) {
-            Err(DbError::UnsupportedIncrementalStorage { .. }) => {}
-            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
-            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
-        }
+        Collection::open("test", dir.path(), config).expect("opening an SQ8 collection works");
     }
 
     #[test]
@@ -1122,6 +1205,113 @@ mod tests {
                 d.id
             );
         }
+    }
+
+    /// A quantized collection must stage in F32, fit on demand, keep serving
+    /// correctly across the transition, and still accept writes afterwards.
+    ///
+    /// The last part is the one worth asserting: the whole reason db was F32-only
+    /// was that a quantizer cannot encode before its codebook exists. Fitting is
+    /// only useful if inserts keep working *after* it.
+    #[test]
+    fn a_quantized_collection_stages_then_fits_and_still_accepts_writes() {
+        use foxstash_core::index::Storage;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 0, // fit explicitly, so the test controls the transition
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+
+        // Deterministic dense pseudo-random. NOT modular arithmetic: a first pass
+        // used `(i*31 + k*17) % 61`, which makes i and i+61 produce IDENTICAL
+        // vectors — d99 and d38 collided and the test failed in staging, before
+        // quantization was even involved. Under a magnitude-invariant metric
+        // (Cosine, the default) proportional vectors are indistinguishable too, so
+        // any fixture with structure risks ties. Use noise.
+        let vector = |i: usize| -> Vec<f32> {
+            let mut state = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..8)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+
+        let c = Collection::create("c", &path, cfg).unwrap();
+        for i in 0..200 {
+            c.insert(format!("d{i}"), format!("content {i}"), vector(i), None)
+                .unwrap();
+        }
+
+        // Staging: inserts worked at all, which they could not have under the old
+        // blanket rejection.
+        assert_eq!(c.len(), 200);
+        for i in [0usize, 99, 199] {
+            let hits = c.search(&vector(i), 1, None).unwrap();
+            assert_eq!(
+                hits[0].id,
+                format!("d{i}"),
+                "staging: d{i} should find itself"
+            );
+        }
+
+        c.fit().unwrap();
+
+        // Fitted: still correct, and still writable — quantized search is lossy, so
+        // check membership in the top-k rather than demanding rank 1.
+        for i in [0usize, 99, 199] {
+            let hits = c.search(&vector(i), 5, None).unwrap();
+            assert!(
+                hits.iter().any(|h| h.id == format!("d{i}")),
+                "fitted: d{i} should be in its own top-5, got {:?}",
+                hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+            );
+        }
+
+        c.insert("post-fit".into(), "after".into(), vector(500), None)
+            .unwrap();
+        assert_eq!(c.len(), 201, "inserts must work after fitting");
+        let hits = c.search(&vector(500), 5, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "post-fit"),
+            "a document inserted after fitting must be searchable"
+        );
+
+        // fit() is idempotent.
+        c.fit().unwrap();
+        assert_eq!(c.len(), 201);
+    }
+
+    /// Warren is bulk-build-only — it retains no f32, so no amount of staging lets
+    /// it accept incremental inserts. It must still be refused up front.
+    #[test]
+    fn warren_storage_is_still_rejected_for_collections() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: foxstash_core::index::Storage::Warren,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+        assert!(Collection::create("c", &path, cfg).is_err());
     }
 
     #[test]
