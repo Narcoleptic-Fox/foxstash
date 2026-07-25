@@ -3689,6 +3689,58 @@ impl HNSWIndex {
     ///
     /// # Returns
     /// A new HNSWIndex built from the embeddings
+    /// Build in parallel from full [`Document`]s, preserving each document's id,
+    /// content and metadata.
+    ///
+    /// [`Self::build_parallel`] takes bare embeddings and assigns *synthetic* ids
+    /// (`"0"`, `"1"`, …) — it is built for anonymous vector corpora. Callers with
+    /// real documents need this.
+    ///
+    /// # Why the documents are not attached positionally
+    ///
+    /// The obvious implementation — build, then write `docs[i]` into slot `i` — is
+    /// **wrong**, and wrong only sometimes, which is worse. `build_parallel`
+    /// randomly shuffles insertion order, and then `finalize_reorder` applies
+    /// [`Self::reorder_for_locality`] (on by default), which permutes every node
+    /// into breadth-first order. Slot `i` has no relationship to input `i`.
+    ///
+    /// What makes this safe is that the builder already records provenance: it
+    /// writes each node's **original input index** as its id, and the reorder
+    /// permutes ids alongside their vectors. So this reads that mapping back
+    /// rather than assuming one, and is correct whether or not reordering runs.
+    ///
+    /// Returns an empty index for an empty input (`build_parallel` panics there).
+    pub fn build_parallel_from_documents(documents: Vec<Document>, config: HNSWConfig) -> Self {
+        if documents.is_empty() {
+            return Self::new(0, config);
+        }
+        let embedding_dim = documents[0].embedding.len();
+        let embeddings: Vec<Vec<f32>> = documents.iter().map(|d| d.embedding.clone()).collect();
+        let mut index = Self::build_parallel(embeddings, config);
+
+        // `ids[slot]` is the original input index, written by
+        // `convert_parallel_to_index` and carried through the reorder.
+        let provenance: Vec<usize> = index
+            .ids
+            .iter()
+            .map(|id| {
+                id.parse::<usize>().expect(
+                    "build_parallel writes the original input index as each id; \
+                     if this fails the builder's id contract has changed",
+                )
+            })
+            .collect();
+
+        for (slot, original) in provenance.into_iter().enumerate() {
+            let doc = &documents[original];
+            index.ids[slot] = doc.id.clone();
+            index.contents[slot] = doc.content.clone();
+            index.metadata[slot] = doc.metadata.clone();
+        }
+        debug_assert_eq!(index.embedding_dim, embedding_dim);
+        index
+    }
+
     pub fn build_parallel(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         assert!(!embeddings.is_empty(), "Cannot build from empty embeddings");
         let embedding_dim = embeddings[0].len();
@@ -4616,6 +4668,115 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()
+    }
+
+    /// Every document must retrieve itself, **with locality reordering on**.
+    ///
+    /// This is the whole point of the test. `build_parallel` shuffles insertion
+    /// order and `reorder_for_locality` (the default) permutes nodes afterwards,
+    /// so a positional attachment mismatches ids to vectors — but only when
+    /// reordering runs. A test with `reorder_for_locality: false` would pass
+    /// while the bug was live in every default build.
+
+    #[test]
+    fn diagnostic_build_parallel_id_vector_correspondence() {
+        let n = 300;
+        let dim = 16;
+        let embeddings: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                let mut v = vec![0.0f32; dim];
+                v[i % dim] = 10.0 + i as f32;
+                v
+            })
+            .collect();
+        for reorder in [true, false] {
+            let config = HNSWConfig {
+                reorder_for_locality: reorder,
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel(embeddings.clone(), config);
+            let mut wrong = 0;
+            for (i, e) in embeddings.iter().enumerate() {
+                let hits = index.search(e, 1).unwrap();
+                if hits[0].id != i.to_string() {
+                    wrong += 1;
+                }
+            }
+            println!("DIAG reorder={reorder}: {wrong}/{n} vectors retrieve the wrong id");
+        }
+    }
+
+    #[test]
+    fn build_parallel_from_documents_keeps_ids_with_their_vectors_under_reordering() {
+        let n = 300;
+        let dim = 16;
+        // Dense pseudo-random vectors, deterministic so failures reproduce.
+        //
+        // NOT one-hot-by-`i % dim`: the default metric is Cosine, which is
+        // magnitude-invariant, so `v[i % dim] = 10 + i` makes every vector sharing
+        // an axis IDENTICAL in direction. A first pass used exactly that and
+        // reported 284/300 "mismatches" that were really ties — the fixture was
+        // degenerate under the metric, not the code wrong.
+        let vector = |seed: usize| -> Vec<f32> {
+            let mut state = (seed as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..dim)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+        let docs: Vec<Document> = (0..n)
+            .map(|i| {
+                let embedding = vector(i);
+                Document {
+                    id: format!("doc-{i}"),
+                    content: format!("content of {i}"),
+                    embedding,
+                    metadata: Some(serde_json::json!({ "n": i })),
+                }
+            })
+            .collect();
+
+        for reorder in [true, false] {
+            let config = HNSWConfig {
+                reorder_for_locality: reorder,
+                ..Default::default()
+            };
+            let index = HNSWIndex::build_parallel_from_documents(docs.clone(), config);
+            assert_eq!(index.len(), n, "reorder={reorder}: node count");
+
+            // Ids are the documents' own, not the synthetic "0".."n".
+            let ids: std::collections::HashSet<&str> =
+                index.ids.iter().map(|s| s.as_str()).collect();
+            assert!(
+                ids.contains("doc-0") && ids.contains("doc-299"),
+                "reorder={reorder}: real ids should replace the synthetic ones"
+            );
+
+            for (i, doc) in docs.iter().enumerate() {
+                let hits = index.search(&doc.embedding, 1).unwrap();
+                let hit = hits.first().expect("a hit");
+                assert_eq!(
+                    hit.id, doc.id,
+                    "reorder={reorder}: doc-{i}'s own vector must retrieve doc-{i}, \
+                     got {} — id and vector are mismatched",
+                    hit.id
+                );
+                assert_eq!(
+                    hit.content, doc.content,
+                    "reorder={reorder}: content must travel with the id"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_parallel_from_documents_handles_an_empty_corpus() {
+        let index = HNSWIndex::build_parallel_from_documents(Vec::new(), HNSWConfig::default());
+        assert_eq!(index.len(), 0);
     }
 
     #[test]

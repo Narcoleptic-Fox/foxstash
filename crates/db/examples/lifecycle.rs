@@ -175,6 +175,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dir_bytes(&path),
     );
 
+    // ---- bulk ingest into a fresh collection -------------------------------
+    // Same corpus through insert_many, which builds the graph in parallel.
+    {
+        let bulk_dir = tmp.path().join("bulk_collection");
+        std::fs::create_dir_all(&bulk_dir)?;
+        let docs: Vec<foxstash_core::Document> = (0..docs)
+            .map(|i| foxstash_core::Document {
+                id: format!("doc-{i}"),
+                content: format!("document number {i} about topic {}", i % 97),
+                embedding: vector(i as u64, dim),
+                metadata: None,
+            })
+            .collect();
+        let start = Instant::now();
+        let c = Collection::create("bulk", &bulk_dir, config.clone())?;
+        c.insert_many(docs)?;
+        c.flush()?;
+        let secs = start.elapsed().as_secs_f64();
+        println!(
+            "{:<22} {secs:>10.3} {:>12} {:>10.1}",
+            "bulk insert_many",
+            fmt_rss(rss_mib()),
+            dir_bytes(&bulk_dir) as f64 / (1024.0 * 1024.0)
+        );
+    }
+
     // ---- reopen: the O(N) sequential rebuild -------------------------------
     let start = Instant::now();
     let collection = Collection::open("bench", &path, config.clone())?;
