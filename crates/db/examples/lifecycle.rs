@@ -137,6 +137,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fmt_rss(rss_mib()),
             "-"
         );
+
+        // Same corpus, same config, through the parallel builder. Quantifies how
+        // much of sequential `add`'s cost is the lack of parallelism versus the
+        // per-insert algorithm itself.
+        let embeddings: Vec<Vec<f32>> = (0..docs).map(|i| vector(i as u64, dim)).collect();
+        let start = Instant::now();
+        let built = HNSWIndex::build_parallel(embeddings, HNSWConfig::default());
+        let par = start.elapsed().as_secs_f64();
+        println!(
+            "{:<22} {par:>10.3} {:>12} {:>10}   <- build_parallel, {} nodes, {:.1}x vs add",
+            "core build_parallel",
+            fmt_rss(rss_mib()),
+            "-",
+            built.len(),
+            secs / par
+        );
     }
 
     // ---- ingest -----------------------------------------------------------
