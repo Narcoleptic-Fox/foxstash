@@ -101,6 +101,11 @@ fn main() {
         "{:<14} {:>9} {:>10} {:>9}",
         "storage", "build_s", "QPS", "recall@10"
     );
+    // TurboQuant is deprecated in favour of TurboRabit. Benchmarking it anyway is
+    // the point of this smoke test: the deprecation claims TurboRabit dominates it
+    // at every bit budget, and that claim is only worth anything if the comparison
+    // keeps running. Drop these rows when the variant is actually removed.
+    #[allow(deprecated)]
     for (label, storage, tb, rb) in [
         ("f32", Storage::F32, 2, 3),
         ("sq8", Storage::SQ8, 2, 3),
