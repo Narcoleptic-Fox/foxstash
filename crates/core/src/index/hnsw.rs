@@ -2424,6 +2424,16 @@ impl HNSWIndex {
     /// - Returns [`RagError::NotTrained`](crate::RagError::NotTrained) if this index's
     ///   storage is quantized (`SQ8`/`RaBitQ`) and [`Self::train`] hasn't been called yet —
     ///   those storages cannot encode a vector without a fitted codebook.
+    pub fn add(&mut self, document: Document) -> Result<()> {
+        let Document {
+            id,
+            content,
+            embedding,
+            metadata,
+        } = document;
+        self.add_parts(&embedding, id, content, metadata)
+    }
+
     /// Add a document the caller wants to keep, cloning only what the index must own.
     ///
     /// [`Self::add`] takes the document by value and *moves* its id and content in —
@@ -2445,16 +2455,6 @@ impl HNSWIndex {
             document.content.clone(),
             document.metadata.clone(),
         )
-    }
-
-    pub fn add(&mut self, document: Document) -> Result<()> {
-        let Document {
-            id,
-            content,
-            embedding,
-            metadata,
-        } = document;
-        self.add_parts(&embedding, id, content, metadata)
     }
 
     /// Shared body of [`Self::add`] and [`Self::add_borrowed`].
