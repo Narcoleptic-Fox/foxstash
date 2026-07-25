@@ -33,6 +33,9 @@ struct CollectionInner {
 /// A named collection of documents with vector search.
 pub struct Collection {
     name: String,
+    /// Base directory. Retained so the graph snapshot can be written beside the
+    /// checkpoint it belongs to — `IncrementalStorage` does not expose its path.
+    base_path: std::path::PathBuf,
     config: DbConfig,
     inner: RwLock<CollectionInner>,
     storage: Mutex<IncrementalStorage>,
@@ -47,7 +50,7 @@ impl Collection {
         let storage =
             IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
-        let state = recovery::recover(&storage, &config)?;
+        let state = recovery::recover(&storage, &config, path)?;
 
         debug!(
             name,
@@ -58,6 +61,7 @@ impl Collection {
 
         Ok(Self {
             name: name.to_string(),
+            base_path: path.to_path_buf(),
             config,
             inner: RwLock::new(CollectionInner {
                 index: state.index,
@@ -91,6 +95,7 @@ impl Collection {
 
         Ok(Self {
             name: name.to_string(),
+            base_path: path.to_path_buf(),
             inner: RwLock::new(CollectionInner {
                 index: HNSWIndex::new(config.embedding_dim, config.hnsw.clone()),
                 id_map: IdMap::new(),
@@ -308,7 +313,7 @@ impl Collection {
             new_text_index.add(pos, &tokens);
         }
 
-        {
+        let checkpoint_meta = {
             let mut storage = self.storage.lock();
             storage
                 .checkpoint(
@@ -319,7 +324,15 @@ impl Collection {
                         index_type: "hnsw".into(),
                     },
                 )
-                .map_err(DbError::Core)?;
+                .map_err(DbError::Core)?
+        };
+
+        // Snapshot the freshly compacted graph, not the pre-compaction one.
+        {
+            let path = self.graph_snapshot_path(checkpoint_meta.id);
+            if let Err(err) = new_index.snapshot_to_file(&path) {
+                debug!(?err, ?path, "graph snapshot not written; open will rebuild");
+            }
         }
 
         inner.index = new_index;
@@ -618,6 +631,30 @@ impl Collection {
 
     /// Collect all live (non-tombstoned) documents, deduplicating by ID.
     /// Reverse-iterates so the latest version of a re-inserted ID wins.
+    /// Path of the graph snapshot belonging to checkpoint `id`.
+    ///
+    /// Named for the checkpoint it was written with, so a snapshot can never be
+    /// paired with a different checkpoint — a crash between the two writes leaves
+    /// an orphan that simply is not found, rather than a mismatched graph.
+    fn graph_snapshot_path(&self, checkpoint_id: u64) -> std::path::PathBuf {
+        self.base_path
+            .join(format!("graph_{checkpoint_id:05}.snapshot"))
+    }
+
+    /// Persist the graph beside the checkpoint so the next open can load it
+    /// instead of rebuilding.
+    ///
+    /// Best-effort by design: the snapshot is a **same-version cache**, and
+    /// recovery falls back to rebuilding whenever it is missing, stale or written
+    /// by another build. So a failure here must not fail the checkpoint — the
+    /// durable data is the checkpoint, and this only ever saves time.
+    fn write_graph_snapshot(&self, inner: &CollectionInner, checkpoint_id: u64) {
+        let path = self.graph_snapshot_path(checkpoint_id);
+        if let Err(err) = inner.index.snapshot_to_file(&path) {
+            debug!(?err, ?path, "graph snapshot not written; open will rebuild");
+        }
+    }
+
     fn collect_live_documents(&self, inner: &CollectionInner) -> Vec<Document> {
         let mut seen = std::collections::HashSet::new();
         let mut live: Vec<Document> = inner
@@ -646,17 +683,20 @@ impl Collection {
             let live_docs = self.collect_live_documents(&inner);
             let doc_count = live_docs.len();
 
-            let mut storage = self.storage.lock();
-            storage
-                .checkpoint(
-                    &live_docs,
-                    IndexMetadata {
-                        document_count: doc_count,
-                        embedding_dim: self.config.embedding_dim,
-                        index_type: "hnsw".into(),
-                    },
-                )
-                .map_err(DbError::Core)?;
+            let meta = {
+                let mut storage = self.storage.lock();
+                storage
+                    .checkpoint(
+                        &live_docs,
+                        IndexMetadata {
+                            document_count: doc_count,
+                            embedding_dim: self.config.embedding_dim,
+                            index_type: "hnsw".into(),
+                        },
+                    )
+                    .map_err(DbError::Core)?
+            };
+            self.write_graph_snapshot(&inner, meta.id);
         }
 
         Ok(())
@@ -831,6 +871,79 @@ mod tests {
 
         assert!(results.iter().all(|r| r.id != "b"));
         assert!(results.len() >= 2);
+    }
+
+    /// The graph snapshot is a cache: reopening must produce identical results
+    /// whether it is present, absent, or corrupt.
+    ///
+    /// Written this way on purpose. A test that only checks the happy path would
+    /// pass even if the fallback were broken — and the fallback is the part that
+    /// carries correctness, since the snapshot refuses to load across versions by
+    /// design and will therefore be missing on every upgrade.
+    #[test]
+    fn reopen_is_correct_with_a_present_missing_or_corrupt_graph_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let config = DbConfig::default().with_embedding_dim(4);
+
+        let expected: Vec<(String, Vec<f32>)> = (0..40)
+            .map(|i| {
+                let f = i as f32;
+                (format!("d{i}"), vec![f, f + 1.0, f + 2.0, f + 3.0])
+            })
+            .collect();
+
+        {
+            let c = Collection::create("c", &path, config.clone()).unwrap();
+            for (id, v) in &expected {
+                c.insert(id.clone(), format!("content {id}"), v.clone(), None)
+                    .unwrap();
+            }
+            // compact() checkpoints, which is what writes the snapshot.
+            c.compact().unwrap();
+        }
+
+        let snapshots = || -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(&path)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("snapshot"))
+                .collect()
+        };
+        assert!(
+            !snapshots().is_empty(),
+            "checkpoint should have written a graph snapshot"
+        );
+
+        // Every id must come back, and search must find each vector, in all three cases.
+        let verify = |case: &str| {
+            let c = Collection::open("c", &path, config.clone()).unwrap();
+            assert_eq!(c.len(), expected.len(), "{case}: document count");
+            for (id, v) in &expected {
+                let hits = c.search(v, 1, None).unwrap();
+                assert_eq!(
+                    hits.first().map(|h| h.id.as_str()),
+                    Some(id.as_str()),
+                    "{case}: nearest neighbour of {id}'s own vector should be {id}"
+                );
+            }
+        };
+
+        verify("snapshot present");
+
+        // Corrupt it: the loader must reject rather than misread, then rebuild.
+        for p in snapshots() {
+            std::fs::write(&p, b"not a snapshot").unwrap();
+        }
+        verify("snapshot corrupt");
+
+        // Absent — the state after any version upgrade.
+        for p in snapshots() {
+            std::fs::remove_file(&p).unwrap();
+        }
+        assert!(snapshots().is_empty());
+        verify("snapshot absent");
     }
 
     #[test]
