@@ -174,6 +174,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start.elapsed().as_secs_f64(),
         dir_bytes(&path),
     );
+    // Captured HERE, before the bulk phase builds a second collection — otherwise
+    // the end-of-run figure measures two collections and is not comparable across
+    // changes.
+    let rss_after_ingest = rss_mib();
 
     // ---- bulk ingest into a fresh collection -------------------------------
     // Same corpus through insert_many, which builds the graph in parallel.
@@ -251,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("live documents: {}", collection.len());
-    if let (Some(b), Some(n)) = (base_rss, rss_mib()) {
+    if let (Some(b), Some(n)) = (base_rss, rss_after_ingest) {
         let vectors_mib = (docs * dim * 4) as f64 / (1024.0 * 1024.0);
         println!(
             "resident growth: {:.1} MiB for a {:.1} MiB corpus ({:.2}x)",
