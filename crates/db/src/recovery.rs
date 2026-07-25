@@ -21,7 +21,7 @@ pub struct RecoveredState {
 /// usable snapshot exists.
 fn rebuild_index(index: &mut HNSWIndex, docs: &[Document]) -> Result<()> {
     for doc in docs {
-        index.add(doc.clone()).map_err(DbError::Core)?;
+        index.add_borrowed(doc).map_err(DbError::Core)?;
     }
     Ok(())
 }
@@ -101,7 +101,7 @@ pub fn recover(
         WalOperation::Add(doc) => {
             // Tombstone old position if re-adding (no-op if absent).
             id_map.remove(&doc.id);
-            index.add(doc.clone())?;
+            index.add_borrowed(doc)?;
             id_map.insert(doc.id.clone());
             documents.push(doc.clone());
             Ok(())

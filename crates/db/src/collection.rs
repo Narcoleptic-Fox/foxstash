@@ -149,7 +149,7 @@ impl Collection {
             }
             // Tombstone previous version if re-inserting same ID (no-op if absent).
             inner.id_map.remove(&id);
-            inner.index.add(doc.clone()).map_err(DbError::Core)?;
+            inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
             let pos = inner.id_map.insert(id);
             let tokens = inner.tokenizer.tokenize(&doc.content);
             inner.text_index.add(pos, &tokens);
@@ -222,7 +222,7 @@ impl Collection {
                         inner.text_index.remove(old_pos);
                     }
                     inner.id_map.remove(&doc.id);
-                    inner.index.add(doc.clone()).map_err(DbError::Core)?;
+                    inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
                     let pos = inner.id_map.insert(doc.id.clone());
                     let tokens = inner.tokenizer.tokenize(&doc.content);
                     inner.text_index.add(pos, &tokens);
@@ -382,7 +382,7 @@ impl Collection {
         let mut new_text_index = InvertedIndex::with_config(self.config.bm25.clone());
 
         for doc in &live_docs {
-            new_index.add(doc.clone()).map_err(DbError::Core)?;
+            new_index.add_borrowed(doc).map_err(DbError::Core)?;
             let pos = new_id_map.insert(doc.id.clone());
             let tokens = inner.tokenizer.tokenize(&doc.content);
             new_text_index.add(pos, &tokens);

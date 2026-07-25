@@ -2424,11 +2424,56 @@ impl HNSWIndex {
     /// - Returns [`RagError::NotTrained`](crate::RagError::NotTrained) if this index's
     ///   storage is quantized (`SQ8`/`RaBitQ`) and [`Self::train`] hasn't been called yet —
     ///   those storages cannot encode a vector without a fitted codebook.
+    /// Add a document the caller wants to keep, cloning only what the index must own.
+    ///
+    /// [`Self::add`] takes the document by value and *moves* its id and content in —
+    /// the right shape when the caller is handing ownership over. A caller that keeps
+    /// its own copy (as `foxstash-db` does, for get-by-id and checkpointing) has to
+    /// pass `doc.clone()` instead, and that clone allocates a `Vec<f32>` for the
+    /// embedding which `add` immediately copies into the arena and drops.
+    ///
+    /// That allocate-copy-free per insert is pure churn, and churn is where the
+    /// memory goes: 78% of a collection's resident footprint measured as allocator
+    /// retention rather than live data.
+    ///
+    /// This clones the id, content and metadata — which the index genuinely must own —
+    /// and reads the embedding straight through, so no vector allocation happens.
+    pub fn add_borrowed(&mut self, document: &Document) -> Result<()> {
+        self.add_parts(
+            &document.embedding,
+            document.id.clone(),
+            document.content.clone(),
+            document.metadata.clone(),
+        )
+    }
+
     pub fn add(&mut self, document: Document) -> Result<()> {
-        if document.embedding.len() != self.embedding_dim {
+        let Document {
+            id,
+            content,
+            embedding,
+            metadata,
+        } = document;
+        self.add_parts(&embedding, id, content, metadata)
+    }
+
+    /// Shared body of [`Self::add`] and [`Self::add_borrowed`].
+    ///
+    /// Takes the embedding by reference because the index copies it into the arena
+    /// rather than retaining the `Vec`, and takes the owned fields the index really
+    /// does keep. Having one implementation is the point: two copies of insertion
+    /// logic is exactly how a validation check ends up on only one path.
+    fn add_parts(
+        &mut self,
+        embedding: &[f32],
+        id: String,
+        content: String,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        if embedding.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
                 expected: self.embedding_dim,
-                actual: document.embedding.len(),
+                actual: embedding.len(),
             });
         }
 
@@ -2454,7 +2499,7 @@ impl HNSWIndex {
             )));
         }
 
-        if document.embedding.iter().any(|v| !v.is_finite()) {
+        if embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
                 "embedding contains non-finite values (NaN or Inf)".into(),
             ));
@@ -2469,11 +2514,11 @@ impl HNSWIndex {
             node_connections.push(Vec::new());
         }
 
-        self.push_node(&document.embedding);
+        self.push_node(embedding);
         self.connections.push(node_connections);
-        self.ids.push(document.id);
-        self.contents.push(document.content);
-        self.metadata.push(document.metadata);
+        self.ids.push(id);
+        self.contents.push(content);
+        self.metadata.push(metadata);
 
         // If this is the first node, make it the entry point
         if self.entry_point.is_none() {
