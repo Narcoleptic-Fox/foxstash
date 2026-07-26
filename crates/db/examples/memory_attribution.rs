@@ -153,6 +153,43 @@ fn main() {
         "\nOne duplicated vector copy is {corpus_mib:.1} MiB = {:.0}% of the live total.",
         corpus_mib / live_total * 100.0
     );
+    // 6. The same corpus, but QUANTIZED — which is what a fitted collection holds.
+    //    db keeps full f32 in `documents` regardless, so quantizing shrinks the
+    //    index's copy while leaving db's untouched. That changes the duplication
+    //    arithmetic completely, and the original "13%" was measured before the
+    //    lifecycle existed.
+    {
+        use foxstash_core::index::Storage;
+        let before = rss_mib();
+        let cfg = HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let quantized = HNSWIndex::build_parallel_from_documents(
+            (0..n)
+                .map(|i| Document {
+                    id: format!("doc-{i}"),
+                    content: format!("document number {i} about topic {}", i % 97),
+                    embedding: vector(i as u64, dim),
+                    metadata: None,
+                })
+                .collect(),
+            cfg,
+        );
+        let quantized_mib = rss_mib() - before;
+        println!(
+            "\nfitted (SQ8) index alone: {quantized_mib:.1} MiB for the same corpus \
+             ({} nodes)",
+            quantized.len()
+        );
+        println!(
+            "  db would ALSO hold {corpus_mib:.1} MiB of f32 in `documents` — \
+             {:.1}x the quantized index itself",
+            corpus_mib / quantized_mib.max(0.1)
+        );
+        drop(quantized);
+    }
+
     println!(
         "NOTE: the inverted-index and id-map rows read 0.0 because they fit in arena space the\n\
          allocator already held. Their cost is real but invisible to RSS deltas — this method\n\
