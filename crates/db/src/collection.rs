@@ -156,7 +156,7 @@ impl Collection {
             inner.documents.push(doc);
         }
 
-        self.maybe_auto_fit()?;
+        self.maybe_auto_fit_locked()?;
         self.maybe_auto_checkpoint_locked()?;
         Ok(())
     }
@@ -232,7 +232,7 @@ impl Collection {
             }
         }
 
-        self.maybe_auto_fit()?;
+        self.maybe_auto_fit_locked()?;
         self.maybe_auto_checkpoint_locked()?;
         Ok(())
     }
@@ -695,6 +695,18 @@ impl Collection {
             return Ok(());
         }
         let _mutation_guard = self.mutation_lock.lock();
+        self.fit_locked()
+    }
+
+    /// Body of [`Self::fit`], for callers **already holding the mutation lock**.
+    ///
+    /// `parking_lot::Mutex` is not reentrant, so a path that holds the mutation
+    /// lock and then calls the public `fit()` deadlocks against itself. `insert`
+    /// holds it for its whole body and then auto-fits, which is exactly that
+    /// shape — it hung on every collection reaching `fit_threshold`, i.e. the
+    /// default configuration. Same `_locked` convention as
+    /// `maybe_auto_checkpoint_locked`.
+    fn fit_locked(&self) -> Result<()> {
         let mut inner = self.inner.write();
         if self.is_fitted(&inner) {
             return Ok(());
@@ -714,7 +726,10 @@ impl Collection {
     }
 
     /// Fit once the collection is large enough, if it is configured to.
-    fn maybe_auto_fit(&self) -> Result<()> {
+    /// Fit once the collection is large enough, if it is configured to.
+    ///
+    /// Callers must already hold the mutation lock — see [`Self::fit_locked`].
+    fn maybe_auto_fit_locked(&self) -> Result<()> {
         if self.config.fit_threshold == 0 || !self.has_quantized_target() {
             return Ok(());
         }
@@ -723,7 +738,7 @@ impl Collection {
             !self.is_fitted(&inner) && inner.id_map.live_count() >= self.config.fit_threshold
         };
         if due {
-            self.fit()?;
+            self.fit_locked()?;
         }
         Ok(())
     }
@@ -1384,6 +1399,127 @@ mod tests {
         re.insert("post".into(), "x".into(), vector(999), None)
             .unwrap();
         assert_eq!(re.len(), 201, "must still accept writes after reopen");
+    }
+
+    #[test]
+    fn auto_fit_triggers_from_insert_without_deadlocking() {
+        use foxstash_core::index::Storage;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        // Threshold LOW so a plain insert crosses it — the default code path.
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 50,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+        let vector = |i: usize| -> Vec<f32> {
+            let mut st = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..8)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((st >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+        let c = Collection::create("c", &path, cfg).unwrap();
+        for i in 0..60 {
+            c.insert(format!("d{i}"), format!("c{i}"), vector(i), None)
+                .unwrap();
+        }
+        assert_eq!(c.len(), 60);
+    }
+
+    /// Auto-fit under concurrent writers.
+    ///
+    /// `fit` swaps the whole index while other threads are inserting, and it is
+    /// reached from inside `insert` while the mutation lock is held. That is the
+    /// shape that produced a self-deadlock, so this exercises it under contention
+    /// rather than from a single thread with auto-fit disabled — which is how the
+    /// deadlock survived its first test.
+    #[test]
+    fn auto_fit_under_concurrent_writers_loses_nothing() {
+        use foxstash_core::index::Storage;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 40,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+
+        let col = Arc::new(Collection::create("c", &path, cfg).unwrap());
+        let threads = 4usize;
+        let per_thread = 40usize;
+        let start = Arc::new(Barrier::new(threads + 1));
+        let mut handles = Vec::new();
+
+        for t in 0..threads {
+            let col = Arc::clone(&col);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..per_thread {
+                    let seed = (t * per_thread + i) as u64;
+                    let mut st = seed.wrapping_mul(6_364_136_223_846_793_005) + 1;
+                    let v: Vec<f32> = (0..8)
+                        .map(|_| {
+                            st = st
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407);
+                            ((st >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                        })
+                        .collect();
+                    col.insert(format!("t{t}-{i}"), format!("c{t}{i}"), v, None)
+                        .unwrap();
+                }
+            }));
+        }
+
+        // A concurrent reader, to catch a search racing the index swap.
+        let reader = {
+            let col = Arc::clone(&col);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..200 {
+                    let _ = col.search(&[0.1; 8], 5, None);
+                    let _ = col.len();
+                }
+            })
+        };
+
+        for h in handles {
+            h.join().expect("writer panicked or deadlocked");
+        }
+        reader.join().expect("reader panicked");
+
+        assert_eq!(
+            col.len(),
+            threads * per_thread,
+            "every concurrent write must survive the fit"
+        );
+        for t in 0..threads {
+            for i in 0..per_thread {
+                assert!(
+                    col.get(&format!("t{t}-{i}")).unwrap().is_some(),
+                    "lost t{t}-{i} across the fit"
+                );
+            }
+        }
     }
 
     #[test]
