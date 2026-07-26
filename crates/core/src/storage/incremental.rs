@@ -320,13 +320,17 @@ impl CheckpointMeta {
             return Ok(());
         }
         if self.format_version == 0 {
-            return Err(RagError::StorageError(format!(
-                "checkpoint {} predates checkpoint versioning (no format_version field). \
-                 This build writes format v{}. The data is not corrupt, but this build \
-                 cannot vouch for reading it: export with the version that wrote it, or \
-                 delete the checkpoint and re-ingest.",
-                self.id, CHECKPOINT_FORMAT_VERSION,
-            )));
+            // Readable, and migrated in place on load — see `load_checkpoint`.
+            //
+            // v0 means "written before the meta carried a version". The version was
+            // added to the METADATA, not to the payload, so a v0 payload has the
+            // same shape a v1 reader expects. And the payload is self-describing
+            // JSON: if an older build wrote a different `Document` shape,
+            // deserialization fails loudly rather than misreading. So the honest
+            // move is to attempt it and let the parse be the check — refusing
+            // outright would have made every existing collection unopenable to buy
+            // safety JSON already provides.
+            return Ok(());
         }
         Err(RagError::StorageError(format!(
             "checkpoint {} is format v{}, this build reads v{} (foxstash {}, written by {}). \
@@ -694,9 +698,36 @@ impl IncrementalStorage {
             .map_err(|e| RagError::StorageError(format!("Failed to read checkpoint: {}", e)))?;
         let data = compression::decompress(&compressed)?;
 
-        // Deserialize
-        let index: T = serde_json::from_slice(&data)
-            .map_err(|e| RagError::StorageError(format!("Checkpoint deserialize failed: {}", e)))?;
+        // Deserialize. For a v0 checkpoint this parse IS the compatibility check:
+        // JSON is self-describing, so a payload written against a different
+        // `Document` shape fails here instead of being misread.
+        let index: T = serde_json::from_slice(&data).map_err(|e| {
+            if meta.format_version == 0 {
+                RagError::StorageError(format!(
+                    "checkpoint {} predates checkpoint versioning and does not match this \
+                     build's document shape ({}). The data is not corrupt — it was written \
+                     by an incompatible version. Export it with the version that wrote it. \
+                     Underlying error: {e}",
+                    meta.id,
+                    env!("CARGO_PKG_VERSION"),
+                ))
+            } else {
+                RagError::StorageError(format!("Checkpoint deserialize failed: {}", e))
+            }
+        })?;
+
+        // Migrate a legacy checkpoint's metadata in place, now that its payload has
+        // been proven readable. Only the meta sidecar is rewritten; the payload is
+        // untouched because nothing about it needed to change. Best-effort: failing
+        // to stamp it costs a re-check next open, not correctness.
+        let mut meta = meta;
+        if meta.format_version == 0 {
+            meta.format_version = CHECKPOINT_FORMAT_VERSION;
+            meta.crate_version = env!("CARGO_PKG_VERSION").to_string();
+            if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                let _ = Self::write_atomic_file(&meta_path, json.as_bytes());
+            }
+        }
 
         Ok(Some((index, meta)))
     }
@@ -987,9 +1018,62 @@ mod tests {
             "error should name the version mismatch: {err}"
         );
 
-        // A pre-versioning checkpoint (no field at all) is reported as such,
-        // not as corruption — this is what every existing on-disk collection
-        // looks like today.
+        // A pre-versioning checkpoint (no field at all) must LOAD and be migrated
+        // in place — this is what every existing on-disk collection looks like, and
+        // refusing them would make the version stamp a data-loss event.
+        let meta_json = std::fs::read_to_string(&meta_path).unwrap();
+        let legacy = meta_json
+            .lines()
+            .filter(|l| !l.contains("format_version") && !l.contains("crate_version"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&meta_path, legacy).unwrap();
+
+        let (loaded, migrated) = storage
+            .load_checkpoint::<Vec<Document>>()
+            .expect("a legacy checkpoint must load, not be refused")
+            .expect("checkpoint present");
+        assert_eq!(loaded.len(), 2, "legacy payload must come back intact");
+        assert_eq!(
+            migrated.format_version, CHECKPOINT_FORMAT_VERSION,
+            "the returned meta should report the migrated version"
+        );
+
+        // The migration is persisted, so it happens once rather than every open.
+        let on_disk: CheckpointMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.format_version, CHECKPOINT_FORMAT_VERSION,
+            "the meta sidecar should have been stamped on disk"
+        );
+        assert_eq!(on_disk.crate_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// A legacy checkpoint whose payload does NOT match this build's document
+    /// shape must fail with a message that says so, not be silently misread.
+    ///
+    /// This is what makes accepting v0 safe: the JSON parse is the compatibility
+    /// check, so "old" and "incompatible" stay distinguishable.
+    #[test]
+    fn a_legacy_checkpoint_with_an_incompatible_payload_fails_clearly() {
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        let docs = vec![create_test_document("a", 4)];
+        let meta = storage
+            .checkpoint(
+                &docs,
+                IndexMetadata {
+                    document_count: 1,
+                    embedding_dim: 4,
+                    index_type: "test".into(),
+                },
+            )
+            .unwrap();
+
+        // Strip the version (making it legacy) and read it back as a type the
+        // payload cannot possibly satisfy.
+        let meta_path = dir.path().join(format!("checkpoint_{:05}.meta", meta.id));
         let legacy = std::fs::read_to_string(&meta_path)
             .unwrap()
             .lines()
@@ -997,12 +1081,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&meta_path, legacy).unwrap();
+
         let err = storage
-            .load_checkpoint::<Vec<Document>>()
-            .expect_err("a pre-versioning checkpoint must be refused");
+            .load_checkpoint::<Vec<u64>>()
+            .expect_err("an incompatible legacy payload must fail");
         assert!(
             format!("{err}").contains("predates checkpoint versioning"),
-            "error should distinguish 'old' from 'corrupt': {err}"
+            "the error should name the legacy case rather than a bare parse error: {err}"
         );
     }
 
