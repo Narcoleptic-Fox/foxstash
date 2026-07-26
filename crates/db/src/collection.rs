@@ -30,6 +30,48 @@ struct CollectionInner {
     tokenizer: SimpleTokenizer,
 }
 
+/// Proof that the holder has exclusive right to mutate a [`Collection`].
+///
+/// # Why this type exists
+///
+/// `Collection` holds three locks and **acquires two of them in inconsistent
+/// order**:
+///
+/// ```text
+/// insert           mutation -> storage -> inner.write
+/// delete, compact  mutation -> inner.write -> storage
+/// ```
+///
+/// That is textbook deadlock shape. The only reason it is safe is that
+/// `mutation_lock` serializes every mutator, so two of them can never interleave
+/// and the cycle cannot form. The ordering inconsistency is *survivable only
+/// because* the mutation lock is always taken first, by every path, without
+/// exception.
+///
+/// That invariant used to live in a naming convention (`_locked` suffixes) and a
+/// comment. It cost two real bugs in one day — an auto-fit that deadlocked
+/// against itself by re-taking a lock it already held, and a compaction path that
+/// looked correct in isolation. So it is a type now: a function that requires the
+/// mutation lock takes `&MutationGuard`, which can only be produced by
+/// [`Collection::begin_mutation`]. A caller that already holds it passes the guard
+/// along instead of locking again, which is what makes the self-deadlock
+/// unrepresentable rather than merely discouraged.
+///
+/// Readers take `inner.read()` alone and need no guard: they never touch
+/// `storage`, so they cannot participate in a cycle.
+struct MutationGuard<'a> {
+    _inner: parking_lot::MutexGuard<'a, ()>,
+    #[cfg(debug_assertions)]
+    owner: &'a std::sync::atomic::AtomicU64,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.owner.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A named collection of documents with vector search.
 pub struct Collection {
     name: String,
@@ -40,9 +82,59 @@ pub struct Collection {
     inner: RwLock<CollectionInner>,
     storage: Mutex<IncrementalStorage>,
     mutation_lock: Mutex<()>,
+    /// Thread currently holding `mutation_lock`, for re-entrance detection.
+    ///
+    /// `parking_lot::Mutex` is not reentrant, so a path that holds the mutation
+    /// lock and takes it again deadlocks **silently and forever** — no panic, no
+    /// timeout, just a hung process. That happened: auto-fit called the public
+    /// `fit()` from inside `insert`, and it shipped, because a hang looks like
+    /// slowness and the test that would have caught it had the feature disabled.
+    ///
+    /// Debug builds record the owner so re-entrance panics with a clear message
+    /// instead. Costs an atomic store per mutation and vanishes in release.
+    #[cfg(debug_assertions)]
+    mutation_owner: std::sync::atomic::AtomicU64,
 }
 
 impl Collection {
+    /// Take the mutation lock. Every mutating path must start here — see
+    /// [`MutationGuard`] for why the lock ordering depends on it.
+    fn begin_mutation(&self) -> MutationGuard<'_> {
+        #[cfg(debug_assertions)]
+        {
+            let me = Self::current_thread_id();
+            assert_ne!(
+                self.mutation_owner
+                    .load(std::sync::atomic::Ordering::Acquire),
+                me,
+                "re-entrant mutation lock: this thread already holds it. \
+                 parking_lot::Mutex is not reentrant, so proceeding would deadlock \
+                 forever with no diagnostic. A path that already holds the lock must \
+                 pass its &MutationGuard along instead of calling the public method."
+            );
+        }
+        let inner = self.mutation_lock.lock();
+        #[cfg(debug_assertions)]
+        self.mutation_owner.store(
+            Self::current_thread_id(),
+            std::sync::atomic::Ordering::Release,
+        );
+        MutationGuard {
+            _inner: inner,
+            #[cfg(debug_assertions)]
+            owner: &self.mutation_owner,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn current_thread_id() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        // 0 means "unheld", so never hand it out as a real id.
+        h.finish() | 1
+    }
+
     /// Open or create a collection at the given path.
     pub fn open(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
         Self::reject_incremental_quantized_storage(&config)?;
@@ -72,6 +164,8 @@ impl Collection {
             }),
             storage: Mutex::new(storage),
             mutation_lock: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            mutation_owner: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -106,6 +200,8 @@ impl Collection {
             config,
             storage: Mutex::new(storage),
             mutation_lock: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            mutation_owner: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -117,7 +213,7 @@ impl Collection {
         embedding: Vec<f32>,
         metadata: Option<Value>,
     ) -> Result<()> {
-        let _mutation_guard = self.mutation_lock.lock();
+        let mutation = self.begin_mutation();
 
         if embedding.len() != self.config.embedding_dim {
             return Err(DbError::DimensionMismatch {
@@ -171,8 +267,8 @@ impl Collection {
             inner.documents.push(doc);
         }
 
-        self.maybe_auto_fit_locked()?;
-        self.maybe_auto_checkpoint_locked()?;
+        self.maybe_auto_fit_locked(&mutation)?;
+        self.maybe_auto_checkpoint_locked(&mutation)?;
         Ok(())
     }
 
@@ -217,7 +313,7 @@ impl Collection {
             }
         }
 
-        let _mutation_guard = self.mutation_lock.lock();
+        let mutation = self.begin_mutation();
 
         // WAL first, all of them, before any in-memory mutation.
         {
@@ -259,8 +355,8 @@ impl Collection {
             }
         }
 
-        self.maybe_auto_fit_locked()?;
-        self.maybe_auto_checkpoint_locked()?;
+        self.maybe_auto_fit_locked(&mutation)?;
+        self.maybe_auto_checkpoint_locked(&mutation)?;
         Ok(())
     }
 
@@ -281,7 +377,8 @@ impl Collection {
 
     /// Soft-delete a document by ID. Returns `true` if the document existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
-        let _mutation_guard = self.mutation_lock.lock();
+        // Held for exclusion only — this path calls nothing that needs proof.
+        let _mutation = self.begin_mutation();
 
         // Hold write lock for the entire operation to prevent TOCTOU races.
         let mut inner = self.inner.write();
@@ -397,7 +494,8 @@ impl Collection {
 
     /// Compact: rebuild index from live documents only, checkpoint, reclaim tombstones.
     pub fn compact(&self) -> Result<()> {
-        let _mutation_guard = self.mutation_lock.lock();
+        // Held for exclusion only — this path calls nothing that needs proof.
+        let _mutation = self.begin_mutation();
 
         // Hold write lock for the entire operation to prevent concurrent mutations
         // from being silently dropped during the swap.
@@ -721,8 +819,8 @@ impl Collection {
         if !self.has_quantized_target() {
             return Ok(());
         }
-        let _mutation_guard = self.mutation_lock.lock();
-        self.fit_locked()
+        let mutation = self.begin_mutation();
+        self.fit_locked(&mutation)
     }
 
     /// Body of [`Self::fit`], for callers **already holding the mutation lock**.
@@ -733,7 +831,7 @@ impl Collection {
     /// shape — it hung on every collection reaching `fit_threshold`, i.e. the
     /// default configuration. Same `_locked` convention as
     /// `maybe_auto_checkpoint_locked`.
-    fn fit_locked(&self) -> Result<()> {
+    fn fit_locked(&self, _mutation: &MutationGuard<'_>) -> Result<()> {
         let mut inner = self.inner.write();
         if self.is_fitted(&inner) {
             return Ok(());
@@ -756,7 +854,7 @@ impl Collection {
     /// Fit once the collection is large enough, if it is configured to.
     ///
     /// Callers must already hold the mutation lock — see [`Self::fit_locked`].
-    fn maybe_auto_fit_locked(&self) -> Result<()> {
+    fn maybe_auto_fit_locked(&self, mutation: &MutationGuard<'_>) -> Result<()> {
         if self.config.fit_threshold == 0 || !self.has_quantized_target() {
             return Ok(());
         }
@@ -765,7 +863,7 @@ impl Collection {
             !self.is_fitted(&inner) && inner.id_map.live_count() >= self.config.fit_threshold
         };
         if due {
-            self.fit_locked()?;
+            self.fit_locked(mutation)?;
         }
         Ok(())
     }
@@ -912,7 +1010,7 @@ impl Collection {
             .collect()
     }
 
-    fn maybe_auto_checkpoint_locked(&self) -> Result<()> {
+    fn maybe_auto_checkpoint_locked(&self, _mutation: &MutationGuard<'_>) -> Result<()> {
         if !self.config.auto_checkpoint {
             return Ok(());
         }
