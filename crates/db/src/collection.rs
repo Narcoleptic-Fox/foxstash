@@ -133,6 +133,21 @@ impl Collection {
             metadata,
         };
 
+        // Validate BEFORE the WAL write, not after.
+        //
+        // The WAL goes first for crash safety, so anything rejected later is
+        // already durable. A non-finite embedding used to be caught only inside
+        // `add` — after the entry was on disk — and `serde_json` writes NaN as
+        // `null`, which never reads back as f32. One rejected insert made the
+        // collection permanently unopenable. Core owns the rules; this asks it.
+        {
+            let inner = self.inner.read();
+            inner
+                .index
+                .validate_embedding_for_add(&doc.embedding)
+                .map_err(DbError::Core)?;
+        }
+
         // WAL first (crash-safe).
         {
             let mut storage = self.storage.lock();
@@ -181,12 +196,24 @@ impl Collection {
         if documents.is_empty() {
             return Ok(());
         }
-        for doc in &documents {
-            if doc.embedding.len() != self.config.embedding_dim {
-                return Err(DbError::DimensionMismatch {
-                    expected: self.config.embedding_dim,
-                    actual: doc.embedding.len(),
-                });
+        // Validate EVERY document before writing ANY of them to the WAL. Same
+        // hazard as `insert`: the WAL is durable, so a document rejected later is
+        // already on disk, and a non-finite embedding serializes to `null` and can
+        // never be read back — bricking the collection. All-or-nothing here also
+        // means a partially-rejected batch never half-applies.
+        {
+            let inner = self.inner.read();
+            for doc in &documents {
+                if doc.embedding.len() != self.config.embedding_dim {
+                    return Err(DbError::DimensionMismatch {
+                        expected: self.config.embedding_dim,
+                        actual: doc.embedding.len(),
+                    });
+                }
+                inner
+                    .index
+                    .validate_embedding_for_add(&doc.embedding)
+                    .map_err(DbError::Core)?;
             }
         }
 
@@ -1520,6 +1547,151 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `documents` / `id_map` positional invariant, under a mixed workload.
+    ///
+    /// `IdMap` maintains its own `next_pos` counter with no structural link to
+    /// `documents.len()`; four separate write paths (insert, insert_many, compact,
+    /// recovery) each have to remember to advance both in lockstep. Nothing
+    /// enforces it, so this asserts it — after every phase, and especially after
+    /// re-inserts and deletes, which are where a position can be assigned without
+    /// a matching document.
+    #[test]
+    fn document_and_id_map_positions_stay_in_lockstep() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(4)).unwrap();
+
+        let check = |phase: &str| {
+            let inner = col.inner.read();
+            assert_eq!(
+                inner.documents.len(),
+                inner.id_map.next_pos_for_test(),
+                "{phase}: documents.len() and id_map's next position diverged"
+            );
+            for id in inner.id_map.live_ids() {
+                let pos = inner
+                    .id_map
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{phase}: live id {id} has no position"));
+                let doc = inner.documents.get(pos).unwrap_or_else(|| {
+                    panic!(
+                        "{phase}: id {id} points at position {pos}, out of {} documents",
+                        inner.documents.len()
+                    )
+                });
+                assert_eq!(
+                    doc.id, *id,
+                    "{phase}: id {id} maps to position {pos}, which holds {}",
+                    doc.id
+                );
+            }
+        };
+
+        for i in 0..30 {
+            col.insert(
+                format!("d{i}"),
+                format!("c{i}"),
+                vec![i as f32, 0.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+        check("after inserts");
+
+        // Re-insert existing ids: tombstones the old position and assigns a new one.
+        for i in 0..10 {
+            col.insert(
+                format!("d{i}"),
+                format!("v2-{i}"),
+                vec![i as f32, 1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+        check("after re-inserts");
+
+        for i in 20..30 {
+            col.delete(&format!("d{i}")).unwrap();
+        }
+        check("after deletes");
+
+        for i in 30..40 {
+            col.insert(
+                format!("d{i}"),
+                format!("c{i}"),
+                vec![i as f32, 0.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+        check("after inserting past the deletes");
+
+        col.compact().unwrap();
+        check("after compaction");
+
+        // And the content must be the LATEST version, not a resurrected old one.
+        for i in 0..10 {
+            assert_eq!(
+                col.get(&format!("d{i}")).unwrap().map(|d| d.content),
+                Some(format!("v2-{i}")),
+                "d{i} should hold its re-inserted content"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_insert_does_not_break_reopen() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(4)).unwrap();
+        col.insert("good".into(), "c".into(), vec![1.0, 2.0, 3.0, 4.0], None)
+            .unwrap();
+        // Right dimension, but not finite — db validates dim, core rejects NaN.
+        let bad = col.insert(
+            "bad".into(),
+            "c".into(),
+            vec![f32::NAN, 0.0, 0.0, 0.0],
+            None,
+        );
+        assert!(bad.is_err(), "a non-finite embedding must be rejected");
+        col.flush().unwrap();
+        drop(col);
+        let re = Collection::open("test", dir.path(), cfg(4))
+            .expect("a rejected insert must not make the collection unopenable");
+        assert!(
+            re.get("good").unwrap().is_some(),
+            "the good document must survive"
+        );
+        assert!(
+            re.get("bad").unwrap().is_none(),
+            "the rejected one must not appear"
+        );
+    }
+
+    #[test]
+    fn a_rejected_batch_does_not_half_apply_or_break_reopen() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(4)).unwrap();
+        let mut batch: Vec<Document> = (0..10)
+            .map(|i| Document {
+                id: format!("d{i}"),
+                content: format!("c{i}"),
+                embedding: vec![i as f32, 1.0, 2.0, 3.0],
+                metadata: None,
+            })
+            .collect();
+        // One bad document, in the middle.
+        batch[5].embedding = vec![f32::INFINITY, 0.0, 0.0, 0.0];
+
+        assert!(
+            col.insert_many(batch).is_err(),
+            "the batch must be rejected"
+        );
+        assert_eq!(col.len(), 0, "a rejected batch must not half-apply");
+        col.flush().unwrap();
+        drop(col);
+        Collection::open("test", dir.path(), cfg(4))
+            .expect("a rejected batch must not make the collection unopenable");
     }
 
     #[test]

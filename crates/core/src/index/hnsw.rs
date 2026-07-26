@@ -2463,20 +2463,26 @@ impl HNSWIndex {
     /// rather than retaining the `Vec`, and takes the owned fields the index really
     /// does keep. Having one implementation is the point: two copies of insertion
     /// logic is exactly how a validation check ends up on only one path.
-    fn add_parts(
-        &mut self,
-        embedding: &[f32],
-        id: String,
-        content: String,
-        metadata: Option<serde_json::Value>,
-    ) -> Result<()> {
+    /// Validate an embedding against everything [`Self::add`] requires, without
+    /// mutating anything.
+    ///
+    /// Exists so a caller that journals before mutating can reject a bad vector
+    /// *before* it is durable. `foxstash-db` writes its WAL first for crash safety,
+    /// and used to discover a non-finite embedding only once `add` ran — after the
+    /// WAL entry was on disk. `serde_json` writes `NaN` as `null`, which can never
+    /// be read back as `f32`, so a single rejected insert made the collection
+    /// permanently unopenable.
+    ///
+    /// One implementation, called by both [`Self::add`] and any pre-flight check —
+    /// a second copy of these rules is how one path ends up enforcing something the
+    /// other does not.
+    pub fn validate_embedding_for_add(&self, embedding: &[f32]) -> Result<()> {
         if embedding.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
                 expected: self.embedding_dim,
                 actual: embedding.len(),
             });
         }
-
         if !self.is_trained() {
             return Err(crate::RagError::NotTrained(format!(
                 "Storage::{:?} requires a fitted codebook before add() — call \
@@ -2485,11 +2491,6 @@ impl HNSWIndex {
                 self.config.storage
             )));
         }
-
-        // Warren retains no f32, and incremental edge selection (`insert_node`) computes EXACT
-        // f32 distances between the new node and existing ones — which it cannot read. So it is a
-        // bulk-build-only mode: fail clearly here rather than deep in `get_embedding`. Build the
-        // whole corpus at once (`build`/`build_parallel`), which has the f32 vectors in hand.
         if matches!(self.config.storage, Storage::Warren) {
             return Err(crate::RagError::InvalidInput(format!(
                 "Storage::{:?} does not support incremental add() — it retains no f32 for exact \
@@ -2498,12 +2499,22 @@ impl HNSWIndex {
                 self.config.storage
             )));
         }
-
         if embedding.iter().any(|v| !v.is_finite()) {
             return Err(crate::RagError::InvalidInput(
                 "embedding contains non-finite values (NaN or Inf)".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn add_parts(
+        &mut self,
+        embedding: &[f32],
+        id: String,
+        content: String,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.validate_embedding_for_add(embedding)?;
 
         let node_id = self.len();
         let node_level = self.random_level();
