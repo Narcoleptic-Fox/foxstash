@@ -387,12 +387,26 @@ impl Collection {
         } else {
             Self::staging_hnsw(&self.config)
         };
-        let mut new_index = HNSWIndex::new(self.config.embedding_dim, rebuild_cfg);
+        // Build the whole graph at once rather than inserting one at a time.
+        //
+        // Required, not merely faster: a fitted collection rebuilds at a QUANTIZED
+        // storage, and `HNSWIndex::new` + `add` cannot do that — `add` needs a
+        // codebook, and a fresh index has none, so it fails with NotTrained.
+        // `build_parallel_from_documents` trains internally from the corpus it is
+        // given, which is exactly what compaction has in hand. (This was a real
+        // bug: compact() on a fitted collection failed outright.)
+        let mut new_index =
+            HNSWIndex::build_parallel_from_documents(live_docs.clone(), rebuild_cfg);
+        if live_docs.is_empty() {
+            // build_parallel_from_documents returns a dimensionless index for an
+            // empty corpus; keep the collection's own dimension so later inserts
+            // still validate. An empty collection is by definition unfitted.
+            new_index = HNSWIndex::new(self.config.embedding_dim, Self::staging_hnsw(&self.config));
+        }
         let mut new_id_map = IdMap::new();
         let mut new_text_index = InvertedIndex::with_config(self.config.bm25.clone());
 
         for doc in &live_docs {
-            new_index.add_borrowed(doc).map_err(DbError::Core)?;
             let pos = new_id_map.insert(doc.id.clone());
             let tokens = inner.tokenizer.tokenize(&doc.content);
             new_text_index.add(pos, &tokens);
@@ -1312,6 +1326,64 @@ mod tests {
         }
         .with_embedding_dim(8);
         assert!(Collection::create("c", &path, cfg).is_err());
+    }
+
+    #[test]
+    fn a_fitted_collection_survives_reopen() {
+        use foxstash_core::index::Storage;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 0,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+        let vector = |i: usize| -> Vec<f32> {
+            let mut st = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..8)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((st >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+        {
+            let c = Collection::create("c", &path, cfg.clone()).unwrap();
+            for i in 0..200 {
+                c.insert(format!("d{i}"), format!("c{i}"), vector(i), None)
+                    .unwrap();
+            }
+            c.fit().unwrap();
+            c.compact().unwrap(); // forces a checkpoint + graph snapshot of the FITTED index
+        }
+        let re = Collection::open("c", &path, cfg).unwrap();
+        assert_eq!(re.len(), 200, "document count after reopen");
+        let mut found = 0;
+        for i in 0..200 {
+            if re
+                .search(&vector(i), 5, None)
+                .unwrap()
+                .iter()
+                .any(|h| h.id == format!("d{i}"))
+            {
+                found += 1;
+            }
+        }
+        assert!(
+            found >= 190,
+            "only {found}/200 documents retrieved themselves after reopen"
+        );
+        re.insert("post".into(), "x".into(), vector(999), None)
+            .unwrap();
+        assert_eq!(re.len(), 201, "must still accept writes after reopen");
     }
 
     #[test]
