@@ -216,7 +216,14 @@ impl FlatIndex {
             })
             .collect();
 
-        // Sort by score in descending order
+        // Partial selection, not a full sort: partition the k best to the front in O(n) (introselect),
+        // then sort only those k — O(n + k log k) vs the O(n log n) of sorting all n for a top-k. The
+        // "selection ≠ full sort" lesson from the GPU top-k work; for k ≪ n it is the bulk of the cost.
+        let k = k.min(scored_docs.len());
+        if k > 0 && k < scored_docs.len() {
+            scored_docs.select_nth_unstable_by(k - 1, |a, b| b.0.total_cmp(&a.0));
+            scored_docs.truncate(k);
+        }
         scored_docs.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // Take top k results and convert to SearchResult
