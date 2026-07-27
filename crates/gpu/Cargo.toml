@@ -1,0 +1,17 @@
+[package]
+name = "foxstash-gpu"
+version = "0.6.0"
+edition = "2021"
+description = "Optional GPU flat-scan backend for foxstash (CubeCL: CUDA/ROCm/Vulkan/Metal/WebGPU)."
+
+[dependencies]
+foxstash-core = { path = "../core" }
+cubecl = { version = "0.10", features = ["wgpu"] }
+bytemuck = "1"
+
+[features]
+# Native AMD ROCm/HIP backend (vs the default wgpu→WGSL→Vulkan path). Build/bench with `--features hip`.
+hip = ["cubecl/hip"]
+
+[dev-dependencies]
+rand = "0.9"

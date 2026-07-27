@@ -36,7 +36,9 @@ jobs:
       # that no longer exists, with a fully green test run. This step is the only thing in CI
       # that would have caught it.
       - name: Check every target compiles (examples and benches included)
-        run: cargo check --workspace --all-targets --verbose
+        # foxstash-gpu is excluded: it pulls cubecl/wgpu (heavy) and nothing depends on it, so it is
+        # not part of the shipped surface. Build it explicitly with `-p foxstash-gpu` when needed.
+        run: cargo check --workspace --exclude foxstash-gpu --all-targets --verbose
 
       - name: Build foxstash-core
         run: cargo build -p foxstash-core --verbose
