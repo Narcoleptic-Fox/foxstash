@@ -557,6 +557,7 @@ impl Collection {
             if let Err(err) = new_index.snapshot_to_file(&path) {
                 debug!(?err, ?path, "graph snapshot not written; open will rebuild");
             }
+            self.prune_graph_snapshots(checkpoint_meta.id);
         }
 
         inner.index = new_index;
@@ -971,6 +972,47 @@ impl Collection {
         let path = self.graph_snapshot_path(checkpoint_id);
         if let Err(err) = inner.index.snapshot_to_file(&path) {
             debug!(?err, ?path, "graph snapshot not written; open will rebuild");
+        }
+        self.prune_graph_snapshots(checkpoint_id);
+    }
+
+    /// Delete graph snapshots for checkpoints that are no longer retained.
+    ///
+    /// Core prunes old checkpoints itself (`keep_checkpoints`, default 2) but knows
+    /// nothing about these files, so without this they accumulate forever — one
+    /// full copy of the graph per checkpoint. Measured at 100k x 768 that is
+    /// ~600 MiB each: compaction alone took the directory from 679 MiB to 1.29 GiB,
+    /// and a long-lived collection would fill the disk.
+    ///
+    /// Mirrors core's retention rather than keeping only the newest: recovery loads
+    /// the snapshot matching the *current* checkpoint, so a snapshot is useful
+    /// exactly as long as its checkpoint is.
+    fn prune_graph_snapshots(&self, current_id: u64) {
+        let keep = self.config.storage.keep_checkpoints as u64;
+        // keep_checkpoints == 0 means "prune aggressively"; still retain the
+        // current one, which is the only one recovery can use.
+        let oldest_kept = current_id.saturating_sub(keep.saturating_sub(1));
+        let Ok(entries) = std::fs::read_dir(&self.base_path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("snapshot") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("graph_"))
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if id < oldest_kept {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    debug!(?err, ?path, "could not prune stale graph snapshot");
+                }
+            }
         }
     }
 
@@ -1790,6 +1832,58 @@ mod tests {
         drop(col);
         Collection::open("test", dir.path(), cfg(4))
             .expect("a rejected batch must not make the collection unopenable");
+    }
+
+    /// Graph snapshots must not accumulate. Core prunes its own checkpoints but
+    /// knows nothing about these files; without pruning, each checkpoint leaves a
+    /// full copy of the graph behind. At 100k x 768 that is ~600 MiB apiece.
+    #[test]
+    fn graph_snapshots_do_not_accumulate_across_checkpoints() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let cfg = DbConfig {
+            storage: IncrementalConfig::default()
+                .with_checkpoint_threshold(1)
+                .with_keep_checkpoints(2),
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(4);
+
+        let col = Collection::create("c", &path, cfg).unwrap();
+        let count = || {
+            std::fs::read_dir(&path)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("snapshot"))
+                .count()
+        };
+
+        for i in 0..12 {
+            col.insert(
+                format!("d{i}"),
+                format!("c{i}"),
+                vec![i as f32, 1.0, 2.0, 3.0],
+                None,
+            )
+            .unwrap();
+            col.compact().unwrap(); // each compaction checkpoints, so each writes a snapshot
+        }
+
+        let n = count();
+        assert!(
+            n <= 3,
+            "graph snapshots accumulated: {n} present after 12 checkpoints with \
+             keep_checkpoints=2 — each is a full copy of the graph"
+        );
+        // And the collection must still open from whatever survived.
+        drop(col);
+        let re = Collection::open("c", &path, DbConfig::default().with_embedding_dim(4)).unwrap();
+        assert_eq!(
+            re.len(),
+            12,
+            "pruning must not remove the snapshot recovery needs"
+        );
     }
 
     #[test]

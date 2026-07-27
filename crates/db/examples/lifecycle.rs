@@ -112,11 +112,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     };
 
+    // The sequential phases are O(N) one-at-a-time inserts — informative at 10k,
+    // hours at 100k. FOXSTASH_SKIP_SEQUENTIAL=1 runs only the paths a real
+    // deployment uses: bulk ingest, reopen, search, fit, compact.
+    let skip_sequential = std::env::var("FOXSTASH_SKIP_SEQUENTIAL").as_deref() == Ok("1");
+
     // ---- core baseline: raw sequential HNSW insert, no db at all ----------
     // Attribution check. If this is close to db's ingest, the cost is core's
     // sequential `add`, not db's WAL/text-index/document bookkeeping — which
     // decides whether the fix belongs in db or in how db drives core.
-    {
+    if !skip_sequential {
         use foxstash_core::index::{HNSWConfig, HNSWIndex};
         let mut index = HNSWIndex::new(dim, HNSWConfig::default());
         let start = Instant::now();
@@ -159,13 +164,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     {
         let collection = Collection::create("bench", &path, config.clone())?;
-        for i in 0..docs {
-            collection.insert(
-                format!("doc-{i}"),
-                format!("document number {i} about topic {}", i % 97),
-                vector(i as u64, dim),
-                None,
+        if skip_sequential {
+            // Populate in bulk so every later phase still has a real collection.
+            // A first version skipped creation entirely and silently measured an
+            // EMPTY directory — reopen 0.000s, self-retrieval 0/200. Fast numbers
+            // that meant nothing.
+            collection.insert_many(
+                (0..docs)
+                    .map(|i| foxstash_core::Document {
+                        id: format!("doc-{i}"),
+                        content: format!("document number {i} about topic {}", i % 97),
+                        embedding: vector(i as u64, dim),
+                        metadata: None,
+                    })
+                    .collect(),
             )?;
+        } else {
+            for i in 0..docs {
+                collection.insert(
+                    format!("doc-{i}"),
+                    format!("document number {i} about topic {}", i % 97),
+                    vector(i as u64, dim),
+                    None,
+                )?;
+            }
         }
         collection.flush()?;
     }
@@ -255,6 +277,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("live documents: {}", collection.len());
+    assert!(
+        !collection.is_empty(),
+        "the collection is empty — every phase above measured nothing. \
+         This harness reports rather than asserts, but an empty run is not a \
+         measurement, it is a bug in the harness."
+    );
     if let (Some(b), Some(n)) = (base_rss, rss_after_ingest) {
         let vectors_mib = (docs * dim * 4) as f64 / (1024.0 * 1024.0);
         println!(
