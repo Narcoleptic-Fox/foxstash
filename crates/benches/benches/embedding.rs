@@ -332,6 +332,11 @@ fn benchmark_hnsw_index(c: &mut Criterion) {
 /// is not yet implemented. Run with `cargo bench -- --ignored` once the
 /// ONNX embedder is available.
 #[allow(dead_code)]
+// Placeholder body: the fixtures below are the intended inputs, but the ONNX
+// embedder does not exist yet so nothing consumes them. Kept (rather than
+// deleted) so the benchmark is a fill-in-the-call away once it does; the allow
+// goes when the body does real work.
+#[allow(unused_variables, unused_mut)]
 #[cfg(feature = "onnx")]
 fn benchmark_embedding_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("embedding");
@@ -391,6 +396,11 @@ fn benchmark_embedding_single(c: &mut Criterion) {
 /// is not yet implemented. Run with `cargo bench -- --ignored` once the
 /// ONNX embedder is available.
 #[allow(dead_code)]
+// Placeholder body: the fixtures below are the intended inputs, but the ONNX
+// embedder does not exist yet so nothing consumes them. Kept (rather than
+// deleted) so the benchmark is a fill-in-the-call away once it does; the allow
+// goes when the body does real work.
+#[allow(unused_variables, unused_mut)]
 #[cfg(feature = "onnx")]
 fn benchmark_embedding_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("embedding");
@@ -440,6 +450,11 @@ fn benchmark_embedding_batch(c: &mut Criterion) {
 /// Note: This benchmark is marked `#[ignore]` because the embedding module
 /// is not yet implemented. Run with `cargo bench -- --ignored` once the
 /// ONNX embedder with caching is available.
+// Placeholder body: the fixtures below are the intended inputs, but the ONNX
+// embedder does not exist yet so nothing consumes them. Kept (rather than
+// deleted) so the benchmark is a fill-in-the-call away once it does; the allow
+// goes when the body does real work.
+#[allow(unused_variables, unused_mut)]
 #[allow(dead_code)]
 #[cfg(feature = "onnx")]
 fn benchmark_cached_embedder(c: &mut Criterion) {

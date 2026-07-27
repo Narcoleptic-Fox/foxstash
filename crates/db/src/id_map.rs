@@ -48,6 +48,14 @@ impl IdMap {
         pos
     }
 
+    /// Next position this map would assign. Test-only: the positional lockstep
+    /// with `Collection::documents` is an invariant nothing structurally enforces,
+    /// so a test needs to be able to read it.
+    #[doc(hidden)]
+    pub fn next_pos_for_test(&self) -> usize {
+        self.next_pos
+    }
+
     /// Mark an ID as deleted (tombstoned). Returns `true` if the ID existed.
     pub fn remove(&mut self, id: &str) -> bool {
         if self.id_to_pos.contains_key(id) {

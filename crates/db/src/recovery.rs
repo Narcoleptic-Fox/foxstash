@@ -17,9 +17,29 @@ pub struct RecoveredState {
     pub text_index: InvertedIndex,
 }
 
+/// Re-insert every document to reconstruct the graph. The slow path, used when no
+/// usable snapshot exists.
+fn rebuild_index(index: &mut HNSWIndex, docs: &[Document]) -> Result<()> {
+    for doc in docs {
+        index.add_borrowed(doc).map_err(DbError::Core)?;
+    }
+    Ok(())
+}
+
 /// Load a checkpoint (if any) and replay the WAL to produce a fully recovered state.
-pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<RecoveredState> {
-    let mut index = HNSWIndex::new(config.embedding_dim, config.hnsw.clone());
+pub fn recover(
+    storage: &IncrementalStorage,
+    config: &DbConfig,
+    base_path: &std::path::Path,
+) -> Result<RecoveredState> {
+    // Recovery rebuilds in STAGING (F32). A fitted collection is restored from its
+    // graph snapshot, which carries the trained codebook; if that snapshot is absent
+    // the collection re-fits once it crosses the threshold again. Rebuilding
+    // straight into a quantized storage is not possible here anyway — core's
+    // incremental `add` needs a codebook that only a corpus-wide build produces.
+    let mut staging = config.hnsw.clone();
+    staging.storage = foxstash_core::index::Storage::F32;
+    let mut index = HNSWIndex::new(config.embedding_dim, staging);
     let mut id_map = IdMap::new();
     let mut documents: Vec<Document> = Vec::new();
 
@@ -42,9 +62,43 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
         }
 
         for doc in &checkpoint_docs {
-            index.add(doc.clone()).map_err(DbError::Core)?;
             id_map.insert(doc.id.clone());
         }
+
+        // Prefer the graph snapshot written alongside this checkpoint. Loading it
+        // is a read; rebuilding is a full HNSW construction — measured at 88% of
+        // the entire open, because re-inserting one document at a time is core's
+        // slowest entry point.
+        //
+        // The snapshot is a **same-version cache** by core's design: it refuses to
+        // load if written by another build, rather than misreading. Every failure
+        // mode — absent, orphaned by a crash between the two writes, or written by
+        // a different version — lands in the same fallback, so correctness never
+        // depends on it being there.
+        let snapshot_path = base_path.join(format!("graph_{:05}.snapshot", meta.id));
+        match HNSWIndex::snapshot_from_file(&snapshot_path) {
+            Ok(loaded) if loaded.len() == checkpoint_docs.len() => {
+                info!(
+                    docs = checkpoint_docs.len(),
+                    "graph loaded from snapshot; skipping rebuild"
+                );
+                index = loaded;
+            }
+            Ok(loaded) => {
+                // Present but disagrees with the checkpoint — treat as stale.
+                debug!(
+                    snapshot_docs = loaded.len(),
+                    checkpoint_docs = checkpoint_docs.len(),
+                    "graph snapshot disagrees with checkpoint; rebuilding"
+                );
+                rebuild_index(&mut index, &checkpoint_docs)?;
+            }
+            Err(err) => {
+                debug!(?err, "no usable graph snapshot; rebuilding");
+                rebuild_index(&mut index, &checkpoint_docs)?;
+            }
+        }
+
         documents = checkpoint_docs;
     }
 
@@ -54,7 +108,7 @@ pub fn recover(storage: &IncrementalStorage, config: &DbConfig) -> Result<Recove
         WalOperation::Add(doc) => {
             // Tombstone old position if re-adding (no-op if absent).
             id_map.remove(&doc.id);
-            index.add(doc.clone())?;
+            index.add_borrowed(doc)?;
             id_map.insert(doc.id.clone());
             documents.push(doc.clone());
             Ok(())
@@ -126,7 +180,7 @@ mod tests {
         let storage = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
         let config = test_config(4);
 
-        let state = recover(&storage, &config).unwrap();
+        let state = recover(&storage, &config, dir.path()).unwrap();
         assert_eq!(state.index.len(), 0);
         assert_eq!(state.id_map.live_count(), 0);
     }
@@ -143,7 +197,7 @@ mod tests {
         storage.log_remove("a").unwrap();
         storage.sync().unwrap();
 
-        let state = recover(&storage, &config).unwrap();
+        let state = recover(&storage, &config, dir.path()).unwrap();
         assert_eq!(state.index.len(), 2); // HNSW still has both nodes
         assert_eq!(state.id_map.live_count(), 1); // only "b" is live
         assert!(state.id_map.is_tombstoned("a"));
@@ -177,7 +231,7 @@ mod tests {
         storage.log_remove("a").unwrap();
         storage.sync().unwrap();
 
-        let state = recover(&storage, &config).unwrap();
+        let state = recover(&storage, &config, dir.path()).unwrap();
         assert_eq!(state.id_map.live_count(), 2); // b + c
         assert!(state.id_map.is_tombstoned("a"));
         assert!(state.id_map.get("b").is_some());
@@ -196,7 +250,7 @@ mod tests {
         storage.log_add(&test_doc("b", 4)).unwrap();
         storage.sync().unwrap();
 
-        let state = recover(&storage, &config).unwrap();
+        let state = recover(&storage, &config, dir.path()).unwrap();
         assert_eq!(state.id_map.live_count(), 1);
         assert!(state.id_map.get("b").is_some());
         assert!(state.id_map.get("a").is_none());
@@ -214,7 +268,7 @@ mod tests {
         storage.log_remove("nonexistent").unwrap();
         storage.sync().unwrap();
 
-        let state = recover(&storage, &config).unwrap();
+        let state = recover(&storage, &config, dir.path()).unwrap();
         assert_eq!(state.id_map.live_count(), 1);
         assert!(state.id_map.get("a").is_some());
     }

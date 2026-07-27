@@ -30,16 +30,111 @@ struct CollectionInner {
     tokenizer: SimpleTokenizer,
 }
 
+/// Proof that the holder has exclusive right to mutate a [`Collection`].
+///
+/// # Why this type exists
+///
+/// `Collection` holds three locks and **acquires two of them in inconsistent
+/// order**:
+///
+/// ```text
+/// insert           mutation -> storage -> inner.write
+/// delete, compact  mutation -> inner.write -> storage
+/// ```
+///
+/// That is textbook deadlock shape. The only reason it is safe is that
+/// `mutation_lock` serializes every mutator, so two of them can never interleave
+/// and the cycle cannot form. The ordering inconsistency is *survivable only
+/// because* the mutation lock is always taken first, by every path, without
+/// exception.
+///
+/// That invariant used to live in a naming convention (`_locked` suffixes) and a
+/// comment. It cost two real bugs in one day — an auto-fit that deadlocked
+/// against itself by re-taking a lock it already held, and a compaction path that
+/// looked correct in isolation. So it is a type now: a function that requires the
+/// mutation lock takes `&MutationGuard`, which can only be produced by
+/// [`Collection::begin_mutation`]. A caller that already holds it passes the guard
+/// along instead of locking again, which is what makes the self-deadlock
+/// unrepresentable rather than merely discouraged.
+///
+/// Readers take `inner.read()` alone and need no guard: they never touch
+/// `storage`, so they cannot participate in a cycle.
+struct MutationGuard<'a> {
+    _inner: parking_lot::MutexGuard<'a, ()>,
+    #[cfg(debug_assertions)]
+    owner: &'a std::sync::atomic::AtomicU64,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.owner.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A named collection of documents with vector search.
 pub struct Collection {
     name: String,
+    /// Base directory. Retained so the graph snapshot can be written beside the
+    /// checkpoint it belongs to — `IncrementalStorage` does not expose its path.
+    base_path: std::path::PathBuf,
     config: DbConfig,
     inner: RwLock<CollectionInner>,
     storage: Mutex<IncrementalStorage>,
     mutation_lock: Mutex<()>,
+    /// Thread currently holding `mutation_lock`, for re-entrance detection.
+    ///
+    /// `parking_lot::Mutex` is not reentrant, so a path that holds the mutation
+    /// lock and takes it again deadlocks **silently and forever** — no panic, no
+    /// timeout, just a hung process. That happened: auto-fit called the public
+    /// `fit()` from inside `insert`, and it shipped, because a hang looks like
+    /// slowness and the test that would have caught it had the feature disabled.
+    ///
+    /// Debug builds record the owner so re-entrance panics with a clear message
+    /// instead. Costs an atomic store per mutation and vanishes in release.
+    #[cfg(debug_assertions)]
+    mutation_owner: std::sync::atomic::AtomicU64,
 }
 
 impl Collection {
+    /// Take the mutation lock. Every mutating path must start here — see
+    /// [`MutationGuard`] for why the lock ordering depends on it.
+    fn begin_mutation(&self) -> MutationGuard<'_> {
+        #[cfg(debug_assertions)]
+        {
+            let me = Self::current_thread_id();
+            assert_ne!(
+                self.mutation_owner
+                    .load(std::sync::atomic::Ordering::Acquire),
+                me,
+                "re-entrant mutation lock: this thread already holds it. \
+                 parking_lot::Mutex is not reentrant, so proceeding would deadlock \
+                 forever with no diagnostic. A path that already holds the lock must \
+                 pass its &MutationGuard along instead of calling the public method."
+            );
+        }
+        let inner = self.mutation_lock.lock();
+        #[cfg(debug_assertions)]
+        self.mutation_owner.store(
+            Self::current_thread_id(),
+            std::sync::atomic::Ordering::Release,
+        );
+        MutationGuard {
+            _inner: inner,
+            #[cfg(debug_assertions)]
+            owner: &self.mutation_owner,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn current_thread_id() -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        // 0 means "unheld", so never hand it out as a real id.
+        h.finish() | 1
+    }
+
     /// Open or create a collection at the given path.
     pub fn open(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
         Self::reject_incremental_quantized_storage(&config)?;
@@ -47,7 +142,7 @@ impl Collection {
         let storage =
             IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
 
-        let state = recovery::recover(&storage, &config)?;
+        let state = recovery::recover(&storage, &config, path)?;
 
         debug!(
             name,
@@ -58,6 +153,7 @@ impl Collection {
 
         Ok(Self {
             name: name.to_string(),
+            base_path: path.to_path_buf(),
             config,
             inner: RwLock::new(CollectionInner {
                 index: state.index,
@@ -68,6 +164,8 @@ impl Collection {
             }),
             storage: Mutex::new(storage),
             mutation_lock: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            mutation_owner: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -91,8 +189,9 @@ impl Collection {
 
         Ok(Self {
             name: name.to_string(),
+            base_path: path.to_path_buf(),
             inner: RwLock::new(CollectionInner {
-                index: HNSWIndex::new(config.embedding_dim, config.hnsw.clone()),
+                index: HNSWIndex::new(config.embedding_dim, Self::staging_hnsw(&config)),
                 id_map: IdMap::new(),
                 documents: Vec::new(),
                 text_index: InvertedIndex::with_config(config.bm25.clone()),
@@ -101,6 +200,8 @@ impl Collection {
             config,
             storage: Mutex::new(storage),
             mutation_lock: Mutex::new(()),
+            #[cfg(debug_assertions)]
+            mutation_owner: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -112,7 +213,7 @@ impl Collection {
         embedding: Vec<f32>,
         metadata: Option<Value>,
     ) -> Result<()> {
-        let _mutation_guard = self.mutation_lock.lock();
+        let mutation = self.begin_mutation();
 
         if embedding.len() != self.config.embedding_dim {
             return Err(DbError::DimensionMismatch {
@@ -127,6 +228,21 @@ impl Collection {
             embedding,
             metadata,
         };
+
+        // Validate BEFORE the WAL write, not after.
+        //
+        // The WAL goes first for crash safety, so anything rejected later is
+        // already durable. A non-finite embedding used to be caught only inside
+        // `add` — after the entry was on disk — and `serde_json` writes NaN as
+        // `null`, which never reads back as f32. One rejected insert made the
+        // collection permanently unopenable. Core owns the rules; this asks it.
+        {
+            let inner = self.inner.read();
+            inner
+                .index
+                .validate_embedding_for_add(&doc.embedding)
+                .map_err(DbError::Core)?;
+        }
 
         // WAL first (crash-safe).
         {
@@ -144,14 +260,103 @@ impl Collection {
             }
             // Tombstone previous version if re-inserting same ID (no-op if absent).
             inner.id_map.remove(&id);
-            inner.index.add(doc.clone()).map_err(DbError::Core)?;
+            inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
             let pos = inner.id_map.insert(id);
             let tokens = inner.tokenizer.tokenize(&doc.content);
             inner.text_index.add(pos, &tokens);
             inner.documents.push(doc);
         }
 
-        self.maybe_auto_checkpoint_locked()?;
+        self.maybe_auto_fit_locked(&mutation)?;
+        self.maybe_auto_checkpoint_locked(&mutation)?;
+        Ok(())
+    }
+
+    /// Insert many documents at once, building the graph in parallel.
+    ///
+    /// `insert` adds one document at a time, which is core's slowest entry point:
+    /// measured, sequential `HNSWIndex::add` is **88% of ingest**, and
+    /// `build_parallel` does the same corpus **7.3x faster**. A collection built
+    /// incrementally cannot use it — but a bulk load can, and bulk load is where
+    /// the cost actually shows up (importing a corpus, restoring an export).
+    ///
+    /// Semantics match `insert`: every document is WAL-logged before any
+    /// in-memory state changes, so a crash mid-call replays cleanly.
+    ///
+    /// Only takes the parallel path on an **empty** collection — `build_parallel`
+    /// constructs a whole graph rather than adding to one, so merging into an
+    /// existing index would mean rebuilding it. A non-empty collection falls back
+    /// to sequential inserts, which is correct but no faster; compact() is the
+    /// tool for rebuilding an existing collection.
+    pub fn insert_many(&self, documents: Vec<Document>) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        // Validate EVERY document before writing ANY of them to the WAL. Same
+        // hazard as `insert`: the WAL is durable, so a document rejected later is
+        // already on disk, and a non-finite embedding serializes to `null` and can
+        // never be read back — bricking the collection. All-or-nothing here also
+        // means a partially-rejected batch never half-applies.
+        {
+            let inner = self.inner.read();
+            for doc in &documents {
+                if doc.embedding.len() != self.config.embedding_dim {
+                    return Err(DbError::DimensionMismatch {
+                        expected: self.config.embedding_dim,
+                        actual: doc.embedding.len(),
+                    });
+                }
+                inner
+                    .index
+                    .validate_embedding_for_add(&doc.embedding)
+                    .map_err(DbError::Core)?;
+            }
+        }
+
+        let mutation = self.begin_mutation();
+
+        // WAL first, all of them, before any in-memory mutation.
+        {
+            let mut storage = self.storage.lock();
+            for doc in &documents {
+                storage.log_add(doc).map_err(DbError::Core)?;
+            }
+        }
+
+        {
+            let mut inner = self.inner.write();
+            if inner.id_map.live_count() == 0 && inner.documents.is_empty() {
+                // Empty: build the whole graph in parallel.
+                inner.index = HNSWIndex::build_parallel_from_documents(
+                    documents.clone(),
+                    self.config.hnsw.clone(),
+                );
+                // The index permutes internally, so id_map/text_index positions
+                // are assigned here in insertion order, exactly as the sequential
+                // path would — they index `documents`, not index slots.
+                for doc in documents {
+                    let pos = inner.id_map.insert(doc.id.clone());
+                    let tokens = inner.tokenizer.tokenize(&doc.content);
+                    inner.text_index.add(pos, &tokens);
+                    inner.documents.push(doc);
+                }
+            } else {
+                for doc in documents {
+                    if let Some(old_pos) = inner.id_map.get(&doc.id) {
+                        inner.text_index.remove(old_pos);
+                    }
+                    inner.id_map.remove(&doc.id);
+                    inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
+                    let pos = inner.id_map.insert(doc.id.clone());
+                    let tokens = inner.tokenizer.tokenize(&doc.content);
+                    inner.text_index.add(pos, &tokens);
+                    inner.documents.push(doc);
+                }
+            }
+        }
+
+        self.maybe_auto_fit_locked(&mutation)?;
+        self.maybe_auto_checkpoint_locked(&mutation)?;
         Ok(())
     }
 
@@ -172,7 +377,8 @@ impl Collection {
 
     /// Soft-delete a document by ID. Returns `true` if the document existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
-        let _mutation_guard = self.mutation_lock.lock();
+        // Held for exclusion only — this path calls nothing that needs proof.
+        let _mutation = self.begin_mutation();
 
         // Hold write lock for the entire operation to prevent TOCTOU races.
         let mut inner = self.inner.write();
@@ -288,7 +494,8 @@ impl Collection {
 
     /// Compact: rebuild index from live documents only, checkpoint, reclaim tombstones.
     pub fn compact(&self) -> Result<()> {
-        let _mutation_guard = self.mutation_lock.lock();
+        // Held for exclusion only — this path calls nothing that needs proof.
+        let _mutation = self.begin_mutation();
 
         // Hold write lock for the entire operation to prevent concurrent mutations
         // from being silently dropped during the swap.
@@ -297,18 +504,40 @@ impl Collection {
         let live_docs = self.collect_live_documents(&inner);
         let doc_count = live_docs.len();
 
-        let mut new_index = HNSWIndex::new(self.config.embedding_dim, self.config.hnsw.clone());
+        // Rebuild at the storage the collection is CURRENTLY using. Using the
+        // configured target would quietly quantize a collection still in staging,
+        // making compaction a semantic change rather than a cleanup.
+        let rebuild_cfg = if self.is_fitted(&inner) {
+            self.config.hnsw.clone()
+        } else {
+            Self::staging_hnsw(&self.config)
+        };
+        // Build the whole graph at once rather than inserting one at a time.
+        //
+        // Required, not merely faster: a fitted collection rebuilds at a QUANTIZED
+        // storage, and `HNSWIndex::new` + `add` cannot do that — `add` needs a
+        // codebook, and a fresh index has none, so it fails with NotTrained.
+        // `build_parallel_from_documents` trains internally from the corpus it is
+        // given, which is exactly what compaction has in hand. (This was a real
+        // bug: compact() on a fitted collection failed outright.)
+        let mut new_index =
+            HNSWIndex::build_parallel_from_documents(live_docs.clone(), rebuild_cfg);
+        if live_docs.is_empty() {
+            // build_parallel_from_documents returns a dimensionless index for an
+            // empty corpus; keep the collection's own dimension so later inserts
+            // still validate. An empty collection is by definition unfitted.
+            new_index = HNSWIndex::new(self.config.embedding_dim, Self::staging_hnsw(&self.config));
+        }
         let mut new_id_map = IdMap::new();
         let mut new_text_index = InvertedIndex::with_config(self.config.bm25.clone());
 
         for doc in &live_docs {
-            new_index.add(doc.clone()).map_err(DbError::Core)?;
             let pos = new_id_map.insert(doc.id.clone());
             let tokens = inner.tokenizer.tokenize(&doc.content);
             new_text_index.add(pos, &tokens);
         }
 
-        {
+        let checkpoint_meta = {
             let mut storage = self.storage.lock();
             storage
                 .checkpoint(
@@ -319,7 +548,16 @@ impl Collection {
                         index_type: "hnsw".into(),
                     },
                 )
-                .map_err(DbError::Core)?;
+                .map_err(DbError::Core)?
+        };
+
+        // Snapshot the freshly compacted graph, not the pre-compaction one.
+        {
+            let path = self.graph_snapshot_path(checkpoint_meta.id);
+            if let Err(err) = new_index.snapshot_to_file(&path) {
+                debug!(?err, ?path, "graph snapshot not written; open will rebuild");
+            }
+            self.prune_graph_snapshots(checkpoint_meta.id);
         }
 
         inner.index = new_index;
@@ -527,11 +765,106 @@ impl Collection {
     /// TODO: once `HNSWIndex::train(&mut self, sample)` lands (fits a codebook from a
     /// calibration sample instead of requiring the full corpus up front), `Collection` can
     /// train from an initial batch and this restriction can be lifted for that case.
+    /// Reject only the storage that genuinely cannot work incrementally.
+    ///
+    /// This used to reject *every* quantized storage, because a quantizer needs a
+    /// codebook fitted on a corpus sample before the first vector is encoded and a
+    /// collection has no sample at construction. That is solved by staging — see
+    /// [`Self::fit`] — so SQ8, RaBitQ and TurboRabit are now reachable.
+    ///
+    /// `Warren` is different and still refused: it retains no f32 at all, so core's
+    /// incremental `add()` cannot compute the exact distances edge selection needs.
+    /// It is a bulk-build-only mode, and no amount of staging changes that.
     fn reject_incremental_quantized_storage(config: &DbConfig) -> Result<()> {
-        if config.hnsw.storage != foxstash_core::index::Storage::F32 {
+        if config.hnsw.storage == foxstash_core::index::Storage::Warren {
             return Err(DbError::UnsupportedIncrementalStorage {
                 storage: config.hnsw.storage,
             });
+        }
+        Ok(())
+    }
+
+    /// HNSW config for the **staging** index: the caller's settings, forced to F32.
+    ///
+    /// Everything else — `m`, `ef_construction`, metric, reordering — is preserved,
+    /// so fitting later changes only how vectors are stored.
+    fn staging_hnsw(config: &DbConfig) -> foxstash_core::index::HNSWConfig {
+        let mut hnsw = config.hnsw.clone();
+        hnsw.storage = foxstash_core::index::Storage::F32;
+        hnsw
+    }
+
+    /// Whether this collection is configured to quantize at all.
+    fn has_quantized_target(&self) -> bool {
+        self.config.hnsw.storage != foxstash_core::index::Storage::F32
+    }
+
+    /// True once the live index is using the configured target storage.
+    fn is_fitted(&self, inner: &CollectionInner) -> bool {
+        inner.index.config().storage == self.config.hnsw.storage
+    }
+
+    /// Quantize the collection: fit a codebook over what it currently holds and
+    /// re-encode every vector into the configured storage.
+    ///
+    /// This is the transition a quantizer needs and an incrementally-written
+    /// collection cannot do at construction. `build_parallel_from_documents` trains
+    /// the codebook internally from the full corpus, so the sample is exactly the
+    /// data — not an approximation of it.
+    ///
+    /// Idempotent: a no-op if the collection is already fitted, or if the target is
+    /// F32 (nothing to fit). Safe to call at any size, though quantizing a handful
+    /// of vectors buys nothing — exact search on a small collection is already the
+    /// right answer, which is why `fit_threshold` exists.
+    pub fn fit(&self) -> Result<()> {
+        if !self.has_quantized_target() {
+            return Ok(());
+        }
+        let mutation = self.begin_mutation();
+        self.fit_locked(&mutation)
+    }
+
+    /// Body of [`Self::fit`], for callers **already holding the mutation lock**.
+    ///
+    /// `parking_lot::Mutex` is not reentrant, so a path that holds the mutation
+    /// lock and then calls the public `fit()` deadlocks against itself. `insert`
+    /// holds it for its whole body and then auto-fits, which is exactly that
+    /// shape — it hung on every collection reaching `fit_threshold`, i.e. the
+    /// default configuration. Same `_locked` convention as
+    /// `maybe_auto_checkpoint_locked`.
+    fn fit_locked(&self, _mutation: &MutationGuard<'_>) -> Result<()> {
+        let mut inner = self.inner.write();
+        if self.is_fitted(&inner) {
+            return Ok(());
+        }
+        let live_docs = self.collect_live_documents(&inner);
+        if live_docs.is_empty() {
+            return Ok(());
+        }
+        // Rebuild at the target storage. Trains from the whole corpus.
+        inner.index = HNSWIndex::build_parallel_from_documents(live_docs, self.config.hnsw.clone());
+        debug!(
+            storage = ?self.config.hnsw.storage,
+            docs = inner.index.len(),
+            "collection fitted"
+        );
+        Ok(())
+    }
+
+    /// Fit once the collection is large enough, if it is configured to.
+    /// Fit once the collection is large enough, if it is configured to.
+    ///
+    /// Callers must already hold the mutation lock — see [`Self::fit_locked`].
+    fn maybe_auto_fit_locked(&self, mutation: &MutationGuard<'_>) -> Result<()> {
+        if self.config.fit_threshold == 0 || !self.has_quantized_target() {
+            return Ok(());
+        }
+        let due = {
+            let inner = self.inner.read();
+            !self.is_fitted(&inner) && inner.id_map.live_count() >= self.config.fit_threshold
+        };
+        if due {
+            self.fit_locked(mutation)?;
         }
         Ok(())
     }
@@ -618,20 +951,108 @@ impl Collection {
 
     /// Collect all live (non-tombstoned) documents, deduplicating by ID.
     /// Reverse-iterates so the latest version of a re-inserted ID wins.
-    fn collect_live_documents(&self, inner: &CollectionInner) -> Vec<Document> {
+    /// Path of the graph snapshot belonging to checkpoint `id`.
+    ///
+    /// Named for the checkpoint it was written with, so a snapshot can never be
+    /// paired with a different checkpoint — a crash between the two writes leaves
+    /// an orphan that simply is not found, rather than a mismatched graph.
+    fn graph_snapshot_path(&self, checkpoint_id: u64) -> std::path::PathBuf {
+        self.base_path
+            .join(format!("graph_{checkpoint_id:05}.snapshot"))
+    }
+
+    /// Persist the graph beside the checkpoint so the next open can load it
+    /// instead of rebuilding.
+    ///
+    /// Best-effort by design: the snapshot is a **same-version cache**, and
+    /// recovery falls back to rebuilding whenever it is missing, stale or written
+    /// by another build. So a failure here must not fail the checkpoint — the
+    /// durable data is the checkpoint, and this only ever saves time.
+    fn write_graph_snapshot(&self, inner: &CollectionInner, checkpoint_id: u64) {
+        let path = self.graph_snapshot_path(checkpoint_id);
+        if let Err(err) = inner.index.snapshot_to_file(&path) {
+            debug!(?err, ?path, "graph snapshot not written; open will rebuild");
+        }
+        self.prune_graph_snapshots(checkpoint_id);
+    }
+
+    /// Delete graph snapshots for checkpoints that are no longer retained.
+    ///
+    /// Core prunes old checkpoints itself (`keep_checkpoints`, default 2) but knows
+    /// nothing about these files, so without this they accumulate forever — one
+    /// full copy of the graph per checkpoint. Measured at 100k x 768 that is
+    /// ~600 MiB each: compaction alone took the directory from 679 MiB to 1.29 GiB,
+    /// and a long-lived collection would fill the disk.
+    ///
+    /// Mirrors core's retention rather than keeping only the newest: recovery loads
+    /// the snapshot matching the *current* checkpoint, so a snapshot is useful
+    /// exactly as long as its checkpoint is.
+    fn prune_graph_snapshots(&self, current_id: u64) {
+        let keep = self.config.storage.keep_checkpoints as u64;
+        // keep_checkpoints == 0 means "prune aggressively"; still retain the
+        // current one, which is the only one recovery can use.
+        let oldest_kept = current_id.saturating_sub(keep.saturating_sub(1));
+        let Ok(entries) = std::fs::read_dir(&self.base_path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("snapshot") {
+                continue;
+            }
+            let Some(id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("graph_"))
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if id < oldest_kept {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    debug!(?err, ?path, "could not prune stale graph snapshot");
+                }
+            }
+        }
+    }
+
+    /// Live documents as **borrows** — no allocation beyond the pointer vector.
+    ///
+    /// The checkpoint path only serializes, so it has no business cloning the
+    /// whole collection to do it. Measured: 78% of resident memory is allocator
+    /// retention rather than live data, and this was the largest single source —
+    /// every checkpoint allocated N ids, N contents and N embeddings, then freed
+    /// them, leaving the pages behind.
+    ///
+    /// Dedup keys on `&str` rather than a cloned `String`, which removes a second
+    /// allocation per document.
+    ///
+    /// Iterates in reverse so the LAST version of a re-inserted id wins, then
+    /// restores insertion order — `documents` is append-only, so an id may appear
+    /// more than once and only the newest is live.
+    fn collect_live_document_refs<'a>(&self, inner: &'a CollectionInner) -> Vec<&'a Document> {
         let mut seen = std::collections::HashSet::new();
-        let mut live: Vec<Document> = inner
+        let mut live: Vec<&Document> = inner
             .documents
             .iter()
             .rev()
-            .filter(|doc| inner.id_map.is_live(&doc.id) && seen.insert(doc.id.clone()))
-            .cloned()
+            .filter(|doc| inner.id_map.is_live(&doc.id) && seen.insert(doc.id.as_str()))
             .collect();
         live.reverse();
         live
     }
 
-    fn maybe_auto_checkpoint_locked(&self) -> Result<()> {
+    /// Owned copies, for callers that must keep them (compaction rebuilds the
+    /// index and replaces the document store). Delegates so there is one
+    /// definition of "live".
+    fn collect_live_documents(&self, inner: &CollectionInner) -> Vec<Document> {
+        self.collect_live_document_refs(inner)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    fn maybe_auto_checkpoint_locked(&self, _mutation: &MutationGuard<'_>) -> Result<()> {
         if !self.config.auto_checkpoint {
             return Ok(());
         }
@@ -643,20 +1064,24 @@ impl Collection {
 
         if needs {
             let inner = self.inner.read();
-            let live_docs = self.collect_live_documents(&inner);
+            // Borrowed: this path serializes and nothing more.
+            let live_docs = self.collect_live_document_refs(&inner);
             let doc_count = live_docs.len();
 
-            let mut storage = self.storage.lock();
-            storage
-                .checkpoint(
-                    &live_docs,
-                    IndexMetadata {
-                        document_count: doc_count,
-                        embedding_dim: self.config.embedding_dim,
-                        index_type: "hnsw".into(),
-                    },
-                )
-                .map_err(DbError::Core)?;
+            let meta = {
+                let mut storage = self.storage.lock();
+                storage
+                    .checkpoint(
+                        &live_docs,
+                        IndexMetadata {
+                            document_count: doc_count,
+                            embedding_dim: self.config.embedding_dim,
+                            index_type: "hnsw".into(),
+                        },
+                    )
+                    .map_err(DbError::Core)?
+            };
+            self.write_graph_snapshot(&inner, meta.id);
         }
 
         Ok(())
@@ -698,50 +1123,43 @@ mod tests {
     // `cargo test -p foxstash-db repro_sq8_storage_panics_on_insert -- --nocapture` before
     // the guard existed:
     //   thread '...' panicked at crates/core/src/index/hnsw.rs:978:41:
-    //   index out of bounds: the len is 0 but the index is 0
-    // `Collection::create`/`open` now reject non-F32 storage up front, so this asserts the
-    // clean `Err` instead.
+    // These three used to assert that SQ8/RaBitQ were REJECTED at construction —
+    // the old contract, when db was F32-only because a quantizer cannot encode
+    // before its codebook exists. Staging solves that (see `fit`), so the contract
+    // is now: quantized targets are ACCEPTED and start in F32. Rewritten rather
+    // than deleted, so the change of behaviour is asserted rather than merely
+    // untested.
     #[test]
-    fn sq8_storage_rejected_at_construction() {
+    fn sq8_storage_is_accepted_and_starts_in_staging() {
         let dir = TempDir::new().unwrap();
         let mut config = cfg(3);
         config.hnsw.storage = foxstash_core::index::Storage::SQ8;
 
-        match Collection::create("test", dir.path(), config) {
-            Err(DbError::UnsupportedIncrementalStorage {
-                storage: foxstash_core::index::Storage::SQ8,
-            }) => {}
-            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
-            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
-        }
+        let col = Collection::create("test", dir.path(), config)
+            .expect("SQ8 is reachable now: the collection stages in F32 and fits later");
+        col.insert("a".into(), "content".into(), vec![1.0, 2.0, 3.0], None)
+            .expect("staging accepts inserts with no codebook");
+        assert_eq!(col.len(), 1);
     }
 
     #[test]
-    fn rabitq_storage_rejected_at_construction() {
+    fn rabitq_storage_is_accepted_and_starts_in_staging() {
         let dir = TempDir::new().unwrap();
         let mut config = cfg(3);
         config.hnsw.storage = foxstash_core::index::Storage::RaBitQ;
 
-        match Collection::create("test", dir.path(), config) {
-            Err(DbError::UnsupportedIncrementalStorage {
-                storage: foxstash_core::index::Storage::RaBitQ,
-            }) => {}
-            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
-            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
-        }
+        let col = Collection::create("test", dir.path(), config).expect("RaBitQ stages too");
+        col.insert("a".into(), "content".into(), vec![1.0, 2.0, 3.0], None)
+            .unwrap();
+        assert_eq!(col.len(), 1);
     }
 
     #[test]
-    fn sq8_storage_rejected_at_open() {
+    fn sq8_storage_is_accepted_at_open() {
         let dir = TempDir::new().unwrap();
         let mut config = cfg(3);
         config.hnsw.storage = foxstash_core::index::Storage::SQ8;
-
-        match Collection::open("test", dir.path(), config) {
-            Err(DbError::UnsupportedIncrementalStorage { .. }) => {}
-            Err(e) => panic!("expected UnsupportedIncrementalStorage, got {e:?}"),
-            Ok(_) => panic!("expected UnsupportedIncrementalStorage, got Ok"),
-        }
+        Collection::open("test", dir.path(), config).expect("opening an SQ8 collection works");
     }
 
     #[test]
@@ -831,6 +1249,641 @@ mod tests {
 
         assert!(results.iter().all(|r| r.id != "b"));
         assert!(results.len() >= 2);
+    }
+
+    /// The graph snapshot is a cache: reopening must produce identical results
+    /// whether it is present, absent, or corrupt.
+    ///
+    /// Written this way on purpose. A test that only checks the happy path would
+    /// pass even if the fallback were broken — and the fallback is the part that
+    /// carries correctness, since the snapshot refuses to load across versions by
+    /// design and will therefore be missing on every upgrade.
+    #[test]
+    fn reopen_is_correct_with_a_present_missing_or_corrupt_graph_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let config = DbConfig::default().with_embedding_dim(4);
+
+        let expected: Vec<(String, Vec<f32>)> = (0..40)
+            .map(|i| {
+                let f = i as f32;
+                (format!("d{i}"), vec![f, f + 1.0, f + 2.0, f + 3.0])
+            })
+            .collect();
+
+        {
+            let c = Collection::create("c", &path, config.clone()).unwrap();
+            for (id, v) in &expected {
+                c.insert(id.clone(), format!("content {id}"), v.clone(), None)
+                    .unwrap();
+            }
+            // compact() checkpoints, which is what writes the snapshot.
+            c.compact().unwrap();
+        }
+
+        let snapshots = || -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(&path)
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("snapshot"))
+                .collect()
+        };
+        assert!(
+            !snapshots().is_empty(),
+            "checkpoint should have written a graph snapshot"
+        );
+
+        // Every id must come back, and search must find each vector, in all three cases.
+        let verify = |case: &str| {
+            let c = Collection::open("c", &path, config.clone()).unwrap();
+            assert_eq!(c.len(), expected.len(), "{case}: document count");
+            for (id, v) in &expected {
+                let hits = c.search(v, 1, None).unwrap();
+                assert_eq!(
+                    hits.first().map(|h| h.id.as_str()),
+                    Some(id.as_str()),
+                    "{case}: nearest neighbour of {id}'s own vector should be {id}"
+                );
+            }
+        };
+
+        verify("snapshot present");
+
+        // Corrupt it: the loader must reject rather than misread, then rebuild.
+        for p in snapshots() {
+            std::fs::write(&p, b"not a snapshot").unwrap();
+        }
+        verify("snapshot corrupt");
+
+        // Absent — the state after any version upgrade.
+        for p in snapshots() {
+            std::fs::remove_file(&p).unwrap();
+        }
+        assert!(snapshots().is_empty());
+        verify("snapshot absent");
+    }
+
+    /// `insert_many` must be observably identical to a loop of `insert` —
+    /// same documents retrievable, same search answers, and durable across a
+    /// reopen (i.e. actually WAL-logged, not just placed in memory).
+    #[test]
+    fn insert_many_matches_insert_and_survives_reopen() {
+        let docs: Vec<Document> = (0..120)
+            .map(|i| {
+                let mut e = vec![0.0f32; 8];
+                // Dense and distinct: the default metric is Cosine, so vectors
+                // differing only in magnitude would be identical in direction.
+                for (k, v) in e.iter_mut().enumerate() {
+                    *v = ((i * 7 + k * 13) % 29) as f32 - 14.0;
+                }
+                e[i % 8] += 40.0;
+                Document {
+                    id: format!("d{i}"),
+                    content: format!("content {i}"),
+                    embedding: e,
+                    metadata: None,
+                }
+            })
+            .collect();
+
+        let cfg = DbConfig::default().with_embedding_dim(8);
+
+        // Reference: one at a time.
+        let one_dir = TempDir::new().unwrap();
+        let one_path = one_dir.path().join("c");
+        std::fs::create_dir_all(&one_path).unwrap();
+        let one = Collection::create("c", &one_path, cfg.clone()).unwrap();
+        for d in &docs {
+            one.insert(d.id.clone(), d.content.clone(), d.embedding.clone(), None)
+                .unwrap();
+        }
+
+        // Bulk.
+        let many_dir = TempDir::new().unwrap();
+        let many_path = many_dir.path().join("c");
+        std::fs::create_dir_all(&many_path).unwrap();
+        {
+            let many = Collection::create("c", &many_path, cfg.clone()).unwrap();
+            many.insert_many(docs.clone()).unwrap();
+            assert_eq!(many.len(), docs.len());
+
+            for d in &docs {
+                assert_eq!(
+                    many.get(&d.id).unwrap().map(|g| g.content),
+                    Some(d.content.clone()),
+                    "{} should be retrievable by id",
+                    d.id
+                );
+                let bulk = many.search(&d.embedding, 1, None).unwrap();
+                let seq = one.search(&d.embedding, 1, None).unwrap();
+                assert_eq!(
+                    bulk.first().map(|h| &h.id),
+                    seq.first().map(|h| &h.id),
+                    "{} : bulk and sequential must agree on the nearest neighbour",
+                    d.id
+                );
+            }
+        }
+
+        // Durability: the WAL must carry it, so a reopen sees everything.
+        let reopened = Collection::open("c", &many_path, cfg).unwrap();
+        assert_eq!(reopened.len(), docs.len(), "bulk insert must be durable");
+        for d in &docs {
+            assert_eq!(
+                reopened
+                    .search(&d.embedding, 1, None)
+                    .unwrap()
+                    .first()
+                    .map(|h| h.id.clone()),
+                Some(d.id.clone()),
+                "{} should retrieve itself after reopen",
+                d.id
+            );
+        }
+    }
+
+    /// A quantized collection must stage in F32, fit on demand, keep serving
+    /// correctly across the transition, and still accept writes afterwards.
+    ///
+    /// The last part is the one worth asserting: the whole reason db was F32-only
+    /// was that a quantizer cannot encode before its codebook exists. Fitting is
+    /// only useful if inserts keep working *after* it.
+    #[test]
+    fn a_quantized_collection_stages_then_fits_and_still_accepts_writes() {
+        use foxstash_core::index::Storage;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 0, // fit explicitly, so the test controls the transition
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+
+        // Deterministic dense pseudo-random. NOT modular arithmetic: a first pass
+        // used `(i*31 + k*17) % 61`, which makes i and i+61 produce IDENTICAL
+        // vectors — d99 and d38 collided and the test failed in staging, before
+        // quantization was even involved. Under a magnitude-invariant metric
+        // (Cosine, the default) proportional vectors are indistinguishable too, so
+        // any fixture with structure risks ties. Use noise.
+        let vector = |i: usize| -> Vec<f32> {
+            let mut state = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..8)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+
+        let c = Collection::create("c", &path, cfg).unwrap();
+        for i in 0..200 {
+            c.insert(format!("d{i}"), format!("content {i}"), vector(i), None)
+                .unwrap();
+        }
+
+        // Staging: inserts worked at all, which they could not have under the old
+        // blanket rejection.
+        assert_eq!(c.len(), 200);
+        for i in [0usize, 99, 199] {
+            let hits = c.search(&vector(i), 1, None).unwrap();
+            assert_eq!(
+                hits[0].id,
+                format!("d{i}"),
+                "staging: d{i} should find itself"
+            );
+        }
+
+        c.fit().unwrap();
+
+        // Fitted: still correct, and still writable — quantized search is lossy, so
+        // check membership in the top-k rather than demanding rank 1.
+        for i in [0usize, 99, 199] {
+            let hits = c.search(&vector(i), 5, None).unwrap();
+            assert!(
+                hits.iter().any(|h| h.id == format!("d{i}")),
+                "fitted: d{i} should be in its own top-5, got {:?}",
+                hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+            );
+        }
+
+        c.insert("post-fit".into(), "after".into(), vector(500), None)
+            .unwrap();
+        assert_eq!(c.len(), 201, "inserts must work after fitting");
+        let hits = c.search(&vector(500), 5, None).unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "post-fit"),
+            "a document inserted after fitting must be searchable"
+        );
+
+        // fit() is idempotent.
+        c.fit().unwrap();
+        assert_eq!(c.len(), 201);
+    }
+
+    /// Warren is bulk-build-only — it retains no f32, so no amount of staging lets
+    /// it accept incremental inserts. It must still be refused up front.
+    #[test]
+    fn warren_storage_is_still_rejected_for_collections() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: foxstash_core::index::Storage::Warren,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+        assert!(Collection::create("c", &path, cfg).is_err());
+    }
+
+    #[test]
+    fn a_fitted_collection_survives_reopen() {
+        use foxstash_core::index::Storage;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 0,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+        let vector = |i: usize| -> Vec<f32> {
+            let mut st = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..8)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((st >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+        {
+            let c = Collection::create("c", &path, cfg.clone()).unwrap();
+            for i in 0..200 {
+                c.insert(format!("d{i}"), format!("c{i}"), vector(i), None)
+                    .unwrap();
+            }
+            c.fit().unwrap();
+            c.compact().unwrap(); // forces a checkpoint + graph snapshot of the FITTED index
+        }
+        let re = Collection::open("c", &path, cfg).unwrap();
+        assert_eq!(re.len(), 200, "document count after reopen");
+        let mut found = 0;
+        for i in 0..200 {
+            if re
+                .search(&vector(i), 5, None)
+                .unwrap()
+                .iter()
+                .any(|h| h.id == format!("d{i}"))
+            {
+                found += 1;
+            }
+        }
+        assert!(
+            found >= 190,
+            "only {found}/200 documents retrieved themselves after reopen"
+        );
+        re.insert("post".into(), "x".into(), vector(999), None)
+            .unwrap();
+        assert_eq!(re.len(), 201, "must still accept writes after reopen");
+    }
+
+    #[test]
+    fn auto_fit_triggers_from_insert_without_deadlocking() {
+        use foxstash_core::index::Storage;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        // Threshold LOW so a plain insert crosses it — the default code path.
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 50,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+        let vector = |i: usize| -> Vec<f32> {
+            let mut st = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..8)
+                .map(|_| {
+                    st = st
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((st >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+        let c = Collection::create("c", &path, cfg).unwrap();
+        for i in 0..60 {
+            c.insert(format!("d{i}"), format!("c{i}"), vector(i), None)
+                .unwrap();
+        }
+        assert_eq!(c.len(), 60);
+    }
+
+    /// Auto-fit under concurrent writers.
+    ///
+    /// `fit` swaps the whole index while other threads are inserting, and it is
+    /// reached from inside `insert` while the mutation lock is held. That is the
+    /// shape that produced a self-deadlock, so this exercises it under contention
+    /// rather than from a single thread with auto-fit disabled — which is how the
+    /// deadlock survived its first test.
+    #[test]
+    fn auto_fit_under_concurrent_writers_loses_nothing() {
+        use foxstash_core::index::Storage;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let hnsw = foxstash_core::index::HNSWConfig {
+            storage: Storage::SQ8,
+            ..Default::default()
+        };
+        let cfg = DbConfig {
+            hnsw,
+            fit_threshold: 40,
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(8);
+
+        let col = Arc::new(Collection::create("c", &path, cfg).unwrap());
+        let threads = 4usize;
+        let per_thread = 40usize;
+        let start = Arc::new(Barrier::new(threads + 1));
+        let mut handles = Vec::new();
+
+        for t in 0..threads {
+            let col = Arc::clone(&col);
+            let start = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                start.wait();
+                for i in 0..per_thread {
+                    let seed = (t * per_thread + i) as u64;
+                    let mut st = seed.wrapping_mul(6_364_136_223_846_793_005) + 1;
+                    let v: Vec<f32> = (0..8)
+                        .map(|_| {
+                            st = st
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407);
+                            ((st >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                        })
+                        .collect();
+                    col.insert(format!("t{t}-{i}"), format!("c{t}{i}"), v, None)
+                        .unwrap();
+                }
+            }));
+        }
+
+        // A concurrent reader, to catch a search racing the index swap.
+        let reader = {
+            let col = Arc::clone(&col);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                for _ in 0..200 {
+                    let _ = col.search(&[0.1; 8], 5, None);
+                    let _ = col.len();
+                }
+            })
+        };
+
+        for h in handles {
+            h.join().expect("writer panicked or deadlocked");
+        }
+        reader.join().expect("reader panicked");
+
+        assert_eq!(
+            col.len(),
+            threads * per_thread,
+            "every concurrent write must survive the fit"
+        );
+        for t in 0..threads {
+            for i in 0..per_thread {
+                assert!(
+                    col.get(&format!("t{t}-{i}")).unwrap().is_some(),
+                    "lost t{t}-{i} across the fit"
+                );
+            }
+        }
+    }
+
+    /// The `documents` / `id_map` positional invariant, under a mixed workload.
+    ///
+    /// `IdMap` maintains its own `next_pos` counter with no structural link to
+    /// `documents.len()`; four separate write paths (insert, insert_many, compact,
+    /// recovery) each have to remember to advance both in lockstep. Nothing
+    /// enforces it, so this asserts it — after every phase, and especially after
+    /// re-inserts and deletes, which are where a position can be assigned without
+    /// a matching document.
+    #[test]
+    fn document_and_id_map_positions_stay_in_lockstep() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(4)).unwrap();
+
+        let check = |phase: &str| {
+            let inner = col.inner.read();
+            assert_eq!(
+                inner.documents.len(),
+                inner.id_map.next_pos_for_test(),
+                "{phase}: documents.len() and id_map's next position diverged"
+            );
+            for id in inner.id_map.live_ids() {
+                let pos = inner
+                    .id_map
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{phase}: live id {id} has no position"));
+                let doc = inner.documents.get(pos).unwrap_or_else(|| {
+                    panic!(
+                        "{phase}: id {id} points at position {pos}, out of {} documents",
+                        inner.documents.len()
+                    )
+                });
+                assert_eq!(
+                    doc.id, *id,
+                    "{phase}: id {id} maps to position {pos}, which holds {}",
+                    doc.id
+                );
+            }
+        };
+
+        for i in 0..30 {
+            col.insert(
+                format!("d{i}"),
+                format!("c{i}"),
+                vec![i as f32, 0.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+        check("after inserts");
+
+        // Re-insert existing ids: tombstones the old position and assigns a new one.
+        for i in 0..10 {
+            col.insert(
+                format!("d{i}"),
+                format!("v2-{i}"),
+                vec![i as f32, 1.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+        check("after re-inserts");
+
+        for i in 20..30 {
+            col.delete(&format!("d{i}")).unwrap();
+        }
+        check("after deletes");
+
+        for i in 30..40 {
+            col.insert(
+                format!("d{i}"),
+                format!("c{i}"),
+                vec![i as f32, 0.0, 0.0, 0.0],
+                None,
+            )
+            .unwrap();
+        }
+        check("after inserting past the deletes");
+
+        col.compact().unwrap();
+        check("after compaction");
+
+        // And the content must be the LATEST version, not a resurrected old one.
+        for i in 0..10 {
+            assert_eq!(
+                col.get(&format!("d{i}")).unwrap().map(|d| d.content),
+                Some(format!("v2-{i}")),
+                "d{i} should hold its re-inserted content"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_insert_does_not_break_reopen() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(4)).unwrap();
+        col.insert("good".into(), "c".into(), vec![1.0, 2.0, 3.0, 4.0], None)
+            .unwrap();
+        // Right dimension, but not finite — db validates dim, core rejects NaN.
+        let bad = col.insert(
+            "bad".into(),
+            "c".into(),
+            vec![f32::NAN, 0.0, 0.0, 0.0],
+            None,
+        );
+        assert!(bad.is_err(), "a non-finite embedding must be rejected");
+        col.flush().unwrap();
+        drop(col);
+        let re = Collection::open("test", dir.path(), cfg(4))
+            .expect("a rejected insert must not make the collection unopenable");
+        assert!(
+            re.get("good").unwrap().is_some(),
+            "the good document must survive"
+        );
+        assert!(
+            re.get("bad").unwrap().is_none(),
+            "the rejected one must not appear"
+        );
+    }
+
+    #[test]
+    fn a_rejected_batch_does_not_half_apply_or_break_reopen() {
+        let dir = TempDir::new().unwrap();
+        let col = Collection::create("test", dir.path(), cfg(4)).unwrap();
+        let mut batch: Vec<Document> = (0..10)
+            .map(|i| Document {
+                id: format!("d{i}"),
+                content: format!("c{i}"),
+                embedding: vec![i as f32, 1.0, 2.0, 3.0],
+                metadata: None,
+            })
+            .collect();
+        // One bad document, in the middle.
+        batch[5].embedding = vec![f32::INFINITY, 0.0, 0.0, 0.0];
+
+        assert!(
+            col.insert_many(batch).is_err(),
+            "the batch must be rejected"
+        );
+        assert_eq!(col.len(), 0, "a rejected batch must not half-apply");
+        col.flush().unwrap();
+        drop(col);
+        Collection::open("test", dir.path(), cfg(4))
+            .expect("a rejected batch must not make the collection unopenable");
+    }
+
+    /// Graph snapshots must not accumulate. Core prunes its own checkpoints but
+    /// knows nothing about these files; without pruning, each checkpoint leaves a
+    /// full copy of the graph behind. At 100k x 768 that is ~600 MiB apiece.
+    #[test]
+    fn graph_snapshots_do_not_accumulate_across_checkpoints() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let cfg = DbConfig {
+            storage: IncrementalConfig::default()
+                .with_checkpoint_threshold(1)
+                .with_keep_checkpoints(2),
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(4);
+
+        let col = Collection::create("c", &path, cfg).unwrap();
+        let count = || {
+            std::fs::read_dir(&path)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("snapshot"))
+                .count()
+        };
+
+        for i in 0..12 {
+            col.insert(
+                format!("d{i}"),
+                format!("c{i}"),
+                vec![i as f32, 1.0, 2.0, 3.0],
+                None,
+            )
+            .unwrap();
+            col.compact().unwrap(); // each compaction checkpoints, so each writes a snapshot
+        }
+
+        let n = count();
+        assert!(
+            n <= 3,
+            "graph snapshots accumulated: {n} present after 12 checkpoints with \
+             keep_checkpoints=2 — each is a full copy of the graph"
+        );
+        // And the collection must still open from whatever survived.
+        drop(col);
+        let re = Collection::open("c", &path, DbConfig::default().with_embedding_dim(4)).unwrap();
+        assert_eq!(
+            re.len(),
+            12,
+            "pruning must not remove the snapshot recovery needs"
+        );
     }
 
     #[test]
