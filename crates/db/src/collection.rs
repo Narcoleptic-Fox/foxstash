@@ -775,6 +775,36 @@ impl Collection {
     /// `Warren` is different and still refused: it retains no f32 at all, so core's
     /// incremental `add()` cannot compute the exact distances edge selection needs.
     /// It is a bulk-build-only mode, and no amount of staging changes that.
+    ///
+    /// # Why it stays refused, reviewed 2026-07-27
+    ///
+    /// This was reconsidered deliberately, because the case for lifting it is real: on a
+    /// 45k × 768-d embedding corpus Warren reaches **99.99% recall in 37 MB where F32 needs
+    /// 158 MB** — the best memory/recall point in the enum, unavailable to the layer most
+    /// users actually touch.
+    ///
+    /// And it is *mechanically* within reach. [`Self::fit_locked`] already does a full
+    /// `build_parallel_from_documents` rebuild, which is exactly the bulk build Warren needs,
+    /// and core rejects `add()` on a Warren index explicitly rather than degrading quietly. So
+    /// the shape would be a collection that ingests normally, fits, and is **sealed** to further
+    /// inserts.
+    ///
+    /// Refused anyway, for two reasons:
+    ///
+    /// 1. **Warren's rerank is currently broken under `DistanceMetric::L2` on vectors that are
+    ///    not unit-norm** — it clamps every candidate to distance 0 and returns score 1.0 for
+    ///    every result (see `warren_rerank_works_under_l2_on_unnormalized_vectors` in core).
+    ///    Widening access to a mode whose accuracy stage silently vanishes on a whole
+    ///    metric/scale combination enlarges the blast radius of a known defect.
+    /// 2. A sealed-after-fit collection is a **new lifecycle state**, and every path that
+    ///    mutates — `insert`, `delete`, `compact`, WAL replay — would have to agree about it.
+    ///    Bolting that on immediately after the db redesign is the same "I needed it, so it went
+    ///    in" move the redesign existed to undo.
+    ///
+    /// Revisit when the L2 rerank is fixed **and** a read-only/sealed collection is a designed
+    /// concept rather than a special case for one storage mode. Until then, callers who want
+    /// Warren's memory profile should build the index through `foxstash-core` directly, where
+    /// bulk-build-only is the documented contract rather than a surprise.
     fn reject_incremental_quantized_storage(config: &DbConfig) -> Result<()> {
         if config.hnsw.storage == foxstash_core::index::Storage::Warren {
             return Err(DbError::UnsupportedIncrementalStorage {

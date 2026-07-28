@@ -64,6 +64,33 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Mutation testing (`cargo mutants --profile mutants`).
+#
+# A mutation run rebuilds and re-tests the crate once per mutant — order 10^3 times — so the
+# cost that matters is `build + test` per iteration, not the speed of either alone.
+#
+# `release` is the wrong profile for that: `lto = true` with `codegen-units = 1` makes the whole
+# crate a single codegen unit, which is what you want for a benchmark and exactly what you do not
+# want when the same crate is recompiled a thousand times. Measured on this workspace, dropping
+# both takes a `foxstash-core` rebuild from 24.1 s to 14.1 s.
+#
+# `opt-level` turned out NOT to be a lever, which is worth recording so nobody re-tunes it hoping
+# otherwise. Measured `build + test` per iteration: opt 1 ≈ 18.3 s, opt 2 ≈ 17.2 s, opt 3 ≈ 17.4 s
+# — a ~1 s spread, i.e. noise. The expectation was that lowering it would trade build time for
+# test time (these tests build HNSW graphs and run recall sweeps, so they are compute-bound); in
+# practice neither side moved much and linking dominates. 2 is kept as the unremarkable middle,
+# not as a tuned value.
+#
+# `debug-assertions` stays ON. A mutant that trips an overflow check or a debug invariant is a
+# mutant the suite caught, and catching it in a cheap assertion beats catching it in a slow test.
+[profile.mutants]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+debug-assertions = true
+strip = false
+
 [profile.release-wasm]
 inherits = "release"
 opt-level = "z"     # Optimize for size
