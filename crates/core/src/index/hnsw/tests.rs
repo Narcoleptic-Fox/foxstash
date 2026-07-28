@@ -4353,3 +4353,202 @@ fn memory_breakdown_payload_and_links_track_their_inputs() {
         mb.upper_layer_links
     );
 }
+
+/// The multi-bit modes must encode correctly through the **sequential** builder too.
+///
+/// `push_node` and `convert_parallel_to_index` are two implementations of the same encoding,
+/// and every multi-bit test in this file went through the parallel one. That left the nibble
+/// packing in `push_node` — `nib[i / 2] |= c << (4 * (i % 2))`, written once per mode —
+/// completely unexercised for `TurboQuant` and `TurboRabit`: mutation testing could replace
+/// the `%` with `+` in all three copies and nothing failed.
+///
+/// This is the shape the repo keeps rediscovering. `storage_pareto` swept three of six
+/// variants; the existing sequential smoke test above sweeps `SQ8` and `RaBitQ` and stops;
+/// `BuildStrategy::Sequential` once panicked on every input for a release while 247 tests
+/// passed. A second copy of one idea, with only the first copy tested.
+///
+/// `Storage::Warren` is absent deliberately — it is bulk-build-only, since sequential edge
+/// selection needs exact f32 distances it does not retain. That it *refuses* rather than
+/// silently building a bad graph is asserted separately below.
+#[test]
+#[allow(deprecated)] // TurboQuant is deprecated but still public, so it still must work.
+fn multibit_storage_encodes_the_same_through_both_builders() {
+    let (base, queries) = rerank_fixture(32);
+    for storage in [Storage::TurboQuant, Storage::TurboRabit] {
+        let recall_of = |build_strategy| {
+            let index = HNSWIndex::build(
+                base.clone(),
+                HNSWConfig {
+                    metric: DistanceMetric::Cosine,
+                    m: 8,
+                    m0: 16,
+                    ef_construction: 60,
+                    ef_search: 60,
+                    storage,
+                    rabit_bits: 4,
+                    turbo_bits: 2,
+                    rerank_candidates: 50,
+                    seed: Some(4),
+                    build_strategy,
+                    ..Default::default()
+                },
+            );
+            recall_against_exact(&index, &base, &queries, 10)
+        };
+        let seq = recall_of(BuildStrategy::Sequential);
+        let par = recall_of(BuildStrategy::Parallel);
+
+        // Absolute floor first: a broken nibble pack does not degrade gracefully, it destroys
+        // the code. Then agreement, because the two builders encode the same vectors and only
+        // their graphs differ.
+        assert!(
+            seq > 0.5,
+            "{storage:?} via BuildStrategy::Sequential recalls {seq:.4} — the sequential \
+             encode path (push_node) is broken"
+        );
+        assert!(
+            (seq - par).abs() < 0.15,
+            "{storage:?} encodes differently in the two builders: sequential {seq:.4} vs \
+             parallel {par:.4}"
+        );
+    }
+}
+
+/// `Storage::Warren` refuses the sequential builder rather than building a bad graph.
+///
+/// Warren retains no f32, and sequential insertion selects edges with exact distances. The
+/// failure must be loud; a silently worse graph is the outcome this asserts against.
+#[test]
+#[should_panic]
+fn warren_rejects_the_sequential_builder() {
+    let (base, _) = rerank_fixture(32);
+    let _ = HNSWIndex::build(
+        base,
+        HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 8,
+            m0: 16,
+            ef_construction: 60,
+            storage: Storage::Warren,
+            rabit_bits: 4,
+            rerank_candidates: 50,
+            seed: Some(4),
+            build_strategy: BuildStrategy::Sequential,
+            ..Default::default()
+        },
+    );
+}
+
+/// Requantizing F32 -> Warren must produce a working index.
+///
+/// This is the only route that reaches `push_node`'s Warren arm — the mode cannot be built
+/// sequentially and rejects `add()`, so its nibble packing and its **two-level 8-bit residual
+/// quantizer** (`step = (hi - lo) / 255.0`, then a second level over the remainder) were
+/// reachable in production via `requantize` and reachable by no test at all. It is also the
+/// path `foxstash-db` uses when a collection fits.
+#[test]
+fn requantize_f32_to_warren_produces_a_working_index() {
+    let (base, queries) = rerank_fixture(32);
+    let shared = |storage, rerank| HNSWConfig {
+        metric: DistanceMetric::Cosine,
+        m: 8,
+        m0: 16,
+        ef_construction: 60,
+        ef_search: 60,
+        storage,
+        rabit_bits: 4,
+        rerank_candidates: rerank,
+        seed: Some(4),
+        ..Default::default()
+    };
+    let f32_index = HNSWIndex::build_parallel(base.clone(), shared(Storage::F32, 0));
+    let exact = recall_against_exact(&f32_index, &base, &queries, 10);
+
+    let warren = f32_index
+        .requantize(shared(Storage::Warren, 50))
+        .expect("F32 -> Warren is a legal requantization");
+    assert!(
+        warren.full.is_empty(),
+        "Warren must retain no f32 after requantize"
+    );
+    assert_eq!(
+        warren.len(),
+        f32_index.len(),
+        "requantize must keep every node"
+    );
+
+    // Tight on purpose. On this fixture both score 1.0000, so a 0.15 slack — the first bar
+    // written here — left every mutant in the two-level residual quantizer alive: the 4-bit
+    // walk alone still retrieves well enough to clear a loose bar, and the residual is a
+    // refinement on top of it. A bar set from what the code actually achieves is the only one
+    // that can see the refinement break.
+    let got = recall_against_exact(&warren, &base, &queries, 10);
+    assert!(
+        got >= 0.98 && exact - got < 0.02,
+        "requantized Warren recalls {got:.4} against F32's {exact:.4} — the two-level 8-bit \
+         residual encode path is losing precision"
+    );
+}
+
+/// `requantize` refuses every graph-defining change, not just the first one checked.
+///
+/// The guard is a four-way `||` chain over `m`, `m0`, `metric` and `ef_construction`. A test
+/// that varies one field leaves the other three arms unexercised, and mutation testing showed
+/// exactly that: the `||`s could be flipped to `&&` — turning "reject if any differs" into
+/// "reject only if all differ" — with nothing failing.
+#[test]
+fn requantize_rejects_every_incompatible_config_field() {
+    let (base, _) = rerank_fixture(32);
+    let base_cfg = |storage| HNSWConfig {
+        metric: DistanceMetric::Cosine,
+        m: 8,
+        m0: 16,
+        ef_construction: 60,
+        storage,
+        rabit_bits: 4,
+        rerank_candidates: 50,
+        seed: Some(4),
+        ..Default::default()
+    };
+    let index = HNSWIndex::build_parallel(base, base_cfg(Storage::F32));
+
+    // Sanity: the unmodified target is accepted, so the rejections below are attributable to
+    // the field changed and not to some unrelated incompatibility.
+    assert!(index.requantize(base_cfg(Storage::SQ8)).is_ok());
+
+    for (label, cfg) in [
+        (
+            "m",
+            HNSWConfig {
+                m: 12,
+                ..base_cfg(Storage::SQ8)
+            },
+        ),
+        (
+            "m0",
+            HNSWConfig {
+                m0: 32,
+                ..base_cfg(Storage::SQ8)
+            },
+        ),
+        (
+            "metric",
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                ..base_cfg(Storage::SQ8)
+            },
+        ),
+        (
+            "ef_construction",
+            HNSWConfig {
+                ef_construction: 120,
+                ..base_cfg(Storage::SQ8)
+            },
+        ),
+    ] {
+        assert!(
+            index.requantize(cfg).is_err(),
+            "requantize accepted a changed `{label}` — the graph was not built under it"
+        );
+    }
+}
