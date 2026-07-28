@@ -60,6 +60,23 @@ pub mod sift {
             queries: 1_000,
             dim: 960,
         },
+        // The first dataset here that is an actual neural embedding. SIFT and GIST are
+        // image descriptors, and this project's own quantizer findings say that is the
+        // distinction that matters: nomic-768 scores RaBitQ 0.53 while distilroberta-768
+        // scores 0.9993 — same dimension, same metric, only the embedder differs. So
+        // accuracy is a property of the distribution and dimension is only a cost, which
+        // means no number measured on SIFT or GIST predicts what a quantizer does to a
+        // user's embeddings.
+        //
+        // EmbeddingGemma-300M over permissively-licensed Rust documentation and library
+        // doc comments. Built by `benchmarks/python/build_text_dataset.py`; `manifest.json`
+        // beside the vectors records the embedder, prefix, source mix and licences.
+        Spec {
+            name: "rustdocs45k",
+            base: 45_000,
+            queries: 1_000,
+            dim: 768,
+        },
     ];
 
     /// A loaded ANN benchmark dataset with its shipped ground truth.
@@ -70,7 +87,16 @@ pub mod sift {
         /// Query vectors.
         pub queries: Vec<Vec<f32>>,
         /// `truth[q]` lists the exact nearest neighbours of `queries[q]`, nearest
-        /// first, as indices into `base`. Computed by exact L2 by the dataset authors.
+        /// first, as indices into `base`.
+        ///
+        /// For the SIFT and GIST sets this is exact L2, computed by the dataset
+        /// authors. For `rustdocs45k` it is exact cosine, computed locally by
+        /// `build_text_dataset.py` — which is the same ranking, because those vectors
+        /// are unit-norm and the builder fails rather than proceeding if they are not.
+        /// Harnesses may therefore score every dataset here under [`DistanceMetric::L2`]
+        /// without silently changing what "correct" means.
+        ///
+        /// [`DistanceMetric::L2`]: foxstash_core::index::hnsw::DistanceMetric::L2
         pub truth: Vec<Vec<usize>>,
     }
 
