@@ -5372,6 +5372,254 @@ mod tests {
         assert!(recall > 0.8, "Warren recall@10 = {:.3}", recall);
     }
 
+    /// Build a clustered corpus with signed, unit-normalizable coordinates.
+    ///
+    /// Shared by the two rerank-discrimination tests below so they differ only in the mode
+    /// under test.
+    fn rerank_fixture(dim: usize) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let mut rng = StdRng::seed_from_u64(77);
+        let (clusters, per) = (12usize, 80usize);
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| (0..dim).map(|_| rng.random::<f32>() - 0.5).collect())
+            .collect();
+        let base: Vec<Vec<f32>> = (0..clusters * per)
+            .map(|i| {
+                centers[i % clusters]
+                    .iter()
+                    .map(|x| x + (rng.random::<f32>() - 0.5) * 0.3)
+                    .collect()
+            })
+            .collect();
+        let queries = base.iter().take(60).cloned().collect();
+        (base, queries)
+    }
+
+    /// Recall@k of `index` against brute-force cosine ground truth over `base`.
+    fn recall_against_exact(
+        index: &HNSWIndex,
+        base: &[Vec<f32>],
+        queries: &[Vec<f32>],
+        k: usize,
+    ) -> f32 {
+        let mut total = 0.0;
+        for q in queries {
+            let got: HashSet<usize> = index
+                .search(q, k)
+                .expect("search")
+                .into_iter()
+                .filter_map(|r| r.id.parse::<usize>().ok())
+                .collect();
+            let mut exact: Vec<(f32, usize)> = base
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let d: f32 = v.iter().zip(q).map(|(a, b)| a * b).sum();
+                    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    (-d / n.max(1e-12), i)
+                })
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth: HashSet<usize> = exact.iter().take(k).map(|(_, i)| *i).collect();
+            total += truth.intersection(&got).count() as f32 / k as f32;
+        }
+        total / queries.len() as f32
+    }
+
+    /// The rerank stage must **change the answer**, not merely be configurable.
+    ///
+    /// # Why this is a differential test
+    ///
+    /// The obvious assertion — "recall is above some threshold" — cannot detect a dead rerank.
+    /// Warren scores 0.855 on sift10k with its residual stage doing *literally nothing* (recall
+    /// identical to three decimal places at `rerank_candidates` 0, 400 and 2000), and 0.9999 on
+    /// real 768-d embeddings with it working. Any fixed bar between those passes in both worlds,
+    /// so the original `recall > 0.8` here could never have caught the stage being inert.
+    ///
+    /// So: build **one** index, toggle only `rerank_candidates`, and require the two runs to
+    /// differ materially. Same graph, same codes, same queries — the rerank is the only variable,
+    /// which is what makes the gap attributable to it.
+    #[test]
+    fn warren_rerank_materially_improves_recall() {
+        let dim = 64;
+        let (base, queries) = rerank_fixture(dim);
+        let mut index = HNSWIndex::build_parallel(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 12,
+                m0: 24,
+                ef_construction: 100,
+                ef_search: 60,
+                storage: Storage::Warren,
+                rabit_bits: 4,
+                rerank_candidates: 100,
+                seed: Some(4),
+                ..Default::default()
+            },
+        );
+
+        index
+            .set_rerank_candidates(0)
+            .expect("lowering to 0 is always allowed");
+        let without = recall_against_exact(&index, &base, &queries, 10);
+        index
+            .set_rerank_candidates(100)
+            .expect("Warren reranks on its residual, not on f32");
+        let with = recall_against_exact(&index, &base, &queries, 10);
+
+        assert!(
+            with - without > 0.15,
+            "Warren's residual rerank changed recall by only {:.4} ({without:.4} -> {with:.4}). \
+             The knob is accepted but the stage is not affecting results — which is exactly how \
+             it behaves on non-unit-norm L2 data today.",
+            with - without
+        );
+
+        // A rerank that ran must also produce a real distance spread. Warren under L2 on
+        // unnormalized vectors returns `(2 - 2*inner_product).max(0)`, which clamps to 0 for
+        // every candidate and hands back score 1.0 ten times over — degenerate output that a
+        // recall check alone would not notice.
+        let scores: Vec<f32> = index
+            .search(&queries[0], 10)
+            .expect("search")
+            .iter()
+            .map(|r| r.score)
+            .collect();
+        let distinct = scores
+            .iter()
+            .map(|s| format!("{s:.6}"))
+            .collect::<HashSet<_>>()
+            .len();
+        assert!(
+            distinct > 5,
+            "reranked scores are degenerate: {distinct} distinct values in {scores:?}"
+        );
+    }
+
+    /// The same discrimination for `Storage::TurboRabit`, which reranks against retained f32.
+    ///
+    /// Kept separate from Warren rather than parameterized: the two reach their accuracy by
+    /// different mechanisms (exact f32 rescoring vs an 8-bit residual), so a shared test that
+    /// passed would not tell you *which* one still works.
+    #[test]
+    fn turborabit_rerank_materially_improves_recall() {
+        let dim = 64;
+        let (base, queries) = rerank_fixture(dim);
+        let mut index = HNSWIndex::build_parallel(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 12,
+                m0: 24,
+                ef_construction: 100,
+                ef_search: 60,
+                storage: Storage::TurboRabit,
+                rabit_bits: 4,
+                rerank_candidates: 100,
+                seed: Some(4),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !index.full.is_empty(),
+            "TurboRabit retains f32 to rerank against; without it this test proves nothing"
+        );
+
+        index.set_rerank_candidates(0).expect("lowering to 0");
+        let without = recall_against_exact(&index, &base, &queries, 10);
+        index.set_rerank_candidates(100).expect("raising back");
+        let with = recall_against_exact(&index, &base, &queries, 10);
+
+        assert!(
+            with - without > 0.15,
+            "TurboRabit's exact rerank changed recall by only {:.4} ({without:.4} -> {with:.4})",
+            with - without
+        );
+    }
+
+    /// Warren's rerank is silently inert under `DistanceMetric::L2` unless the vectors happen
+    /// to be unit-norm.
+    ///
+    /// # The defect
+    ///
+    /// The rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q-x‖²` **only when
+    /// `‖q‖ = ‖x‖ = 1`**. On vectors of any other scale `acc` is a large inner product, the
+    /// expression is negative for every candidate, and `.max(0.0)` flattens the entire pool to
+    /// distance 0. Every candidate ties, the re-sort carries no information, and the walk's
+    /// ordering survives untouched.
+    ///
+    /// Measured on sift10k (‖x‖ ≈ 500): recall is identical to four decimal places with the
+    /// rerank off and on, and a 10-result search returns **one distinct score, 1.0, ten times**.
+    /// Normalizing the same vectors restores a 0.028 gap, as does switching to
+    /// `DistanceMetric::Cosine` — which normalizes via `rabitq_cosine_input`.
+    ///
+    /// The walk does not have this bug: it computes `dtc² + ‖q-c‖² + f_rescale·(…)`, which is
+    /// norm-aware. Only the rerank took the unit-norm shortcut, so the two disagree about what
+    /// distance means on the same index.
+    ///
+    /// Ignored because it fails today and the fix is a real decision, not a typo: `‖x‖²` is not
+    /// in the node block. It can be recovered without a format change at the cost of ~3 extra
+    /// SIMD dots per candidate (`‖x‖² = dtc² + 2⟨c, x-c⟩ + ‖c‖²`, reusing the existing kernels
+    /// with `R·c` in place of `R·q`), or by storing it per node and bumping the snapshot format.
+    #[test]
+    #[ignore = "known defect: Warren's rerank assumes unit norm under L2; see the doc comment"]
+    fn warren_rerank_works_under_l2_on_unnormalized_vectors() {
+        let dim = 64;
+        let (base, queries) = rerank_fixture(dim);
+        // Scale well away from unit norm — the condition the rerank silently depends on.
+        let base: Vec<Vec<f32>> = base
+            .iter()
+            .map(|v| v.iter().map(|x| x * 100.0).collect())
+            .collect();
+        let queries: Vec<Vec<f32>> = queries
+            .iter()
+            .map(|v| v.iter().map(|x| x * 100.0).collect())
+            .collect();
+
+        let mut index = HNSWIndex::build_parallel(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::L2,
+                m: 12,
+                m0: 24,
+                ef_construction: 100,
+                ef_search: 60,
+                storage: Storage::Warren,
+                rabit_bits: 4,
+                rerank_candidates: 100,
+                seed: Some(4),
+                ..Default::default()
+            },
+        );
+
+        let scores: Vec<f32> = index
+            .search(&queries[0], 10)
+            .expect("search")
+            .iter()
+            .map(|r| r.score)
+            .collect();
+        let distinct = scores
+            .iter()
+            .map(|s| format!("{s:.6}"))
+            .collect::<HashSet<_>>()
+            .len();
+        assert!(
+            distinct > 5,
+            "Warren+L2 returned {distinct} distinct scores in {scores:?} — the rerank clamped \
+             every candidate to distance 0"
+        );
+
+        index.set_rerank_candidates(0).expect("lowering to 0");
+        let without = recall_against_exact(&index, &base, &queries, 10);
+        index.set_rerank_candidates(100).expect("raising back");
+        let with = recall_against_exact(&index, &base, &queries, 10);
+        assert!(
+            with - without > 0.15,
+            "Warren+L2 rerank changed recall by {:.4} on unnormalized vectors",
+            with - without
+        );
+    }
+
     /// `train()` on a non-empty index must refuse — retraining would desynchronize vectors
     /// already encoded under the old codebook.
     #[test]
