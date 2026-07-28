@@ -825,44 +825,64 @@ fn turborabit_rerank_materially_improves_recall() {
     );
 }
 
-/// Warren's rerank is silently inert under `DistanceMetric::L2` unless the vectors happen
-/// to be unit-norm.
+/// `Storage::Warren` + `DistanceMetric::L2` on non-unit vectors is refused, loudly.
 ///
-/// # The defect
+/// # What this is protecting against
 ///
-/// The rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q-x‖²` **only when
-/// `‖q‖ = ‖x‖ = 1`**. On vectors of any other scale `acc` is a large inner product, the
-/// expression is negative for every candidate, and `.max(0.0)` flattens the entire pool to
-/// distance 0. Every candidate ties, the re-sort carries no information, and the walk's
-/// ordering survives untouched.
+/// Warren's rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q-x‖²` **only when
+/// `‖q‖ = ‖x‖ = 1`**. At any other scale `acc` is a large inner product, the expression is
+/// negative for every candidate, and `.max(0.0)` flattens the pool to distance 0 — every
+/// candidate ties, the re-sort carries no information, and the walk's ordering survives.
 ///
-/// Measured on sift10k (‖x‖ ≈ 500): recall is identical to four decimal places with the
-/// rerank off and on, and a 10-result search returns **one distinct score, 1.0, ten times**.
-/// Normalizing the same vectors restores a 0.028 gap, as does switching to
-/// `DistanceMetric::Cosine` — which normalizes via `rabitq_cosine_input`.
+/// Measured on sift10k (‖x‖ ≈ 500) before the guard existed: recall identical to four decimals
+/// with the rerank off and on, and a 10-result search returning **one distinct score, 1.0, ten
+/// times**. A confident-looking wrong answer, with nothing to alert the caller.
 ///
-/// The walk does not have this bug: it computes `dtc² + ‖q-c‖² + f_rescale·(…)`, which is
-/// norm-aware. Only the rerank took the unit-norm shortcut, so the two disagree about what
-/// distance means on the same index.
-///
-/// Ignored because it fails today and the fix is a real decision, not a typo: `‖x‖²` is not
-/// in the node block. It can be recovered without a format change at the cost of ~3 extra
-/// SIMD dots per candidate (`‖x‖² = dtc² + 2⟨c, x-c⟩ + ‖c‖²`, reusing the existing kernels
-/// with `R·c` in place of `R·q`), or by storing it per node and bumping the snapshot format.
+/// The guard converts that into a panic. It is not the real fix — the rerank should be
+/// norm-aware like the walk already is — but it removes the silent-wrong-answer class.
 #[test]
-#[ignore = "known defect: Warren's rerank assumes unit norm under L2; see the doc comment"]
-fn warren_rerank_works_under_l2_on_unnormalized_vectors() {
+#[should_panic(expected = "requires unit-norm vectors")]
+fn warren_l2_on_unnormalized_vectors_is_rejected() {
     let dim = 64;
-    let (base, queries) = rerank_fixture(dim);
+    let (base, _) = rerank_fixture(dim);
     // Scale well away from unit norm — the condition the rerank silently depends on.
     let base: Vec<Vec<f32>> = base
         .iter()
         .map(|v| v.iter().map(|x| x * 100.0).collect())
         .collect();
-    let queries: Vec<Vec<f32>> = queries
-        .iter()
-        .map(|v| v.iter().map(|x| x * 100.0).collect())
-        .collect();
+    let _ = HNSWIndex::build_parallel(
+        base,
+        HNSWConfig {
+            metric: DistanceMetric::L2,
+            m: 12,
+            m0: 24,
+            ef_construction: 100,
+            storage: Storage::Warren,
+            rabit_bits: 4,
+            rerank_candidates: 100,
+            seed: Some(4),
+            ..Default::default()
+        },
+    );
+}
+
+/// The configuration the guard above leaves legal must actually work.
+///
+/// Rejecting the broken combination is only half a contract; without this, `Warren` + `L2`
+/// could be refused on non-unit input and quietly useless on unit input, and both halves
+/// would look fine. This is also the only test that exercises Warren's **L2 rerank arm** at
+/// all — every other Warren test runs under `Cosine`, which is a different branch. Mutation
+/// testing found all four mutants on that line surviving for exactly that reason.
+#[test]
+fn warren_rerank_works_under_l2_on_unit_norm_vectors() {
+    let dim = 64;
+    let (base, queries) = rerank_fixture(dim);
+    let unit = |v: &Vec<f32>| -> Vec<f32> {
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        v.iter().map(|x| x / n).collect()
+    };
+    let base: Vec<Vec<f32>> = base.iter().map(unit).collect();
+    let queries: Vec<Vec<f32>> = queries.iter().map(unit).collect();
 
     let mut index = HNSWIndex::build_parallel(
         base.clone(),
@@ -880,6 +900,18 @@ fn warren_rerank_works_under_l2_on_unnormalized_vectors() {
         },
     );
 
+    index.set_rerank_candidates(0).expect("lowering to 0");
+    let without = recall_against_exact(&index, &base, &queries, 10);
+    index.set_rerank_candidates(100).expect("raising back");
+    let with = recall_against_exact(&index, &base, &queries, 10);
+    assert!(
+        with - without > 0.15,
+        "Warren's L2 rerank changed recall by only {:.4} ({without:.4} -> {with:.4}) on \
+         unit-norm vectors, where its `2 - 2*<q,x>` arithmetic is exact",
+        with - without
+    );
+
+    // Unit-norm L2 distances live in [0, 4]; a clamped-to-zero pool would show one value.
     let scores: Vec<f32> = index
         .search(&queries[0], 10)
         .expect("search")
@@ -893,18 +925,7 @@ fn warren_rerank_works_under_l2_on_unnormalized_vectors() {
         .len();
     assert!(
         distinct > 5,
-        "Warren+L2 returned {distinct} distinct scores in {scores:?} — the rerank clamped \
-             every candidate to distance 0"
-    );
-
-    index.set_rerank_candidates(0).expect("lowering to 0");
-    let without = recall_against_exact(&index, &base, &queries, 10);
-    index.set_rerank_candidates(100).expect("raising back");
-    let with = recall_against_exact(&index, &base, &queries, 10);
-    assert!(
-        with - without > 0.15,
-        "Warren+L2 rerank changed recall by {:.4} on unnormalized vectors",
-        with - without
+        "reranked L2 scores are degenerate: {distinct} distinct in {scores:?}"
     );
 }
 

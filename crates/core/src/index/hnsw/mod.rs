@@ -3105,6 +3105,54 @@ impl HNSWIndex {
     /// rather than assuming one, and is correct whether or not reordering runs.
     ///
     /// Returns an empty index for an empty input (`build_parallel` panics there).
+    /// Refuse `Storage::Warren` + `DistanceMetric::L2` on vectors that are not unit-norm.
+    ///
+    /// # Why this is a hard failure rather than a caveat
+    ///
+    /// Warren's rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q−x‖²` **only**
+    /// when `‖q‖ = ‖x‖ = 1`. At any other scale `acc` is a large inner product, the expression
+    /// is negative for every candidate, and `.max(0.0)` flattens the whole pool to distance 0.
+    /// Every candidate ties, the re-sort carries no information, and the walk's ordering
+    /// survives untouched.
+    ///
+    /// Nothing about that is visible to a caller. Measured on sift10k (`‖x‖ ≈ 500`): recall is
+    /// identical to four decimals with the rerank off and on, and a 10-result search comes back
+    /// with **one distinct score, `1.0`, ten times**. A wrong answer that looks like a confident
+    /// one is the worst shape a bug can take, so it is converted into a refusal here.
+    ///
+    /// This is a guard, not the fix. The rerank *should* be norm-aware like the walk already is
+    /// (`dtc² + ‖q−c‖² + f_rescale·(…)`); doing that needs `‖x‖²`, which is not in the node
+    /// block. Until then this narrows Warren's contract to the configurations where its
+    /// arithmetic actually holds — which includes `DistanceMetric::Cosine`, whose query is
+    /// normalized by `rabitq_cosine_input`, and is the default metric.
+    ///
+    /// Panics rather than returning `Result` because `build_parallel` is infallible by
+    /// signature and already asserts on empty input; this is the same class of caller error.
+    fn reject_warren_l2_without_unit_norm(embeddings: &[Vec<f32>], config: &HNSWConfig) {
+        if config.storage != Storage::Warren || config.metric != DistanceMetric::L2 {
+            return;
+        }
+        // Tolerance is loose on purpose: the failure mode is `‖x‖` off by orders of magnitude,
+        // not by rounding. Anything genuinely normalized clears 1e-3 comfortably.
+        let offender = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, v.iter().map(|x| x * x).sum::<f32>().sqrt()))
+            .find(|(_, norm)| (norm - 1.0).abs() > 1e-3);
+        if let Some((i, norm)) = offender {
+            panic!(
+                "Storage::Warren with DistanceMetric::L2 requires unit-norm vectors, but \
+                 embeddings[{i}] has norm {norm:.4}.\n\
+                 Warren's residual rerank rescores with `2 - 2*<q,x>`, which is the squared L2 \
+                 distance only for unit vectors; at this scale it clamps every candidate to \
+                 distance 0, silently disabling reranking and returning score 1.0 for every \
+                 result.\n\
+                 Fix by normalizing the vectors, or by using DistanceMetric::Cosine (the \
+                 default), which normalizes internally."
+            );
+        }
+    }
+
     pub fn build_parallel_from_documents(documents: Vec<Document>, config: HNSWConfig) -> Self {
         if documents.is_empty() {
             return Self::new(0, config);
@@ -3138,6 +3186,7 @@ impl HNSWIndex {
 
     pub fn build_parallel(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         assert!(!embeddings.is_empty(), "Cannot build from empty embeddings");
+        Self::reject_warren_l2_without_unit_norm(&embeddings, &config);
         let embedding_dim = embeddings[0].len();
         let n = embeddings.len();
 
