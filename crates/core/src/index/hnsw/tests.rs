@@ -4130,3 +4130,226 @@ fn rerank_candidates_nonzero_beats_zero_on_the_same_index() {
              silently ignored, exactly the shape of the historical PQHNSWConfig bug."
     );
 }
+
+/// Build a small clustered corpus with an explicit content length, for the payload test.
+fn memory_fixture(n: usize, dim: usize, content_len: usize) -> Vec<Document> {
+    let mut rng = StdRng::seed_from_u64(9);
+    (0..n)
+        .map(|i| Document {
+            id: format!("doc-{i}"),
+            content: "x".repeat(content_len),
+            embedding: (0..dim).map(|_| rng.random::<f32>() - 0.5).collect(),
+            metadata: None,
+        })
+        .collect()
+}
+
+/// `memory_breakdown`'s logical split must exactly partition the memory actually held.
+///
+/// # Why this test exists, and why it is not a restatement of the implementation
+///
+/// `memory_breakdown` had **zero** test coverage. Mutation testing put 26 surviving mutants in
+/// it — across all twelve of its lines — meaning its arithmetic could be changed arbitrarily
+/// and nothing in the suite would notice. That matters beyond tidiness: it is the function
+/// behind every memory figure this project quotes, including `storage_pareto`'s memory column
+/// (`index.memory_breakdown().total()`) and the claim that `Storage::Warren` reaches F32 recall
+/// at a fraction of F32's memory. Those numbers were being reported off an unverified
+/// computation.
+///
+/// The temptation with an accounting function is to re-derive its formula in the test, which
+/// only proves the formula equals itself. Instead this asserts a property the implementation
+/// never states: **the logical split must reconcile with the physical allocations.**
+/// `embeddings`/`norms`/`layer0_links` are three names for one arena, so once the cold rerank
+/// array is separated out they must sum to exactly `nodes.capacity()`. A partition that does
+/// not add up is wrong no matter how it was computed.
+#[test]
+fn memory_breakdown_partitions_the_arena_exactly() {
+    for storage in [
+        Storage::F32,
+        Storage::SQ8,
+        Storage::TurboRabit,
+        Storage::Warren,
+    ] {
+        let dim = 64;
+        let docs = memory_fixture(400, dim, 16);
+        let index = HNSWIndex::build_parallel_from_documents(
+            docs,
+            HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 8,
+                m0: 16,
+                ef_construction: 60,
+                storage,
+                rabit_bits: 4,
+                rerank_candidates: 50,
+                seed: Some(3),
+                ..Default::default()
+            },
+        );
+        let mb = index.memory_breakdown();
+        let arena = index.nodes.capacity() * std::mem::size_of::<u32>();
+        let cold = index.full.capacity() * std::mem::size_of::<f32>();
+
+        assert!(
+            mb.embeddings >= cold,
+            "{storage:?}: embeddings ({}) must include the cold rerank array ({cold})",
+            mb.embeddings
+        );
+        let hot = mb.embeddings - cold;
+        assert_eq!(
+            hot + mb.norms + mb.layer0_links,
+            arena,
+            "{storage:?}: the arena split does not add up — hot {hot} + norms {} + layer0 {} \
+             != nodes.capacity() {arena}",
+            mb.norms,
+            mb.layer0_links
+        );
+
+        // The hot half, derived through a different route than the implementation takes:
+        // `node_stride = node_hdr_len + vec_words`, so the vector share of each block is the
+        // stride minus its header. The implementation reads `vec_words` directly.
+        let n = index.len();
+        let stride = node_stride(
+            index.config.m0.min(M0_MAX),
+            dim,
+            storage,
+            index.config.quant_bits(),
+        );
+        let hdr = node_hdr_len(index.config.m0.min(M0_MAX));
+        assert_eq!(
+            hot,
+            n * (stride - hdr) * std::mem::size_of::<u32>(),
+            "{storage:?}: hot vector bytes disagree with the block layout"
+        );
+
+        assert_eq!(
+            mb.total(),
+            mb.embeddings + mb.norms + mb.layer0_links + mb.upper_layer_links + mb.payload,
+            "{storage:?}: total() is not the sum of its parts"
+        );
+        assert_eq!(
+            mb.norms,
+            n * std::mem::size_of::<f32>(),
+            "{storage:?}: one f32 norm per node"
+        );
+
+        // Warren retains no f32 at all — that is the entire point of the mode, and the
+        // memory claim made for it depends on this being true rather than assumed.
+        if storage == Storage::Warren {
+            assert_eq!(cold, 0, "Warren must retain no full-precision vectors");
+        }
+    }
+}
+
+/// `payload` must track the strings actually stored, and `upper_layer_links` the links.
+///
+/// Both are `Vec`/`String` capacity walks, where a mutated `+` into `*` inflates the number
+/// without changing its shape. They are checked two ways, because neither alone is enough:
+///
+/// - **differentially** — change one input, require the reported bytes to move by the amount
+///   that input implies. Catches a term that is not really being measured.
+/// - **absolutely, against tight bounds** — because a difference *cancels constant offsets*.
+///   A first version of this test only did the delta, and `s.capacity() + size_of::<String>()`
+///   mutated to `s.capacity() - size_of::<String>()` sailed through it: subtracting two indexes
+///   removes the constant either way. The bounds below come from independent quantities
+///   (`len()` for the floor, `capacity()` for the ceiling), so the real value sits in a narrow
+///   band that a changed operator leaves.
+///
+/// The delta also has to move the *right* input. Varying only content length left every mutant
+/// in the `ids` arm alive, because nothing in the test made ids differ.
+#[test]
+fn memory_breakdown_payload_and_links_track_their_inputs() {
+    let (n, dim, short, long) = (300usize, 32usize, 8usize, 108usize);
+    let cfg = || HNSWConfig {
+        metric: DistanceMetric::Cosine,
+        m: 8,
+        m0: 16,
+        ef_construction: 60,
+        seed: Some(5),
+        ..Default::default()
+    };
+    let a = HNSWIndex::build_parallel_from_documents(memory_fixture(n, dim, short), cfg());
+    let b = HNSWIndex::build_parallel_from_documents(memory_fixture(n, dim, long), cfg());
+
+    // Same corpus, same graph, contents 100 bytes longer each.
+    let grew = b.memory_breakdown().payload - a.memory_breakdown().payload;
+    let expected = n * (long - short);
+    assert!(
+        grew.abs_diff(expected) <= n,
+        "payload grew {grew} bytes for {n} documents that each gained {} bytes; \
+         expected about {expected}",
+        long - short
+    );
+
+    // The same delta on the OTHER string field. `ids` and `contents` are summed by two separate
+    // closures, so a corpus that only varies content length exercises exactly one of them and
+    // leaves the other unmeasured — which is how every mutant in the `ids` arm survived the
+    // first version of this test.
+    let mut longer_ids = memory_fixture(n, dim, short);
+    for doc in &mut longer_ids {
+        doc.id = format!("{}{}", doc.id, "y".repeat(100));
+    }
+    let c = HNSWIndex::build_parallel_from_documents(longer_ids, cfg());
+    let id_grew = c.memory_breakdown().payload - a.memory_breakdown().payload;
+    assert!(
+        id_grew.abs_diff(n * 100) <= n,
+        "payload grew {id_grew} bytes when {n} ids each gained 100 bytes"
+    );
+
+    // Absolute bounds on payload. Floor: the bytes the strings actually hold, with no
+    // per-`String` overhead counted at all. Ceiling: their allocated capacity plus one header
+    // each. The true value must sit between, which a flipped operator does not.
+    let mb = a.memory_breakdown();
+    let hdr = std::mem::size_of::<String>();
+    let bytes: usize = a.ids.iter().chain(a.contents.iter()).map(|s| s.len()).sum();
+    let caps: usize = a
+        .ids
+        .iter()
+        .chain(a.contents.iter())
+        .map(|s| s.capacity())
+        .sum();
+    let strings = a.ids.len() + a.contents.len();
+    // Strictly greater than raw capacity, because every `String` carries a header that is real
+    // memory. That strictness is load-bearing: `s.capacity() + size_of::<String>()` mutated to
+    // `-` makes each term underflow (capacity here is 8, the header 24), and summing 300 of
+    // those wraps back around to a small, entirely plausible number — which happened to equal
+    // `caps` exactly and sat inside a `>=` band unnoticed. A differential cannot see it either,
+    // since the constant cancels in a subtraction.
+    assert!(
+        mb.payload > caps && mb.payload <= caps + strings * hdr,
+        "payload {} outside ({caps}, {}] for {strings} strings holding {bytes} bytes in \
+         {caps} bytes of capacity",
+        mb.payload,
+        caps + strings * hdr
+    );
+
+    // Upper-layer links: bounded below by the u32s actually stored, above by their allocated
+    // capacity plus one header per `Vec`.
+    //
+    // These bounds do NOT pin the `capacity() * size_of::<u32>()` term itself — mutating that
+    // `*` to `+` or `/` shifts the total by ~3% (18,696 vs 19,216 here) and stays inside the
+    // band, because per-`Vec` headers outweigh the capacity term 6:1 on a graph this sparse.
+    // Closing that would mean asserting the formula equals itself, which detects edits rather
+    // than errors, so it is deliberately left open: the term is 2.7 KB of a 19 KB field that is
+    // itself a rounding error against the index. Recorded rather than papered over.
+    let links: usize = a
+        .connections
+        .iter()
+        .flat_map(|layers| layers.iter())
+        .map(|l| l.len())
+        .sum();
+    let link_caps: usize = a
+        .connections
+        .iter()
+        .flat_map(|layers| layers.iter())
+        .map(|l| l.capacity())
+        .sum();
+    let vecs: usize = a.connections.len() + a.connections.iter().map(|l| l.len()).sum::<usize>();
+    let floor = links * std::mem::size_of::<u32>();
+    let ceiling = link_caps * std::mem::size_of::<u32>() + vecs * std::mem::size_of::<Vec<u32>>();
+    assert!(
+        (floor..=ceiling).contains(&mb.upper_layer_links),
+        "upper_layer_links {} outside [{floor}, {ceiling}] for {links} links in {vecs} vecs",
+        mb.upper_layer_links
+    );
+}
