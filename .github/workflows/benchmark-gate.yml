@@ -59,7 +59,7 @@ jobs:
       # produce a different sift10k/ directory.
       - name: Cache sift10k dataset
         id: cache-sift10k
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: benchmarks/data/sift10k
           key: sift10k-data-v2
