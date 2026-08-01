@@ -163,7 +163,7 @@ jobs:
         run: cargo llvm-cov -p foxstash-db --lcov --output-path lcov-db.info
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: lcov-core.info,lcov-db.info
           fail_ci_if_error: false
