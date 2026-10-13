@@ -67,9 +67,9 @@ pub(super) const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -
         // coordinate replaces the earlier B bit-plane passes. `quant_bits` no longer
         // affects the block size, only the values inside the slots.
         Storage::TurboRabit => 2 + nibble_words(dim),
-        // Byte-identical to TurboRabit: Warren's walk IS TurboRabit's walk. Its extra 8-bit
+        // Byte-identical to TurboRabit: Mouse's walk IS TurboRabit's walk. Its extra 8-bit
         // residual lives in a cold side array, not the hot block.
-        Storage::Warren => 2 + nibble_words(dim),
+        Storage::Mouse => 2 + nibble_words(dim),
     }
 }
 

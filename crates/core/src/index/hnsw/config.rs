@@ -341,13 +341,15 @@ pub enum Storage {
     /// Correctness-first integration stores codes in a parallel array; arena-packing is the
     /// same later QPS optimization as TurboQuant's.
     TurboRabit,
-    /// **Warren** — TurboRabit's 4-bit walk + an 8-bit residual rerank, and **no retained f32**.
+    /// **Mouse** — TurboRabit's 4-bit walk + an 8-bit residual rerank, and **no retained f32**.
+    ///
+    /// Named for the trait: the leanest-memory `Storage` mode (the ⅓-memory figure below).
     ///
     /// The combination the profile asked for. `dist/query` is dominated by the *walk* (~2,400
     /// visits/query against ~200 rerank candidates, roughly 6:1 in bytes), so the hot path must be
     /// the cheapest code we have — TurboRabit's 384 B at 768-d.
     ///
-    /// Warren keeps TurboRabit's arena block **byte-identical**, so the walk is literally the same
+    /// Mouse keeps TurboRabit's arena block **byte-identical**, so the walk is literally the same
     /// code, and replaces the retained f32 with an 8-bit residual taken against TurboRabit's own
     /// reconstruction. Measured on coco/nomic-768 against an f32 ceiling of 0.9930: residual rerank
     /// reaches **0.9905** at a third of TurboRabit's vector memory (1,152 B vs 3,456 B).
@@ -358,7 +360,7 @@ pub enum Storage {
     ///
     /// Bulk-build only: incremental `add()` selects edges with exact f32 distances that this mode
     /// does not retain.
-    Warren,
+    Mouse,
 }
 
 impl Storage {
@@ -368,16 +370,16 @@ impl Storage {
     /// `TurboRabit`. False for:
     ///
     /// - [`Storage::F32`], which never reranks (the walk is already exact), and
-    /// - [`Storage::Warren`], whose **8-bit residual code *is* the rerank representation** — it
+    /// - [`Storage::Mouse`], whose **8-bit residual code *is* the rerank representation** — it
     ///   retains no f32 at all and reranks perfectly well without it.
     ///
     /// This distinction exists because "`full` is empty" and "cannot rerank" were the same
     /// statement until the no-f32 modes, and code that conflated them rejected a legal configuration:
-    /// `set_rerank_candidates` returned `FullPrecisionDropped` on every no-f32 (Warren) index, which killed
+    /// `set_rerank_candidates` returned `FullPrecisionDropped` on every no-f32 (Mouse) index, which killed
     /// the whole arm on its first query group in the 2026-07-19 sweep.
     #[inline]
     pub(super) fn rerank_needs_full(self) -> bool {
-        !matches!(self, Storage::F32 | Storage::Warren)
+        !matches!(self, Storage::F32 | Storage::Mouse)
     }
 }
 

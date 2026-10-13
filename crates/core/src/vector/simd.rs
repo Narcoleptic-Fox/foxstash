@@ -1050,12 +1050,12 @@ fn sq8_asymmetric_dot_scalar(query: &[f32], codes: &[u8], min: &[f32], scale: &[
 /// Raw asymmetric dot of a full-precision query with a node's per-coordinate `u8` codes:
 /// `Σ query[d] * codes[d]`.
 ///
-/// A plain integer-code dot `Σ query[i]·codes[i]`, behind [`Storage::Warren`]'s residual rerank.
+/// A plain integer-code dot `Σ query[i]·codes[i]`, behind [`Storage::Mouse`]'s residual rerank.
 /// Unlike [`sq8_asymmetric_dot_simd`] there is NO per-dimension min/scale — the residual affine is
 /// *per-vector* (`min`/`step` scalars), so it folds out of the sum and the caller applies it once.
-/// Used for Warren's two 8-bit residual levels (codes `0..=255`, one per byte).
+/// Used for Mouse's two 8-bit residual levels (codes `0..=255`, one per byte).
 ///
-/// [`Storage::Warren`]: crate::index::hnsw::Storage::Warren
+/// [`Storage::Mouse`]: crate::index::hnsw::Storage::Mouse
 pub fn byte_uint_dot_simd(query: &[f32], codes: &[u8]) -> f32 {
     debug_assert_eq!(query.len(), codes.len());
     #[cfg(target_arch = "x86_64")]

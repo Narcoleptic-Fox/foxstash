@@ -13,7 +13,7 @@ use super::*;
 /// cleanly here rather than deserialized into garbage (bincode read a stray byte as a bool and
 /// panicked with `InvalidBoolEncoding`).
 ///
-/// v3: `HNSWSnapshot` gained `warren_res` + `warren_rc` (for `Storage::Warren`) mid-struct, shifting
+/// v3: `HNSWSnapshot` gained `mouse_res` + `mouse_rc` (for `Storage::Mouse`) mid-struct, shifting
 /// the positional bincode layout — a v2 snapshot must be rejected, not misparsed.
 pub(super) const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
@@ -36,8 +36,8 @@ pub(super) struct HNSWSnapshot {
     pub(super) rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
     pub(super) turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
     pub(super) turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
-    pub(super) warren_res: Vec<u8>,
-    pub(super) warren_rc: Vec<f32>,
+    pub(super) mouse_res: Vec<u8>,
+    pub(super) mouse_rc: Vec<f32>,
     pub(super) ids: Vec<String>,
     pub(super) contents: Vec<String>,
     /// `serde_json::Value` cannot ride bincode (its `Deserialize` is self-describing —

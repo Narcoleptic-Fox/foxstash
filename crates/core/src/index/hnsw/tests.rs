@@ -577,13 +577,13 @@ fn rabitq_train_then_add_retrieves_correctly() {
     );
 }
 
-/// Warren's defining properties: TurboRabit's walk, an 8-bit residual rerank, **no f32**.
+/// Mouse's defining properties: TurboRabit's walk, an 8-bit residual rerank, **no f32**.
 ///
-/// The arena assert is the load-bearing one — Warren's whole QPS case is that its hot path is
+/// The arena assert is the load-bearing one — Mouse's whole QPS case is that its hot path is
 /// byte-identical to TurboRabit's. If the block ever diverges, the walk silently stops being
 /// the cheap one and the mode's reason to exist is gone.
 #[test]
-fn warren_walks_like_turborabit_and_reranks_without_f32() {
+fn mouse_walks_like_turborabit_and_reranks_without_f32() {
     let mut rng = StdRng::seed_from_u64(21);
     let (dim, clusters, per) = (32, 6, 70);
     let centers: Vec<Vec<f32>> = (0..clusters)
@@ -609,29 +609,29 @@ fn warren_walks_like_turborabit_and_reranks_without_f32() {
         seed: Some(4),
         ..Default::default()
     };
-    let warren = HNSWIndex::build_parallel(base.clone(), cfg(Storage::Warren));
+    let mouse = HNSWIndex::build_parallel(base.clone(), cfg(Storage::Mouse));
     let tr = HNSWIndex::build_parallel(base.clone(), cfg(Storage::TurboRabit));
 
     // The hot block must match TurboRabit's exactly — same stride, same layout.
     assert_eq!(
-        warren.stride, tr.stride,
-        "Warren's arena block must equal TurboRabit's"
+        mouse.stride, tr.stride,
+        "Mouse's arena block must equal TurboRabit's"
     );
-    assert!(warren.full.is_empty(), "Warren must retain no f32");
+    assert!(mouse.full.is_empty(), "Mouse must retain no f32");
     assert!(
         !tr.full.is_empty(),
-        "TurboRabit does retain f32 (the thing Warren removes)"
+        "TurboRabit does retain f32 (the thing Mouse removes)"
     );
     assert_eq!(
-        warren.warren_res.len(),
+        mouse.mouse_res.len(),
         base.len() * (20 + 2 * dim),
         "one residual block per node"
     );
 
     // The rerank knob must work despite `full` being empty.
-    let mut w = warren;
+    let mut w = mouse;
     w.set_rerank_candidates(100)
-        .expect("Warren reranks on its residual, not f32");
+        .expect("Mouse reranks on its residual, not f32");
 
     let k = 10;
     let mut total = 0.0f32;
@@ -657,7 +657,7 @@ fn warren_walks_like_turborabit_and_reranks_without_f32() {
         total += truth.intersection(&got).count() as f32 / k as f32;
     }
     let recall = total / 50.0;
-    assert!(recall > 0.8, "Warren recall@10 = {:.3}", recall);
+    assert!(recall > 0.8, "Mouse recall@10 = {:.3}", recall);
 }
 
 /// Build a clustered corpus with signed, unit-normalizable coordinates.
@@ -718,7 +718,7 @@ fn recall_against_exact(
 /// # Why this is a differential test
 ///
 /// The obvious assertion — "recall is above some threshold" — cannot detect a dead rerank.
-/// Warren scores 0.855 on sift10k with its residual stage doing *literally nothing* (recall
+/// Mouse scores 0.855 on sift10k with its residual stage doing *literally nothing* (recall
 /// identical to three decimal places at `rerank_candidates` 0, 400 and 2000), and 0.9999 on
 /// real 768-d embeddings with it working. Any fixed bar between those passes in both worlds,
 /// so the original `recall > 0.8` here could never have caught the stage being inert.
@@ -727,7 +727,7 @@ fn recall_against_exact(
 /// differ materially. Same graph, same codes, same queries — the rerank is the only variable,
 /// which is what makes the gap attributable to it.
 #[test]
-fn warren_rerank_materially_improves_recall() {
+fn mouse_rerank_materially_improves_recall() {
     let dim = 64;
     let (base, queries) = rerank_fixture(dim);
     let mut index = HNSWIndex::build_parallel(
@@ -738,7 +738,7 @@ fn warren_rerank_materially_improves_recall() {
             m0: 24,
             ef_construction: 100,
             ef_search: 60,
-            storage: Storage::Warren,
+            storage: Storage::Mouse,
             rabit_bits: 4,
             rerank_candidates: 100,
             seed: Some(4),
@@ -752,18 +752,18 @@ fn warren_rerank_materially_improves_recall() {
     let without = recall_against_exact(&index, &base, &queries, 10);
     index
         .set_rerank_candidates(100)
-        .expect("Warren reranks on its residual, not on f32");
+        .expect("Mouse reranks on its residual, not on f32");
     let with = recall_against_exact(&index, &base, &queries, 10);
 
     assert!(
         with - without > 0.15,
-        "Warren's residual rerank changed recall by only {:.4} ({without:.4} -> {with:.4}). \
+        "Mouse's residual rerank changed recall by only {:.4} ({without:.4} -> {with:.4}). \
              The knob is accepted but the stage is not affecting results — which is exactly how \
              it behaves on non-unit-norm L2 data today.",
         with - without
     );
 
-    // A rerank that ran must also produce a real distance spread. Warren under L2 on
+    // A rerank that ran must also produce a real distance spread. Mouse under L2 on
     // unnormalized vectors returns `(2 - 2*inner_product).max(0)`, which clamps to 0 for
     // every candidate and hands back score 1.0 ten times over — degenerate output that a
     // recall check alone would not notice.
@@ -786,7 +786,7 @@ fn warren_rerank_materially_improves_recall() {
 
 /// The same discrimination for `Storage::TurboRabit`, which reranks against retained f32.
 ///
-/// Kept separate from Warren rather than parameterized: the two reach their accuracy by
+/// Kept separate from Mouse rather than parameterized: the two reach their accuracy by
 /// different mechanisms (exact f32 rescoring vs an 8-bit residual), so a shared test that
 /// passed would not tell you *which* one still works.
 #[test]
@@ -825,11 +825,11 @@ fn turborabit_rerank_materially_improves_recall() {
     );
 }
 
-/// `Storage::Warren` + `DistanceMetric::L2` on non-unit vectors is refused, loudly.
+/// `Storage::Mouse` + `DistanceMetric::L2` on non-unit vectors is refused, loudly.
 ///
 /// # What this is protecting against
 ///
-/// Warren's rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q-x‖²` **only when
+/// Mouse's rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q-x‖²` **only when
 /// `‖q‖ = ‖x‖ = 1`**. At any other scale `acc` is a large inner product, the expression is
 /// negative for every candidate, and `.max(0.0)` flattens the pool to distance 0 — every
 /// candidate ties, the re-sort carries no information, and the walk's ordering survives.
@@ -842,7 +842,7 @@ fn turborabit_rerank_materially_improves_recall() {
 /// norm-aware like the walk already is — but it removes the silent-wrong-answer class.
 #[test]
 #[should_panic(expected = "requires unit-norm vectors")]
-fn warren_l2_on_unnormalized_vectors_is_rejected() {
+fn mouse_l2_on_unnormalized_vectors_is_rejected() {
     let dim = 64;
     let (base, _) = rerank_fixture(dim);
     // Scale well away from unit norm — the condition the rerank silently depends on.
@@ -857,7 +857,7 @@ fn warren_l2_on_unnormalized_vectors_is_rejected() {
             m: 12,
             m0: 24,
             ef_construction: 100,
-            storage: Storage::Warren,
+            storage: Storage::Mouse,
             rabit_bits: 4,
             rerank_candidates: 100,
             seed: Some(4),
@@ -868,13 +868,13 @@ fn warren_l2_on_unnormalized_vectors_is_rejected() {
 
 /// The configuration the guard above leaves legal must actually work.
 ///
-/// Rejecting the broken combination is only half a contract; without this, `Warren` + `L2`
+/// Rejecting the broken combination is only half a contract; without this, `Mouse` + `L2`
 /// could be refused on non-unit input and quietly useless on unit input, and both halves
-/// would look fine. This is also the only test that exercises Warren's **L2 rerank arm** at
-/// all — every other Warren test runs under `Cosine`, which is a different branch. Mutation
+/// would look fine. This is also the only test that exercises Mouse's **L2 rerank arm** at
+/// all — every other Mouse test runs under `Cosine`, which is a different branch. Mutation
 /// testing found all four mutants on that line surviving for exactly that reason.
 #[test]
-fn warren_rerank_works_under_l2_on_unit_norm_vectors() {
+fn mouse_rerank_works_under_l2_on_unit_norm_vectors() {
     let dim = 64;
     let (base, queries) = rerank_fixture(dim);
     let unit = |v: &Vec<f32>| -> Vec<f32> {
@@ -892,7 +892,7 @@ fn warren_rerank_works_under_l2_on_unit_norm_vectors() {
             m0: 24,
             ef_construction: 100,
             ef_search: 60,
-            storage: Storage::Warren,
+            storage: Storage::Mouse,
             rabit_bits: 4,
             rerank_candidates: 100,
             seed: Some(4),
@@ -906,7 +906,7 @@ fn warren_rerank_works_under_l2_on_unit_norm_vectors() {
     let with = recall_against_exact(&index, &base, &queries, 10);
     assert!(
         with - without > 0.15,
-        "Warren's L2 rerank changed recall by only {:.4} ({without:.4} -> {with:.4}) on \
+        "Mouse's L2 rerank changed recall by only {:.4} ({without:.4} -> {with:.4}) on \
          unit-norm vectors, where its `2 - 2*<q,x>` arithmetic is exact",
         with - without
     );
@@ -2353,7 +2353,7 @@ fn snapshot_round_trip_is_verbatim_in_every_storage() {
         ("rabitq", Storage::RaBitQ),
         ("turboquant", Storage::TurboQuant),
         ("turborabit", Storage::TurboRabit),
-        // Warren is bulk-build-only (no incremental add), and this test adds a doc — it has
+        // Mouse is bulk-build-only (no incremental add), and this test adds a doc — it has
         // tested by the snapshot round-trip tests.
     ] {
         // Every field non-default, so a dropped field cannot hide behind its default.
@@ -4152,7 +4152,7 @@ fn memory_fixture(n: usize, dim: usize, content_len: usize) -> Vec<Document> {
 /// it — across all twelve of its lines — meaning its arithmetic could be changed arbitrarily
 /// and nothing in the suite would notice. That matters beyond tidiness: it is the function
 /// behind every memory figure this project quotes, including `storage_pareto`'s memory column
-/// (`index.memory_breakdown().total()`) and the claim that `Storage::Warren` reaches F32 recall
+/// (`index.memory_breakdown().total()`) and the claim that `Storage::Mouse` reaches F32 recall
 /// at a fraction of F32's memory. Those numbers were being reported off an unverified
 /// computation.
 ///
@@ -4168,7 +4168,7 @@ fn memory_breakdown_partitions_the_arena_exactly() {
         Storage::F32,
         Storage::SQ8,
         Storage::TurboRabit,
-        Storage::Warren,
+        Storage::Mouse,
     ] {
         let dim = 64;
         let docs = memory_fixture(400, dim, 16);
@@ -4233,10 +4233,10 @@ fn memory_breakdown_partitions_the_arena_exactly() {
             "{storage:?}: one f32 norm per node"
         );
 
-        // Warren retains no f32 at all — that is the entire point of the mode, and the
+        // Mouse retains no f32 at all — that is the entire point of the mode, and the
         // memory claim made for it depends on this being true rather than assumed.
-        if storage == Storage::Warren {
-            assert_eq!(cold, 0, "Warren must retain no full-precision vectors");
+        if storage == Storage::Mouse {
+            assert_eq!(cold, 0, "Mouse must retain no full-precision vectors");
         }
     }
 }
@@ -4367,7 +4367,7 @@ fn memory_breakdown_payload_and_links_track_their_inputs() {
 /// `BuildStrategy::Sequential` once panicked on every input for a release while 247 tests
 /// passed. A second copy of one idea, with only the first copy tested.
 ///
-/// `Storage::Warren` is absent deliberately — it is bulk-build-only, since sequential edge
+/// `Storage::Mouse` is absent deliberately — it is bulk-build-only, since sequential edge
 /// selection needs exact f32 distances it does not retain. That it *refuses* rather than
 /// silently building a bad graph is asserted separately below.
 #[test]
@@ -4414,13 +4414,13 @@ fn multibit_storage_encodes_the_same_through_both_builders() {
     }
 }
 
-/// `Storage::Warren` refuses the sequential builder rather than building a bad graph.
+/// `Storage::Mouse` refuses the sequential builder rather than building a bad graph.
 ///
-/// Warren retains no f32, and sequential insertion selects edges with exact distances. The
+/// Mouse retains no f32, and sequential insertion selects edges with exact distances. The
 /// failure must be loud; a silently worse graph is the outcome this asserts against.
 #[test]
 #[should_panic]
-fn warren_rejects_the_sequential_builder() {
+fn mouse_rejects_the_sequential_builder() {
     let (base, _) = rerank_fixture(32);
     let _ = HNSWIndex::build(
         base,
@@ -4429,7 +4429,7 @@ fn warren_rejects_the_sequential_builder() {
             m: 8,
             m0: 16,
             ef_construction: 60,
-            storage: Storage::Warren,
+            storage: Storage::Mouse,
             rabit_bits: 4,
             rerank_candidates: 50,
             seed: Some(4),
@@ -4439,15 +4439,15 @@ fn warren_rejects_the_sequential_builder() {
     );
 }
 
-/// Requantizing F32 -> Warren must produce a working index.
+/// Requantizing F32 -> Mouse must produce a working index.
 ///
-/// This is the only route that reaches `push_node`'s Warren arm — the mode cannot be built
+/// This is the only route that reaches `push_node`'s Mouse arm — the mode cannot be built
 /// sequentially and rejects `add()`, so its nibble packing and its **two-level 8-bit residual
 /// quantizer** (`step = (hi - lo) / 255.0`, then a second level over the remainder) were
 /// reachable in production via `requantize` and reachable by no test at all. It is also the
 /// path `foxstash-db` uses when a collection fits.
 #[test]
-fn requantize_f32_to_warren_produces_a_working_index() {
+fn requantize_f32_to_mouse_produces_a_working_index() {
     let (base, queries) = rerank_fixture(32);
     let shared = |storage, rerank| HNSWConfig {
         metric: DistanceMetric::Cosine,
@@ -4464,15 +4464,15 @@ fn requantize_f32_to_warren_produces_a_working_index() {
     let f32_index = HNSWIndex::build_parallel(base.clone(), shared(Storage::F32, 0));
     let exact = recall_against_exact(&f32_index, &base, &queries, 10);
 
-    let warren = f32_index
-        .requantize(shared(Storage::Warren, 50))
-        .expect("F32 -> Warren is a legal requantization");
+    let mouse = f32_index
+        .requantize(shared(Storage::Mouse, 50))
+        .expect("F32 -> Mouse is a legal requantization");
     assert!(
-        warren.full.is_empty(),
-        "Warren must retain no f32 after requantize"
+        mouse.full.is_empty(),
+        "Mouse must retain no f32 after requantize"
     );
     assert_eq!(
-        warren.len(),
+        mouse.len(),
         f32_index.len(),
         "requantize must keep every node"
     );
@@ -4482,10 +4482,10 @@ fn requantize_f32_to_warren_produces_a_working_index() {
     // walk alone still retrieves well enough to clear a loose bar, and the residual is a
     // refinement on top of it. A bar set from what the code actually achieves is the only one
     // that can see the refinement break.
-    let got = recall_against_exact(&warren, &base, &queries, 10);
+    let got = recall_against_exact(&mouse, &base, &queries, 10);
     assert!(
         got >= 0.98 && exact - got < 0.02,
-        "requantized Warren recalls {got:.4} against F32's {exact:.4} — the two-level 8-bit \
+        "requantized Mouse recalls {got:.4} against F32's {exact:.4} — the two-level 8-bit \
          residual encode path is losing precision"
     );
 }

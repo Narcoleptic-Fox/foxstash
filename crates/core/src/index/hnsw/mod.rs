@@ -394,12 +394,12 @@ pub struct HNSWIndex {
     /// Codes are arena-packed per node as `[dtc_sq][f_rescale][B bit-planes]`.
     turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
 
-    // === Warren storage (empty unless Storage::Warren) ===
+    // === Mouse storage (empty unless Storage::Mouse) ===
     /// Per-node 8-bit residual against TurboRabit's reconstruction, in ROTATED space, flat-packed
     /// as `[min f32][step f32][dim bytes]`. Cold — read only during rerank, never in the walk.
-    warren_res: Vec<u8>,
+    mouse_res: Vec<u8>,
     /// `R·c`, precomputed once: rerank needs `R·q = rq + R·c` and `rq` is per-query.
-    warren_rc: Vec<f32>,
+    mouse_rc: Vec<f32>,
 
     // === GRAPH STRUCTURE (layers >= 1 only) ===
     /// Connections above layer 0: `connections[node_id][layer]` → neighbours.
@@ -542,8 +542,8 @@ impl HNSWIndex {
             rabitq: None,
             turboquant: None,
             turborabit: None,
-            warren_res: Vec::new(),
-            warren_rc: Vec::new(),
+            mouse_res: Vec::new(),
+            mouse_rc: Vec::new(),
             ids: Vec::new(),
             contents: Vec::new(),
             metadata: Vec::new(),
@@ -654,7 +654,7 @@ impl HNSWIndex {
             }
             // Same fit as TurboRabit (the walk is TurboRabit's), plus the constant `R·c` the
             // rotated-space rerank needs.
-            Storage::Warren => {
+            Storage::Mouse => {
                 assert!(
                     (1..=4).contains(&self.config.rabit_bits),
                     "rabit_bits must be in 1..=4, got {}",
@@ -674,7 +674,7 @@ impl HNSWIndex {
                 } else {
                     crate::vector::turborabit::TurboRabitQuantizer::fit(embeddings, bits)
                 };
-                self.warren_rc = q.rotate(q.centroid());
+                self.mouse_rc = q.rotate(q.centroid());
                 self.turborabit = Some(q);
             }
         }
@@ -720,7 +720,7 @@ impl HNSWIndex {
             Storage::RaBitQ => self.rabitq.is_some(),
             Storage::TurboQuant => self.turboquant.is_some(),
             Storage::TurboRabit => self.turborabit.is_some(),
-            Storage::Warren => self.turborabit.is_some(),
+            Storage::Mouse => self.turborabit.is_some(),
         }
     }
 
@@ -1055,11 +1055,11 @@ impl HNSWIndex {
                 let start = node_id * self.embedding_dim;
                 &self.full[start..start + self.embedding_dim]
             }
-            // Warren keeps no f32 and returns early in the walk/rerank, so this is off its path.
+            // Mouse keeps no f32 and returns early in the walk/rerank, so this is off its path.
             // `get_all_documents`/`requantize` would reach it — reconstruct via the codebook there
             // rather than paying to retain f32. Experimental mode, not yet exposed to bindings.
-            Storage::Warren => panic!(
-                "Storage::Warren retains no exact f32 vectors; rerank uses the residual code"
+            Storage::Mouse => panic!(
+                "Storage::Mouse retains no exact f32 vectors; rerank uses the residual code"
             ),
         }
     }
@@ -1127,34 +1127,34 @@ impl HNSWIndex {
         self.nodes[base] = count as u32;
     }
 
-    /// Byte stride of one node's Warren residual block:
+    /// Byte stride of one node's Mouse residual block:
     /// `[min1 f32][step1 f32][scale f32][min2 f32][step2 f32][dim bytes L1][dim bytes L2]`.
     ///
-    /// **Two 8-bit levels, not one.** A single 8-bit residual left Warren 0.002 recall short of
+    /// **Two 8-bit levels, not one.** A single 8-bit residual left Mouse 0.002 recall short of
     /// exact f32 rerank — enough to miss the 0.99 threshold and, via the cliff, read as a 25% QPS
     /// loss. Measured on coco at pool=500 against an f32 ceiling of 0.9948: 8 bits → 0.9935,
     /// 10 → 0.9944, **12 → 0.9948 (exact match)**, 16 → no further gain.
     ///
     /// 12 bits flat would need bit-packing; 16 flat would need a `u16` SIMD kernel. Two 8-bit
     /// levels reuse `byte_uint_dot_simd` untouched and, because each level rescales to its own
-    /// range, are typically *better* than flat 16 for the same bits — the same reason Warren's
+    /// range, are typically *better* than flat 16 for the same bits — the same reason Mouse's
     /// 4+8 beat a standalone 8.
     ///
     /// `scale = ℓ/‖v‖` is stored rather than recomputed because deriving it needs a pass over the
     /// nibbles, and a scalar per-dimension pass costs more than the two SIMD dots the rest of the
     /// rerank takes. Four bytes to delete a loop.
     #[inline]
-    fn warren_res_stride(&self) -> usize {
+    fn mouse_res_stride(&self) -> usize {
         20 + 2 * self.embedding_dim
     }
 
     /// `(min1, step1, scale, min2, step2, level1, level2)` — cold path, rerank only.
     #[inline]
     #[allow(clippy::type_complexity)]
-    fn warren_res_at(&self, node_id: usize) -> (f32, f32, f32, f32, f32, &[u8], &[u8]) {
-        let st = self.warren_res_stride();
+    fn mouse_res_at(&self, node_id: usize) -> (f32, f32, f32, f32, f32, &[u8], &[u8]) {
+        let st = self.mouse_res_stride();
         let d = self.embedding_dim;
-        let b = &self.warren_res[node_id * st..node_id * st + st];
+        let b = &self.mouse_res[node_id * st..node_id * st + st];
         let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         (
             f(0),
@@ -1283,14 +1283,14 @@ impl HNSWIndex {
             // is NO retained f32 — the 8-bit residual code IS the rerank representation. `node_id`
             // grows in id order because `push_node` is called in id order by every build
             // path, keeping the array index-aligned with the arena.
-            // Warren writes TurboRabit's arena block VERBATIM (so the walk is the same code) and,
+            // Mouse writes TurboRabit's arena block VERBATIM (so the walk is the same code) and,
             // instead of the f32 copy, an 8-bit residual against TurboRabit's own reconstruction —
             // taken in ROTATED space, which is where the rerank consumes it.
-            Storage::Warren => {
+            Storage::Mouse => {
                 let tr = self
                     .turborabit
                     .as_ref()
-                    .expect("Storage::Warren requires fit_codebook before push_node");
+                    .expect("Storage::Mouse requires fit_codebook before push_node");
                 let encode_input = self.rabitq_cosine_input(embedding);
                 let code = tr.encode(&encode_input);
                 self.nodes[v] = code.dtc_sq.to_bits();
@@ -1356,13 +1356,13 @@ impl HNSWIndex {
                 } else {
                     0.0
                 };
-                self.warren_res.extend_from_slice(&lo1.to_le_bytes());
-                self.warren_res.extend_from_slice(&step1.to_le_bytes());
-                self.warren_res.extend_from_slice(&scale.to_le_bytes());
-                self.warren_res.extend_from_slice(&lo2.to_le_bytes());
-                self.warren_res.extend_from_slice(&step2.to_le_bytes());
-                self.warren_res.extend_from_slice(&c1);
-                self.warren_res.extend_from_slice(&c2);
+                self.mouse_res.extend_from_slice(&lo1.to_le_bytes());
+                self.mouse_res.extend_from_slice(&step1.to_le_bytes());
+                self.mouse_res.extend_from_slice(&scale.to_le_bytes());
+                self.mouse_res.extend_from_slice(&lo2.to_le_bytes());
+                self.mouse_res.extend_from_slice(&step2.to_le_bytes());
+                self.mouse_res.extend_from_slice(&c1);
+                self.mouse_res.extend_from_slice(&c2);
             }
         }
     }
@@ -1465,8 +1465,8 @@ impl HNSWIndex {
             rabitq: None,
             turboquant: None,
             turborabit: None,
-            warren_res: Vec::new(),
-            warren_rc: Vec::new(),
+            mouse_res: Vec::new(),
+            mouse_rc: Vec::new(),
             ids: self.ids.clone(),
             contents: self.contents.clone(),
             metadata: self.metadata.clone(),
@@ -1598,18 +1598,18 @@ impl HNSWIndex {
             rabitq: self.rabitq.clone(),
             turboquant: self.turboquant.clone(),
             turborabit: self.turborabit.clone(),
-            warren_res: if self.warren_res.is_empty() {
+            mouse_res: if self.mouse_res.is_empty() {
                 Vec::new()
             } else {
-                let ws = self.warren_res_stride();
+                let ws = self.mouse_res_stride();
                 let mut packed = vec![0u8; n * ws];
                 for (new, &old) in order.iter().enumerate() {
                     packed[new * ws..new * ws + ws]
-                        .copy_from_slice(&self.warren_res[old * ws..old * ws + ws]);
+                        .copy_from_slice(&self.mouse_res[old * ws..old * ws + ws]);
                 }
                 packed
             },
-            warren_rc: self.warren_rc.clone(),
+            mouse_rc: self.mouse_rc.clone(),
             // Flat code buffer follows the same node permutation as the arena blocks, copied one
             // fixed-stride block at a time (NOT byte-by-byte — this is a Vec<u8> of stride blocks).
             ids: permute(&self.ids),
@@ -1646,8 +1646,8 @@ impl HNSWIndex {
             rabitq: self.rabitq.clone(),
             turboquant: self.turboquant.clone(),
             turborabit: self.turborabit.clone(),
-            warren_res: self.warren_res.clone(),
-            warren_rc: self.warren_rc.clone(),
+            mouse_res: self.mouse_res.clone(),
+            mouse_rc: self.mouse_rc.clone(),
             ids: self.ids.clone(),
             contents: self.contents.clone(),
             metadata: self
@@ -1742,8 +1742,8 @@ impl HNSWIndex {
             rabitq: snap.rabitq,
             turboquant: snap.turboquant,
             turborabit: snap.turborabit,
-            warren_res: snap.warren_res,
-            warren_rc: snap.warren_rc,
+            mouse_res: snap.mouse_res,
+            mouse_rc: snap.mouse_rc,
             ids: snap.ids,
             contents: snap.contents,
             metadata,
@@ -1830,7 +1830,7 @@ impl HNSWIndex {
                 self.config.storage
             )));
         }
-        if matches!(self.config.storage, Storage::Warren) {
+        if matches!(self.config.storage, Storage::Mouse) {
             return Err(crate::RagError::InvalidInput(format!(
                 "Storage::{:?} does not support incremental add() — it retains no f32 for exact \
                  graph construction. Build the whole corpus at once via HNSWIndex::build / \
@@ -1920,7 +1920,7 @@ impl HNSWIndex {
         }
 
         // Bulk-build-only — see the identical guard in `add()`.
-        if matches!(self.config.storage, Storage::Warren) {
+        if matches!(self.config.storage, Storage::Mouse) {
             return Err(crate::RagError::InvalidInput(format!(
                 "Storage::{:?} does not support incremental add() — it retains no f32 for exact \
                  graph construction. Build the whole corpus at once via HNSWIndex::build / \
@@ -2213,23 +2213,23 @@ impl HNSWIndex {
             // which dominates the high-recall operating points. Only the head lines are
             // issued; `exact_distance` reads the vector sequentially, so the hardware
             // streamer covers the tail (same rationale as VECTOR_LINES above).
-            if self.config.storage == Storage::Warren {
+            if self.config.storage == Storage::Mouse {
                 // No f32: rescore against TurboRabit's reconstruction plus the 8-bit residual,
                 // entirely in ROTATED space so nothing here is O(dim²):
                 //     ⟨q,x⟩ = ⟨q,c⟩ + ⟨R·q, r_recon + e⟩,   R·q = rq + R·c
                 let tr = self
                     .turborabit
                     .as_ref()
-                    .expect("Storage::Warren rerank requires a fitted codebook");
+                    .expect("Storage::Mouse rerank requires a fitted codebook");
                 let prepared = qprep
                     .turborabit
-                    .expect("Storage::Warren rerank requires prepare_turborabit_query");
+                    .expect("Storage::Mouse rerank requires prepare_turborabit_query");
                 let dim = self.embedding_dim;
                 let cos_in = self.rabitq_cosine_input(query);
                 let rq_full: Vec<f32> = prepared
                     .rq()
                     .iter()
-                    .zip(&self.warren_rc)
+                    .zip(&self.mouse_rc)
                     .map(|(a, b)| a + b)
                     .collect();
                 let qc: f32 = cos_in.iter().zip(tr.centroid()).map(|(a, b)| a * b).sum();
@@ -2237,7 +2237,7 @@ impl HNSWIndex {
                 // own identity `grid = u + c_B`:
                 //   ⟨rq, recon⟩ = scale·(⟨rq,u⟩ + c_B·Σrq) + (lo1+lo2)·Σrq
                 //                 + step1·⟨rq,L1⟩ + step2·⟨rq,L2⟩
-                // A hand-rolled scalar unpack here cost 5.4 µs/candidate and made Warren 3x
+                // A hand-rolled scalar unpack here cost 5.4 µs/candidate and made Mouse 3x
                 // slower than TurboRabit despite an identical walk.
                 let cb = -(((1u32 << self.config.rabit_bits) - 1) as f32) / 2.0;
                 let sum_rq: f32 = rq_full.iter().sum();
@@ -2245,7 +2245,7 @@ impl HNSWIndex {
                 for entry in found.iter_mut() {
                     let v = entry.1 * self.stride + self.hdr;
                     let nib: &[u8] = bytemuck::cast_slice(&self.nodes[v + 2..v + 2 + nw]);
-                    let (lo1, step1, scale, lo2, step2, l1, l2) = self.warren_res_at(entry.1);
+                    let (lo1, step1, scale, lo2, step2, l1, l2) = self.mouse_res_at(entry.1);
                     let nibble_dot = crate::vector::simd::nibble_uint_dot_simd(&rq_full, nib);
                     let d1 = crate::vector::simd::byte_uint_dot_simd(&rq_full, l1);
                     let d2 = crate::vector::simd::byte_uint_dot_simd(&rq_full, l2);
@@ -2492,7 +2492,7 @@ impl HNSWIndex {
             rabitq: rq_prepared.as_ref(),
             turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
-            // Insert path never runs under Warren (bulk-build-only; add() is rejected).
+            // Insert path never runs under Mouse (bulk-build-only; add() is rejected).
             filter: None, // builds are never filtered
         };
         let mut ctx = SearchContext::new(self.len());
@@ -2874,9 +2874,9 @@ impl HNSWIndex {
         &self,
         query: &[f32],
     ) -> Option<crate::vector::turborabit::PreparedQuery> {
-        // Warren's walk IS TurboRabit's, so it needs the same prepared query — and its rerank
+        // Mouse's walk IS TurboRabit's, so it needs the same prepared query — and its rerank
         // additionally needs `rq` to build `R·q`.
-        if !matches!(self.config.storage, Storage::TurboRabit | Storage::Warren) {
+        if !matches!(self.config.storage, Storage::TurboRabit | Storage::Mouse) {
             return None;
         }
         let tr = self
@@ -3005,7 +3005,7 @@ impl HNSWIndex {
         // under L2, halved under cosine (both sides unit-normalized before encoding,
         // making `raw = 2·cosine_distance`). Must match
         // `TurboRabitQuantizer::estimate_dist_sq` exactly — guarded by the same tests.
-        if matches!(self.config.storage, Storage::TurboRabit | Storage::Warren) {
+        if matches!(self.config.storage, Storage::TurboRabit | Storage::Mouse) {
             let prepared = qprep.turborabit.expect(
                 "Storage::TurboRabit traversal requires a query prepared via prepare_turborabit_query",
             );
@@ -3105,11 +3105,11 @@ impl HNSWIndex {
     /// rather than assuming one, and is correct whether or not reordering runs.
     ///
     /// Returns an empty index for an empty input (`build_parallel` panics there).
-    /// Refuse `Storage::Warren` + `DistanceMetric::L2` on vectors that are not unit-norm.
+    /// Refuse `Storage::Mouse` + `DistanceMetric::L2` on vectors that are not unit-norm.
     ///
     /// # Why this is a hard failure rather than a caveat
     ///
-    /// Warren's rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q−x‖²` **only**
+    /// Mouse's rerank finishes with `(2.0 - 2.0 * acc).max(0.0)`, which is `‖q−x‖²` **only**
     /// when `‖q‖ = ‖x‖ = 1`. At any other scale `acc` is a large inner product, the expression
     /// is negative for every candidate, and `.max(0.0)` flattens the whole pool to distance 0.
     /// Every candidate ties, the re-sort carries no information, and the walk's ordering
@@ -3122,14 +3122,14 @@ impl HNSWIndex {
     ///
     /// This is a guard, not the fix. The rerank *should* be norm-aware like the walk already is
     /// (`dtc² + ‖q−c‖² + f_rescale·(…)`); doing that needs `‖x‖²`, which is not in the node
-    /// block. Until then this narrows Warren's contract to the configurations where its
+    /// block. Until then this narrows Mouse's contract to the configurations where its
     /// arithmetic actually holds — which includes `DistanceMetric::Cosine`, whose query is
     /// normalized by `rabitq_cosine_input`, and is the default metric.
     ///
     /// Panics rather than returning `Result` because `build_parallel` is infallible by
     /// signature and already asserts on empty input; this is the same class of caller error.
-    fn reject_warren_l2_without_unit_norm(embeddings: &[Vec<f32>], config: &HNSWConfig) {
-        if config.storage != Storage::Warren || config.metric != DistanceMetric::L2 {
+    fn reject_mouse_l2_without_unit_norm(embeddings: &[Vec<f32>], config: &HNSWConfig) {
+        if config.storage != Storage::Mouse || config.metric != DistanceMetric::L2 {
             return;
         }
         // Tolerance is loose on purpose: the failure mode is `‖x‖` off by orders of magnitude,
@@ -3141,9 +3141,9 @@ impl HNSWIndex {
             .find(|(_, norm)| (norm - 1.0).abs() > 1e-3);
         if let Some((i, norm)) = offender {
             panic!(
-                "Storage::Warren with DistanceMetric::L2 requires unit-norm vectors, but \
+                "Storage::Mouse with DistanceMetric::L2 requires unit-norm vectors, but \
                  embeddings[{i}] has norm {norm:.4}.\n\
-                 Warren's residual rerank rescores with `2 - 2*<q,x>`, which is the squared L2 \
+                 Mouse's residual rerank rescores with `2 - 2*<q,x>`, which is the squared L2 \
                  distance only for unit vectors; at this scale it clamps every candidate to \
                  distance 0, silently disabling reranking and returning score 1.0 for every \
                  result.\n\
@@ -3186,7 +3186,7 @@ impl HNSWIndex {
 
     pub fn build_parallel(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
         assert!(!embeddings.is_empty(), "Cannot build from empty embeddings");
-        Self::reject_warren_l2_without_unit_norm(&embeddings, &config);
+        Self::reject_mouse_l2_without_unit_norm(&embeddings, &config);
         let embedding_dim = embeddings[0].len();
         let n = embeddings.len();
 
@@ -3651,8 +3651,8 @@ impl HNSWIndex {
             rabitq: None,
             turboquant: None,
             turborabit: None,
-            warren_res: Vec::new(),
-            warren_rc: Vec::new(),
+            mouse_res: Vec::new(),
+            mouse_rc: Vec::new(),
             ids,
             contents: vec![String::new(); n],
             metadata: vec![None; n],

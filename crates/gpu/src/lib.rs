@@ -181,10 +181,10 @@ fn scan_turborabit_tiled(
     }
 }
 
-/// GPU query rotation: `rq_t[j][q] = Σ_d R[j][d]·centered_t[d][q]` — the `R·(q−c)` that TR4/Warren need for
+/// GPU query rotation: `rq_t[j][q] = Σ_d R[j][d]·centered_t[d][q]` — the `R·(q−c)` that TR4/Mouse need for
 /// rotated space, done on device instead of a per-query CPU `O(dim²)` matvec. One thread per `(j, q)` output
 /// element; `centered` is **transposed `[dim][b]`** so at each `d` adjacent threads (adjacent `q`) read
-/// adjacent values — coalesced. (Reading it `[b][dim]` strided ran this at ~10 GFLOP/s — the whole TR4/Warren
+/// adjacent values — coalesced. (Reading it `[b][dim]` strided ran this at ~10 GFLOP/s — the whole TR4/Mouse
 /// scan penalty.) `R`'s row `j` is broadcast across the warp (same `j`). Output is `[dim][b]` for the scan.
 #[cube(launch_unchecked)]
 fn rotate_queries(
@@ -280,16 +280,16 @@ fn ivf_scan_sq8(
     }
 }
 
-/// GPU Warren residual rerank: **one thread per (query, candidate)** recomputes the residual-refined dot on
+/// GPU Mouse residual rerank: **one thread per (query, candidate)** recomputes the residual-refined dot on
 /// device, moving the `O(C·dim)` rerank off the CPU (which capped the two-stage at ~1000 QPS). It gathers
 /// the candidate's 4-bit scan code (nibble) + 8+8 residual (byte) and evaluates
 /// `⟨q,x⟩ = qc + Σ_d rq_full[d]·(scale·u + bias + step1·r1 + step2·r2)`, where `bias = scale·c_B + lo1 + lo2`
 /// folds the grid constant and both residual offsets — the same value the CPU path gets via
 /// `reconstruct_rotated`. OOB/padded candidates (`cand ≥ n_real`) score −inf so the final top-k drops them.
 #[cube(launch_unchecked)]
-fn rerank_warren(
+fn rerank_mouse(
     rq_t: &Array<f32>,
-    warren_rc: &Array<f32>,
+    mouse_rc: &Array<f32>,
     qc: &Array<f32>,
     cand_idx: &Array<u32>,
     codes_w: &Array<u32>,
@@ -328,8 +328,8 @@ fn rerank_warren(
                 let r1 = ((c1_w[d * nw_byte + wib] >> shb) & 255u32) as f32;
                 let r2 = ((c2_w[d * nw_byte + wib] >> shb) & 255u32) as f32;
                 let r_full = sc * u + bi + s1 * r1 + s2 * r2;
-                // rq_full[d] = R·q = R·(q−c) + R·c = rq_t[d][q] + warren_rc[d]  (rotation done on the GPU).
-                acc += (rq_t[d * bb + q] + warren_rc[d]) * r_full;
+                // rq_full[d] = R·q = R·(q−c) + R·c = rq_t[d][q] + mouse_rc[d]  (rotation done on the GPU).
+                acc += (rq_t[d * bb + q] + mouse_rc[d]) * r_full;
             }
             out[pos] = qc[q] + acc;
         } else {
@@ -966,8 +966,8 @@ impl GpuFlatIndex {
 
     /// The coarse stage of a two-stage search: GPU scan (the index's quantized mode) → top-`c` candidate
     /// **indices** per query (real indices only). The caller reranks this small pool with a precise
-    /// representation (exact f32 in [`search_batch_reranked`](Self::search_batch_reranked), or Warren's
-    /// 8-bit residual in [`WarrenRerankIndex`]).
+    /// representation (exact f32 in [`search_batch_reranked`](Self::search_batch_reranked), or Mouse's
+    /// 8-bit residual in [`MouseRerankIndex`]).
     pub fn coarse_candidates(&self, queries: &[Vec<f32>], c: usize) -> Vec<Vec<usize>> {
         let n_real = self.ids.len();
         let mut out = Vec::with_capacity(queries.len());
@@ -998,7 +998,7 @@ impl GpuFlatIndex {
     /// which candidates enter the pool). `vecs` must be the corpus the index was built from. Falls back to
     /// [`search_batch`](Self::search_batch) when `rerank_c <= k` (nothing to refine).
     ///
-    /// This is the flat-index form of Warren's two-phase idea. Warren avoids retaining f32 by reranking
+    /// This is the flat-index form of Mouse's two-phase idea. Mouse avoids retaining f32 by reranking
     /// against an 8-bit residual (⅓ less memory); here f32 is read only for the `rerank_c` candidates, and
     /// establishes the recall ceiling the residual variant would approximate.
     pub fn search_batch_reranked(
@@ -1240,10 +1240,10 @@ impl GpuFlatIndex {
     }
 }
 
-/// Per-vector Warren residual: a **two-level 8+8-bit** quantization of `R·(x−c) − reconstruct_rotated`,
+/// Per-vector Mouse residual: a **two-level 8+8-bit** quantization of `R·(x−c) − reconstruct_rotated`,
 /// each level with its own affine (`lo`/`step`). Two levels reach the f32 rerank ceiling where one is
 /// ~0.002 short (a single 8-bit range can't resolve both the coarse residual and what it leaves).
-struct WarrenRes {
+struct MouseRes {
     lo1: f32,
     step1: f32,
     lo2: f32,
@@ -1252,8 +1252,8 @@ struct WarrenRes {
     c2: Vec<u8>,
 }
 
-/// Quantize `v` to 8 bits with a shared affine — mirrors `foxstash-core`'s Warren `quant` closure exactly.
-fn warren_quant(v: &[f32]) -> (f32, f32, Vec<u8>) {
+/// Quantize `v` to 8 bits with a shared affine — mirrors `foxstash-core`'s Mouse `quant` closure exactly.
+fn mouse_quant(v: &[f32]) -> (f32, f32, Vec<u8>) {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for &x in v {
         lo = lo.min(x);
@@ -1273,23 +1273,23 @@ fn warren_quant(v: &[f32]) -> (f32, f32, Vec<u8>) {
     (lo, step, codes)
 }
 
-/// Warren-style two-stage index (**1c, the memory path**): a TurboRabit 4-bit GPU scan for the coarse
+/// Mouse-style two-stage index (**1c, the memory path**): a TurboRabit 4-bit GPU scan for the coarse
 /// stage plus a per-vector **8+8-bit residual** — and **no retained f32**. The rerank rescores the coarse
 /// top-C in rotated space, `⟨q,x⟩ = ⟨q,c⟩ + ⟨R·q, r_recon + e⟩` (`R` orthonormal ⇒ this is the exact dot
 /// as the residual → the true one), reaching ~0.99 recall at ~⅓ less memory than retaining f32. Port of
-/// `foxstash-core`'s `Storage::Warren`; the residual encode and rerank mirror the CPU derivation exactly.
+/// `foxstash-core`'s `Storage::Mouse`; the residual encode and rerank mirror the CPU derivation exactly.
 ///
 /// This is the memory-conscious backend for the two-stage framework: pick it over
 /// [`GpuFlatIndex::search_batch_reranked`]'s exact f32 rerank when you chose 4-bit codes *for* their half
 /// memory, since storing f32 would erase that win.
-pub struct WarrenRerankIndex {
+pub struct MouseRerankIndex {
     inner: GpuFlatIndex,
     quant: TurboRabitQuantizer,
     /// `R·c` — the rotated centroid, added to `prepare_query`'s `rq` to get `R·q` once per query.
-    warren_rc: Vec<f32>,
+    mouse_rc: Vec<f32>,
     /// Per-vector 4-bit codes; drive `reconstruct_rotated` (the coarse reconstruction the residual refines).
     codes: Vec<TurboRabitCode>,
-    res: Vec<WarrenRes>,
+    res: Vec<MouseRes>,
     /// GPU-resident residual for [`Self::search_batch_gpu`]: byte-packed 8-bit levels `[dim][n/4]` plus the
     /// per-vector `scale`/`bias`/`step1`/`step2` (`bias = scale·c_B + lo1 + lo2`). No f32 — 16 bits/dim.
     c1_w: cubecl::server::Handle,
@@ -1300,18 +1300,18 @@ pub struct WarrenRerankIndex {
     g_step2: cubecl::server::Handle,
 }
 
-impl WarrenRerankIndex {
-    /// Build a Warren index: a TurboRabit-`bits` GPU scan index plus the per-vector 8+8 residual. `bits`
-    /// ∈ 1..=4 (Warren is the 4-bit-walk mode). The residual quantizer is refit deterministically, so it
+impl MouseRerankIndex {
+    /// Build a Mouse index: a TurboRabit-`bits` GPU scan index plus the per-vector 8+8 residual. `bits`
+    /// ∈ 1..=4 (Mouse is the 4-bit-walk mode). The residual quantizer is refit deterministically, so it
     /// matches the codes the inner scan was built with.
     pub fn build(vecs: &[Vec<f32>], ids: Vec<String>, bits: usize) -> Self {
         assert!(
             (1..=4).contains(&bits),
-            "Warren bits must be in 1..=4, got {bits}"
+            "Mouse bits must be in 1..=4, got {bits}"
         );
         let inner = GpuFlatIndex::build_turborabit(vecs, ids, bits);
         let quant = TurboRabitQuantizer::fit(vecs, bits);
-        let warren_rc = quant.rotate(quant.centroid());
+        let mouse_rc = quant.rotate(quant.centroid());
 
         // GPU residual arrays: byte-packed 8-bit levels [dim][n/4] + per-vector scale/bias/step1/step2,
         // padded to the inner index's n (padded rows stay zero → they score −inf at rerank).
@@ -1332,13 +1332,13 @@ impl WarrenRerankIndex {
             let centred: Vec<f32> = v.iter().zip(quant.centroid()).map(|(a, b)| a - b).collect();
             let r_true = quant.rotate(&centred);
             let e: Vec<f32> = r_true.iter().zip(&r_recon).map(|(a, b)| a - b).collect();
-            let (lo1, step1, c1) = warren_quant(&e);
+            let (lo1, step1, c1) = mouse_quant(&e);
             let e2: Vec<f32> = e
                 .iter()
                 .zip(&c1)
                 .map(|(&x, &c)| x - (lo1 + c as f32 * step1))
                 .collect();
-            let (lo2, step2, c2) = warren_quant(&e2);
+            let (lo2, step2, c2) = mouse_quant(&e2);
 
             // pack residual codes [dim][n/4] (byte per code) and the folded per-vector scalars for the GPU.
             for d in 0..dim {
@@ -1366,7 +1366,7 @@ impl WarrenRerankIndex {
             g_step2[i] = step2;
 
             codes.push(code);
-            res.push(WarrenRes {
+            res.push(MouseRes {
                 lo1,
                 step1,
                 lo2,
@@ -1387,7 +1387,7 @@ impl WarrenRerankIndex {
             g_step2: upf(g_step2),
             inner,
             quant,
-            warren_rc,
+            mouse_rc,
             codes,
             res,
         }
@@ -1411,7 +1411,7 @@ impl WarrenRerankIndex {
                 let rq_full: Vec<f32> = prep
                     .rq()
                     .iter()
-                    .zip(&self.warren_rc)
+                    .zip(&self.mouse_rc)
                     .map(|(a, b)| a + b)
                     .collect();
                 let qc: f32 = q
@@ -1454,7 +1454,7 @@ impl WarrenRerankIndex {
     }
 
     /// Two-stage search with the rerank **on the GPU**: coarse 4-bit scan → top-`rerank_c` → the
-    /// `rerank_warren` kernel recomputes the residual-refined dot on device → a cheap CPU top-`k` over the
+    /// `rerank_mouse` kernel recomputes the residual-refined dot on device → a cheap CPU top-`k` over the
     /// `rerank_c` refined scores. Same result as [`search_batch`](Self::search_batch) (which reranks on the
     /// CPU) but the `O(C·dim)` work runs in parallel — this is what uncaps the ~1000-QPS CPU-rerank ceiling.
     pub fn search_batch_gpu(
@@ -1474,10 +1474,10 @@ impl WarrenRerankIndex {
             // coarse stage on the GPU: scan → top-C candidate indices (kept on device as `oi`).
             let oh = self.inner.scan_chunk(chunk, b);
             let (_os, oi) = self.inner.topk_pipeline(oh, b, rerank_c);
-            // R lives in the inner TR4 index; the rerank's R·q is done on the GPU too (rq_t + warren_rc).
+            // R lives in the inner TR4 index; the rerank's R·q is done on the GPU too (rq_t + mouse_rc).
             let r_w = match &self.inner.mode {
                 Mode::TurboRabit { r_w, .. } => r_w,
-                _ => unreachable!("WarrenRerankIndex inner is always TurboRabit"),
+                _ => unreachable!("MouseRerankIndex inner is always TurboRabit"),
             };
             let centroid = self.quant.centroid();
             let mut centered = vec![0f32; b * dim];
@@ -1507,12 +1507,12 @@ impl WarrenRerankIndex {
                     dim as u32,
                 );
             }
-            let rch = client.create(cubecl::bytes::Bytes::from_elems(self.warren_rc.clone()));
+            let rch = client.create(cubecl::bytes::Bytes::from_elems(self.mouse_rc.clone()));
             let qch = client.create(cubecl::bytes::Bytes::from_elems(qcv));
             let outh = client.empty(b * rerank_c * core::mem::size_of::<f32>());
             let total = (b * rerank_c) as u32;
             unsafe {
-                rerank_warren::launch_unchecked(
+                rerank_mouse::launch_unchecked(
                     client,
                     CubeCount::Static(total.div_ceil(threads), 1, 1),
                     CubeDim::new_1d(threads),
@@ -2266,10 +2266,10 @@ mod tests {
         }
     }
 
-    /// Warren's 8+8-bit residual rerank (no f32) must recover recall like the f32 rerank does — it tracks
+    /// Mouse's 8+8-bit residual rerank (no f32) must recover recall like the f32 rerank does — it tracks
     /// the exact dot because the reconstruction approaches R·(x−c) and R is orthonormal.
     #[test]
-    fn warren_residual_reranks_without_f32() {
+    fn mouse_residual_reranks_without_f32() {
         let (n, dim, k, c) = (3000usize, 128usize, 10usize, 100usize);
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let centers: Vec<Vec<f32>> = (0..30)
@@ -2288,7 +2288,7 @@ mod tests {
             .collect();
         let ids: Vec<String> = (0..n).map(|i| i.to_string()).collect();
         let plain_idx = GpuFlatIndex::build_turborabit(&vecs, ids.clone(), 4);
-        let warren = WarrenRerankIndex::build(&vecs, ids, 4);
+        let mouse = MouseRerankIndex::build(&vecs, ids, 4);
         let queries: Vec<Vec<f32>> = (0..40).map(|qi| vecs[qi * 13 % n].clone()).collect();
 
         let recall = |res: &[Vec<SearchResult>]| -> f64 {
@@ -2311,11 +2311,11 @@ mod tests {
 
         let plain = recall(&plain_idx.search_batch(&queries, k));
         let f32rr = recall(&plain_idx.search_batch_reranked(&queries, k, c, &vecs));
-        let warrenrr = recall(&warren.search_batch(&queries, k, c));
-        // Warren recovers most of what the f32 rerank does, well above the un-reranked coarse recall.
+        let mouserr = recall(&mouse.search_batch(&queries, k, c));
+        // Mouse recovers most of what the f32 rerank does, well above the un-reranked coarse recall.
         assert!(
-            warrenrr > plain && warrenrr >= f32rr - 0.05 && warrenrr > 0.9,
-            "warren rerank: plain {plain:.3}, f32 {f32rr:.3}, warren {warrenrr:.3}"
+            mouserr > plain && mouserr >= f32rr - 0.05 && mouserr > 0.9,
+            "mouse rerank: plain {plain:.3}, f32 {f32rr:.3}, mouse {mouserr:.3}"
         );
 
         // IVF: probing more cells raises recall toward exact; enough probes ⇒ near-exact.
@@ -2371,14 +2371,14 @@ mod tests {
         );
 
         // The GPU rerank kernel must reproduce the CPU rerank (the tested oracle) top-k per query.
-        let gpu = warren.search_batch_gpu(&queries, k, c);
-        let cpu = warren.search_batch(&queries, k, c);
+        let gpu = mouse.search_batch_gpu(&queries, k, c);
+        let cpu = mouse.search_batch(&queries, k, c);
         for (g, cp) in gpu.iter().zip(&cpu) {
             let gs: std::collections::HashSet<&str> = g.iter().map(|r| r.id.as_str()).collect();
             let cs: std::collections::HashSet<&str> = cp.iter().map(|r| r.id.as_str()).collect();
             assert_eq!(
                 gs, cs,
-                "GPU Warren rerank != CPU Warren rerank — kernel bug"
+                "GPU Mouse rerank != CPU Mouse rerank — kernel bug"
             );
         }
     }
