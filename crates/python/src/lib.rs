@@ -60,21 +60,21 @@ fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
             }
             Ok((Storage::TurboRabit, bits))
         }
-        // Warren: turborabit's 4-bit walk + a two-level 8+8 residual rerank, no retained f32.
-        // The bit budget is turborabit's, so "warren4" style suffixes route the same way.
-        other if other.starts_with("warren") => {
-            let bits = other["warren".len()..].parse::<usize>().unwrap_or(4);
+        // Mouse: turborabit's 4-bit walk + a two-level 8+8 residual rerank, no retained f32.
+        // The bit budget is turborabit's, so "mouse4" style suffixes route the same way.
+        other if other.starts_with("mouse") => {
+            let bits = other["mouse".len()..].parse::<usize>().unwrap_or(4);
             if !(1..=4).contains(&bits) {
                 return Err(PyValueError::new_err(
-                    "foxstash: warren bit budget must be in 1..=4 (e.g. \"warren4\") — it is \
+                    "foxstash: mouse bit budget must be in 1..=4 (e.g. \"mouse4\") — it is \
                      turborabit's walk code, which is nibble-packed.",
                 ));
             }
-            Ok((Storage::Warren, bits))
+            Ok((Storage::Mouse, bits))
         }
         other => Err(PyValueError::new_err(format!(
             "foxstash: unsupported storage {other:?}. Expected \"f32\", \"sq8\", \"rabitq\", \
-             \"turboquant[N]\", \"turborabit[N]\", or \"warren[N]\"."
+             \"turboquant[N]\", \"turborabit[N]\", or \"mouse[N]\"."
         ))),
     }
 }
@@ -133,8 +133,8 @@ impl Foxstash {
             } else {
                 HNSWConfig::default().turbo_bits
             },
-            // Warren's walk IS turborabit's, so it reads the same bit budget.
-            rabit_bits: if matches!(self.storage, Storage::TurboRabit | Storage::Warren) {
+            // Mouse's walk IS turborabit's, so it reads the same bit budget.
+            rabit_bits: if matches!(self.storage, Storage::TurboRabit | Storage::Mouse) {
                 self.turbo_bits
             } else {
                 HNSWConfig::default().rabit_bits

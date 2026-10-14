@@ -750,10 +750,8 @@ mod compression_roundtrip {
         assert_eq!(raw_bytes, decompressed);
 
         // Reconstruct and verify
-        let reconstructed: Vec<f32> = decompressed
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let (chunks, _) = decompressed.as_chunks::<4>();
+        let reconstructed: Vec<f32> = chunks.iter().map(|&c| f32::from_le_bytes(c)).collect();
         assert_eq!(embeddings, reconstructed);
     }
 

@@ -1,7 +1,7 @@
 //! RaBitQ quantization — theoretically-grounded 1-bit quantization with an
 //! unbiased distance estimator (Gao & Long, "RaBitQ", SIGMOD 2024).
 //!
-//! Unlike [`BinaryQuantizer`](super::quantize::BinaryQuantizer), which packs
+//! Unlike a plain sign-bit binary quantizer, which packs
 //! sign bits and compares them with crude Hamming distance, RaBitQ:
 //!
 //! 1. Subtracts a shared **centroid** and works on unit residuals.
@@ -245,7 +245,7 @@ impl RaBitQuantizer {
     }
 
     /// Reconstruct an approximate vector from its code. Lossy (sign-only) but directionally
-    /// correct; used by [`Self::distance_symmetric`].
+    /// correct; used by [`Self::distance_quantized`].
     pub fn dequantize(&self, quantized: &RaBitCode) -> Vec<f32> {
         // Reconstruct o ≈ c + dtc · Rᵀ · x̄, where x̄ᵢ = ±1/√D from the sign bits.
         // Lossy (sign-only), but directionally correct.

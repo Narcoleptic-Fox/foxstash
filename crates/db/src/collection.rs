@@ -772,11 +772,41 @@ impl Collection {
     /// collection has no sample at construction. That is solved by staging — see
     /// [`Self::fit`] — so SQ8, RaBitQ and TurboRabit are now reachable.
     ///
-    /// `Warren` is different and still refused: it retains no f32 at all, so core's
+    /// `Mouse` is different and still refused: it retains no f32 at all, so core's
     /// incremental `add()` cannot compute the exact distances edge selection needs.
     /// It is a bulk-build-only mode, and no amount of staging changes that.
+    ///
+    /// # Why it stays refused, reviewed 2026-07-27
+    ///
+    /// This was reconsidered deliberately, because the case for lifting it is real: on a
+    /// 45k × 768-d embedding corpus Mouse reaches **99.99% recall in 37 MB where F32 needs
+    /// 158 MB** — the best memory/recall point in the enum, unavailable to the layer most
+    /// users actually touch.
+    ///
+    /// And it is *mechanically* within reach. [`Self::fit_locked`] already does a full
+    /// `build_parallel_from_documents` rebuild, which is exactly the bulk build Mouse needs,
+    /// and core rejects `add()` on a Mouse index explicitly rather than degrading quietly. So
+    /// the shape would be a collection that ingests normally, fits, and is **sealed** to further
+    /// inserts.
+    ///
+    /// Refused anyway, for two reasons:
+    ///
+    /// 1. **Mouse's rerank is currently broken under `DistanceMetric::L2` on vectors that are
+    ///    not unit-norm** — it clamps every candidate to distance 0 and returns score 1.0 for
+    ///    every result (see `mouse_rerank_works_under_l2_on_unnormalized_vectors` in core).
+    ///    Widening access to a mode whose accuracy stage silently vanishes on a whole
+    ///    metric/scale combination enlarges the blast radius of a known defect.
+    /// 2. A sealed-after-fit collection is a **new lifecycle state**, and every path that
+    ///    mutates — `insert`, `delete`, `compact`, WAL replay — would have to agree about it.
+    ///    Bolting that on immediately after the db redesign is the same "I needed it, so it went
+    ///    in" move the redesign existed to undo.
+    ///
+    /// Revisit when the L2 rerank is fixed **and** a read-only/sealed collection is a designed
+    /// concept rather than a special case for one storage mode. Until then, callers who want
+    /// Mouse's memory profile should build the index through `foxstash-core` directly, where
+    /// bulk-build-only is the documented contract rather than a surprise.
     fn reject_incremental_quantized_storage(config: &DbConfig) -> Result<()> {
-        if config.hnsw.storage == foxstash_core::index::Storage::Warren {
+        if config.hnsw.storage == foxstash_core::index::Storage::Mouse {
             return Err(DbError::UnsupportedIncrementalStorage {
                 storage: config.hnsw.storage,
             });
@@ -1491,15 +1521,15 @@ mod tests {
         assert_eq!(c.len(), 201);
     }
 
-    /// Warren is bulk-build-only — it retains no f32, so no amount of staging lets
+    /// Mouse is bulk-build-only — it retains no f32, so no amount of staging lets
     /// it accept incremental inserts. It must still be refused up front.
     #[test]
-    fn warren_storage_is_still_rejected_for_collections() {
+    fn mouse_storage_is_still_rejected_for_collections() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("c");
         std::fs::create_dir_all(&path).unwrap();
         let hnsw = foxstash_core::index::HNSWConfig {
-            storage: foxstash_core::index::Storage::Warren,
+            storage: foxstash_core::index::Storage::Mouse,
             ..Default::default()
         };
         let cfg = DbConfig {

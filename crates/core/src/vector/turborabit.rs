@@ -474,7 +474,7 @@ impl TurboRabitQuantizer {
     /// Reconstruct an approximation of the original vector from its code.
     ///
     /// TurboRabit is normally used as a distance *estimator*, not a codec — but the code does
-    /// determine a reconstruction, and Warren needs one so an 8-bit residual can be taken against
+    /// determine a reconstruction, and Mouse needs one so an 8-bit residual can be taken against
     /// it. Inverting [`Self::encode`]:
     ///
     /// - the packed sign + magnitude give the grid value `±(m + ½)`, i.e. the **direction** of the

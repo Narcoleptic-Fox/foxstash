@@ -1,6 +1,6 @@
 //! 1c: does a two-stage exact-f32 rerank of the coarse top-C recover the recall the quantizer lost?
 //! Plain vs reranked (recall + QPS) per mode. Run: VECS_DIR=<dir> cargo run -p foxstash-gpu --example rerank --release
-use foxstash_gpu::{GpuFlatIndex, WarrenRerankIndex};
+use foxstash_gpu::{GpuFlatIndex, MouseRerankIndex};
 use std::time::Instant;
 
 fn read_f32(p: &str) -> Vec<f32> {
@@ -102,24 +102,24 @@ fn main() {
         );
     }
 
-    // Warren: 4-bit scan + 8+8 residual rerank, NO f32. CPU-rerank vs GPU-gather-rerank (same result).
-    let warren = WarrenRerankIndex::build(&vecs, ids.clone(), 4);
-    let wr = recall(&warren.search_batch(&qs, k, c));
-    let wq = qps(&|| warren.search_batch(&qs, k, c));
-    let gr = recall(&warren.search_batch_gpu(&qs, k, c));
-    let gq = qps(&|| warren.search_batch_gpu(&qs, k, c));
+    // Mouse: 4-bit scan + 8+8 residual rerank, NO f32. CPU-rerank vs GPU-gather-rerank (same result).
+    let mouse = MouseRerankIndex::build(&vecs, ids.clone(), 4);
+    let wr = recall(&mouse.search_batch(&qs, k, c));
+    let wq = qps(&|| mouse.search_batch(&qs, k, c));
+    let gr = recall(&mouse.search_batch_gpu(&qs, k, c));
+    let gq = qps(&|| mouse.search_batch_gpu(&qs, k, c));
     println!(
         "{:>8} {:>9} {wr:>9.4} {:>9} {wq:>9.0}   (8+8 residual, CPU rerank)",
-        "Warren", "-", "-"
+        "Mouse", "-", "-"
     );
     println!(
         "{:>8} {:>9} {gr:>9.4} {:>9} {gq:>9.0}   (8+8 residual, GPU gather-rerank)",
-        "Warren-G", "-", "-"
+        "Mouse-G", "-", "-"
     );
-    // The rerank representation: f32 keeps 32 bits/dim; Warren's 8+8 residual is 16 bits/dim (no f32) and
+    // The rerank representation: f32 keeps 32 bits/dim; Mouse's 8+8 residual is 16 bits/dim (no f32) and
     // reaches the same recall — half the rerank memory. (The 4-bit scan codes are shared with the coarse
     // stage either way.)
     println!(
-        "rerank repr/dim: f32 = 32 bits  vs  Warren 8+8 residual = 16 bits (no f32, same recall)"
+        "rerank repr/dim: f32 = 32 bits  vs  Mouse 8+8 residual = 16 bits (no f32, same recall)"
     );
 }
