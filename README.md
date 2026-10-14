@@ -103,6 +103,24 @@ the whole frontier. On GIST (960-d, 100k), `Storage::SQ8` with `rerank_candidate
 **98.40% recall@10 in 139 MB** — 3.2x smaller than `RaBitQ + rerank` (440 MB) at the same recall,
 trading about 2.6x QPS. If memory is your binding constraint, start here.
 
+### The memory-lean modes (`Storage::TurboRabit` / `Storage::Mouse`)
+
+Two newer codes trade a little recall headroom for a much smaller footprint.
+
+- **`Storage::TurboRabit`** (Extended RaBitQ) is a multi-bit code (4-bit by default) that holds up
+  on out-of-distribution data where plain 1-bit `RaBitQ` can collapse (0.987 vs 0.888 recall@10 on
+  the yandex-200 OOD set). Reach for it when you want a smaller index than `SQ8` with more
+  robustness than a 1-bit code. It works through the incremental `Collection` API: it stages in F32
+  and quantizes on `fit`.
+- **`Storage::Mouse`** is `TurboRabit`'s 4-bit walk plus a two-level 8+8-bit residual rerank with
+  no retained f32, at roughly **one third** the vector memory of `TurboRabit` (1,152 B vs 3,456 B
+  at 768-d) and near-F32 recall. The trade is that it is **bulk-build only**: it keeps no exact
+  vectors, so incremental `add()` cannot select graph edges and the `Collection` layer refuses it.
+  Build it once over the whole corpus with `HNSWIndex::build` / `build_parallel`.
+
+`Storage::TurboQuant` is **deprecated** as of 0.7 (removal in 0.8); `TurboRabit` dominates it at
+every bit budget, so migrate to `TurboRabit` or `SQ8`.
+
 > ### ⚠️ Pick your storage mode by dimension — the two swap places
 >
 > The right code depends on your dimension, and the two **trade places**:
