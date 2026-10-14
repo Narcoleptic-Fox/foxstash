@@ -674,10 +674,8 @@ mod tests {
         assert_eq!(data, decompressed);
 
         // Verify we can reconstruct embeddings
-        let reconstructed: Vec<f32> = decompressed
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+        let (chunks, _) = decompressed.as_chunks::<4>();
+        let reconstructed: Vec<f32> = chunks.iter().map(|&c| f32::from_le_bytes(c)).collect();
         assert_eq!(embeddings, reconstructed);
     }
 
