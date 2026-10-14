@@ -20,7 +20,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Toolchain is PINNED, not `@stable`. A floating stable silently pulls each new release's
       # clippy lints, which turned CI red on unchanged code (clippy 1.99 added
@@ -81,7 +81,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.99.0
@@ -104,7 +104,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.99.0
@@ -124,7 +124,7 @@ jobs:
     name: WASM Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.99.0
@@ -144,7 +144,7 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.99.0
@@ -176,7 +176,7 @@ jobs:
     name: Every config option reaches every path that claims it
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Fails if a public HNSWConfig field is read by no entry point (a public option nothing
       # honours -- the shape of four bugs in the 1.0 audit), or if the matrix embedded in
       # docs/ARCHITECTURE.md has drifted from the source. A generated diagram that is allowed to
@@ -187,7 +187,7 @@ jobs:
     name: Python binding (recall vs brute force)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: actions/setup-python@v5
         with:

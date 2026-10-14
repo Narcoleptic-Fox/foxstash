@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@1.99.0
@@ -76,7 +76,7 @@ jobs:
     if: ${{ !contains(github.ref_name, '-') }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@1.99.0
@@ -190,7 +190,7 @@ jobs:
             asset_name: foxstash-native-windows-x86_64.dll
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (${{ matrix.target }})
         uses: dtolnay/rust-toolchain@1.99.0
@@ -249,7 +249,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (stable + wasm32 target)
         uses: dtolnay/rust-toolchain@1.99.0
@@ -300,7 +300,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history is required so that git log can reach the previous tag.
           fetch-depth: 0
