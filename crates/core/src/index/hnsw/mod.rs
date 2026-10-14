@@ -1633,7 +1633,28 @@ impl HNSWIndex {
     /// foxstash version refuses to load (with a clear error) instead of misreading. Use the
     /// JSON path for anything that must outlive a version bump.
     pub fn snapshot_to_file(&self, path: &std::path::Path) -> Result<()> {
-        let snap = HNSWSnapshot {
+        // Streams straight to disk, so the plaintext path never holds the whole snapshot in
+        // memory. Callers that must post-process the bytes use `snapshot_to_bytes` instead.
+        let file = std::fs::File::create(path)?;
+        bincode::serialize_into(std::io::BufWriter::new(file), &self.build_snapshot())?;
+        Ok(())
+    }
+
+    /// Serialize the same snapshot [`Self::snapshot_to_file`] writes, into an in-memory buffer.
+    ///
+    /// The byte-level counterpart to `snapshot_to_file`, for callers that must transform the
+    /// bytes before they reach disk, e.g. `foxstash-db` encrypting the snapshot through a
+    /// caller-supplied cipher. This buffers the entire snapshot (hundreds of MB for a large
+    /// index), so the plaintext path should keep using the streaming `snapshot_to_file`; reach
+    /// for this only when the bytes themselves are needed.
+    pub fn snapshot_to_bytes(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(&self.build_snapshot())?)
+    }
+
+    /// Assemble the serializable snapshot of the current in-memory layout. Shared by
+    /// [`Self::snapshot_to_file`] and [`Self::snapshot_to_bytes`] so the two cannot drift.
+    fn build_snapshot(&self) -> HNSWSnapshot {
+        HNSWSnapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
             embedding_dim: self.embedding_dim,
@@ -1657,10 +1678,7 @@ impl HNSWIndex {
                 .collect(),
             entry_point: self.entry_point,
             max_layer: self.max_layer,
-        };
-        let file = std::fs::File::create(path)?;
-        bincode::serialize_into(std::io::BufWriter::new(file), &snap)?;
-        Ok(())
+        }
     }
 
     /// Load a [`Self::snapshot_to_file`] snapshot. The graph is restored verbatim; the level
@@ -1680,6 +1698,28 @@ impl HNSWIndex {
             .allow_trailing_bytes()
             .with_limit(limit)
             .deserialize_from(std::io::BufReader::new(file))?;
+        Self::from_snapshot(snap)
+    }
+
+    /// Load a snapshot from bytes produced by [`Self::snapshot_to_bytes`] — the decrypt-side
+    /// counterpart for callers like `foxstash-db`. Applies the same version guard and
+    /// validation as [`Self::snapshot_from_file`].
+    pub fn snapshot_from_bytes(data: &[u8]) -> Result<HNSWIndex> {
+        use bincode::Options;
+        // Same config the file path uses; the limit bounds allocation off a foreign or corrupt
+        // length prefix. `fixint + allow_trailing_bytes` matches what `bincode::serialize` writes.
+        let snap: HNSWSnapshot = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(data.len() as u64)
+            .deserialize(data)?;
+        Self::from_snapshot(snap)
+    }
+
+    /// Validate a deserialized snapshot and rebuild the in-memory index. Shared by
+    /// [`Self::snapshot_from_file`] and [`Self::snapshot_from_bytes`] so the version guard and
+    /// shape checks cannot drift between the two entry points.
+    fn from_snapshot(snap: HNSWSnapshot) -> Result<HNSWIndex> {
         if snap.format_version != SNAPSHOT_FORMAT_VERSION
             || snap.crate_version != env!("CARGO_PKG_VERSION")
         {

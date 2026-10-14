@@ -35,6 +35,13 @@ pub enum RagError {
     #[error("Storage error: {0}")]
     StorageError(String),
 
+    /// An encrypted artifact (WAL entry, checkpoint, or graph snapshot) could not be
+    /// authenticated and decrypted. Raised fail-closed: a wrong key, a failed authentication tag,
+    /// a tampered or rolled-back artifact, or a missing cipher for an encrypted store. Never
+    /// recovered from by falling back to plaintext or a rebuild, which would hide tampering.
+    #[error("decryption failed: {0}")]
+    Decryption(String),
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
