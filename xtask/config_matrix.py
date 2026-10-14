@@ -23,18 +23,13 @@ Two rules this tool must obey, both learned by getting them wrong:
     cell reported `read` is merely probable. Guarded by expected_failures.txt, which pins the four
     cells this tool must still report empty at commit 9aa7def.
 
-Usage: config_matrix.py [path/to/hnsw.rs]
+Usage: config_matrix.py [path/to/hnsw/ dir (default) or a single .rs file]
 """
 import re
 import sys
 import pathlib
 
-DEFAULT = pathlib.Path(__file__).parent.parent / "crates/core/src/index/hnsw.rs"
-src = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT).read_text()
-
-FIELDS = re.findall(
-    r"^\s+pub (\w+):", re.search(r"pub struct HNSWConfig \{(.*?)\n\}", src, re.S).group(1), re.M
-)
+DEFAULT = pathlib.Path(__file__).parent.parent / "crates/core/src/index/hnsw"
 
 
 def strip(line: str) -> str:
@@ -44,9 +39,35 @@ def strip(line: str) -> str:
     return re.sub(r"//.*", "", line)  # line comments and doc comments
 
 
-raw = src.split("\n")
-end = next((i for i, l in enumerate(raw) if l.strip() in ("#[cfg(test)]", "mod tests {")), len(raw))
-code = [strip(l) for l in raw[:end]]  # a field only tests read is a field nothing honours
+def gather(root: pathlib.Path):
+    """Read the hnsw module as one logical source.
+
+    `hnsw.rs` was split into a directory (config.rs, layout.rs, parallel.rs, mod.rs, ...), so no
+    single file still holds the struct, the entry points and their call subtrees together. The
+    matrix is built over every module file at once. `tests.rs` and each file's own `#[cfg(test)]`
+    tail are excluded: a field only a test reads is a field nothing honours. A file path is still
+    accepted (the pre-split layout, and for testing).
+    """
+    files = [root] if root.is_file() else sorted(
+        p for p in root.glob("*.rs") if p.name != "tests.rs"
+    )
+    full, code = [], []
+    for path in files:
+        lines = path.read_text().split("\n")
+        end = next(
+            (i for i, l in enumerate(lines) if l.strip() in ("#[cfg(test)]", "mod tests {")),
+            len(lines),
+        )
+        full.extend(lines)
+        code.extend(strip(l) for l in lines[:end])
+    return "\n".join(full), code
+
+
+src, code = gather(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else DEFAULT))
+
+FIELDS = re.findall(
+    r"^\s+pub (\w+):", re.search(r"pub struct HNSWConfig \{(.*?)\n\}", src, re.S).group(1), re.M
+)
 
 # fn name -> [(start, end), ...], by brace depth over comment-free lines.
 # `pending` handles multi-line signatures -- `fn search_inner(` puts its `{` several lines down.
