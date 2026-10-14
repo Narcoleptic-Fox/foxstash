@@ -76,25 +76,70 @@ pub fn recover(
         // a different version — lands in the same fallback, so correctness never
         // depends on it being there.
         let snapshot_path = base_path.join(format!("graph_{:05}.snapshot", meta.id));
-        match HNSWIndex::snapshot_from_file(&snapshot_path) {
-            Ok(loaded) if loaded.len() == checkpoint_docs.len() => {
+        // Load the snapshot, with one crucial difference under encryption: a snapshot that is
+        // PRESENT but fails to authenticate is a hard error (fail closed — it signals tampering or
+        // key loss, which a silent rebuild would hide). A genuinely absent snapshot, or one that
+        // authenticates but is stale/version-mismatched, falls back to rebuilding from the
+        // checkpoint, which is itself authenticated.
+        let loaded: Option<HNSWIndex> = match &config.cipher {
+            Some(cipher) => {
+                let store_id = storage.manifest().store_id;
+                match std::fs::read(&snapshot_path) {
+                    Ok(raw) => {
+                        let (role, generation, bytes) =
+                            foxstash_core::storage::open_artifact(cipher.as_ref(), &store_id, &raw)
+                                .map_err(|e| {
+                                    DbError::Core(foxstash_core::RagError::Decryption(
+                                        e.to_string(),
+                                    ))
+                                })?;
+                        if role != foxstash_core::storage::Role::Snapshot || generation != meta.id {
+                            return Err(DbError::Core(foxstash_core::RagError::Decryption(
+                                format!(
+                                    "graph snapshot is {role:?} generation {generation}, \
+                                     expected a Snapshot for checkpoint {}",
+                                    meta.id
+                                ),
+                            )));
+                        }
+                        // Authenticated. A from_bytes failure now is a stale/version cache miss,
+                        // not tampering, so rebuild rather than fail closed.
+                        match HNSWIndex::snapshot_from_bytes(&bytes) {
+                            Ok(idx) => Some(idx),
+                            Err(err) => {
+                                debug!(?err, "decrypted snapshot not loadable; rebuilding");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(DbError::Core(foxstash_core::RagError::StorageError(
+                            format!("failed to read graph snapshot: {e}"),
+                        )));
+                    }
+                }
+            }
+            None => HNSWIndex::snapshot_from_file(&snapshot_path).ok(),
+        };
+        match loaded {
+            Some(loaded) if loaded.len() == checkpoint_docs.len() => {
                 info!(
                     docs = checkpoint_docs.len(),
                     "graph loaded from snapshot; skipping rebuild"
                 );
                 index = loaded;
             }
-            Ok(loaded) => {
-                // Present but disagrees with the checkpoint — treat as stale.
-                debug!(
-                    snapshot_docs = loaded.len(),
-                    checkpoint_docs = checkpoint_docs.len(),
-                    "graph snapshot disagrees with checkpoint; rebuilding"
-                );
-                rebuild_index(&mut index, &checkpoint_docs)?;
-            }
-            Err(err) => {
-                debug!(?err, "no usable graph snapshot; rebuilding");
+            other => {
+                if let Some(loaded) = other {
+                    debug!(
+                        snapshot_docs = loaded.len(),
+                        checkpoint_docs = checkpoint_docs.len(),
+                        "graph snapshot disagrees with checkpoint; rebuilding"
+                    );
+                } else {
+                    debug!("no usable graph snapshot; rebuilding");
+                }
                 rebuild_index(&mut index, &checkpoint_docs)?;
             }
         }
