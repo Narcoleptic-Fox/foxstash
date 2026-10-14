@@ -73,12 +73,14 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use crate::storage::compression::{self, Codec};
+use crate::storage::encryption::{open_artifact, seal_artifact, Cipher, Role, StoreId};
 use crate::{Document, RagError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -239,6 +241,15 @@ pub struct Manifest {
     pub index_type: String,
     /// Last modified timestamp
     pub last_modified: u64,
+    /// Whether this store's content artifacts (WAL, checkpoints, graph snapshots) are encrypted.
+    /// The manifest itself stays plaintext — it holds only counts and dimensions, no content — so
+    /// this flag and [`Self::store_id`] can be read before any decryption to pick the right path.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Random per-store identifier, bound into every encrypted artifact's AAD so an artifact from
+    /// another store cannot be swapped in. All-zero for a plaintext store.
+    #[serde(default)]
+    pub store_id: StoreId,
 }
 
 impl Default for Manifest {
@@ -251,6 +262,8 @@ impl Default for Manifest {
             embedding_dim: 0,
             index_type: String::new(),
             last_modified: 0,
+            encrypted: false,
+            store_id: [0u8; 16],
         }
     }
 }
@@ -360,11 +373,20 @@ struct WalWriter {
     path: PathBuf, // Kept for future: WAL rotation, recovery logging
     current_size: usize,
     sync_on_write: bool,
+    /// When set, each entry's bytes are sealed before the length prefix is written. The entry's
+    /// `seq` is its AAD generation, binding the record to its position in the log.
+    cipher: Option<Arc<dyn Cipher>>,
+    store_id: StoreId,
 }
 
 impl WalWriter {
     /// Open or create WAL file
-    fn open(path: &Path, sync_on_write: bool) -> Result<Self> {
+    fn open(
+        path: &Path,
+        sync_on_write: bool,
+        cipher: Option<Arc<dyn Cipher>>,
+        store_id: StoreId,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -378,13 +400,21 @@ impl WalWriter {
             path: path.to_path_buf(),
             current_size,
             sync_on_write,
+            cipher,
+            store_id,
         })
     }
 
     /// Append entry to WAL
     fn append(&mut self, entry: &WalEntry) -> Result<()> {
-        let data = serde_json::to_vec(entry)
+        let plain = serde_json::to_vec(entry)
             .map_err(|e| RagError::StorageError(format!("WAL serialize failed: {}", e)))?;
+        // Seal per entry when encrypting, binding role + store + this entry's seq into the AAD so a
+        // record cannot be lifted to another store, role, or position.
+        let data = match &self.cipher {
+            Some(c) => seal_artifact(c.as_ref(), Role::Wal, &self.store_id, entry.seq, &plain),
+            None => plain,
+        };
         let len = data.len() as u32;
 
         // Write length prefix + data
@@ -429,15 +459,19 @@ impl WalWriter {
 /// Read entries from WAL
 struct WalReader {
     file: BufReader<File>,
+    cipher: Option<Arc<dyn Cipher>>,
+    store_id: StoreId,
 }
 
 impl WalReader {
     /// Open WAL for reading
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, cipher: Option<Arc<dyn Cipher>>, store_id: StoreId) -> Result<Self> {
         let file = File::open(path)
             .map_err(|e| RagError::StorageError(format!("Failed to open WAL: {}", e)))?;
         Ok(Self {
             file: BufReader::new(file),
+            cipher,
+            store_id,
         })
     }
 
@@ -462,8 +496,35 @@ impl WalReader {
                 Err(e) => return Err(RagError::StorageError(format!("WAL read failed: {}", e))),
             }
 
+            // Decrypt when a cipher is set. Fail closed: a WAL that will not authenticate is an
+            // error, never silently skipped. The entry's own `seq` must match the AAD generation
+            // the record was sealed under, so a record cannot be replayed at a forged position.
+            let plain = match &self.cipher {
+                Some(c) => {
+                    let (role, generation, pt) =
+                        open_artifact(c.as_ref(), &self.store_id, &data)
+                            .map_err(|e| RagError::Decryption(e.to_string()))?;
+                    if role != Role::Wal {
+                        return Err(RagError::Decryption(format!(
+                            "WAL entry sealed as {role:?}, not a WAL record"
+                        )));
+                    }
+                    (generation, pt)
+                }
+                None => (0u64, data),
+            };
+            let data = plain.1;
+            let sealed_gen = plain.0;
+
             let entry: WalEntry = serde_json::from_slice(&data)
                 .map_err(|e| RagError::StorageError(format!("WAL deserialize failed: {}", e)))?;
+
+            if self.cipher.is_some() && entry.seq != sealed_gen {
+                return Err(RagError::Decryption(format!(
+                    "WAL entry seq {} does not match the sealed position {sealed_gen}",
+                    entry.seq
+                )));
+            }
 
             // Verify integrity
             if !entry.verify() {
@@ -496,11 +557,29 @@ pub struct IncrementalStorage {
     manifest: Manifest,
     wal_writer: Option<WalWriter>,
     ops_since_sync: usize,
+    /// Caller-supplied cipher. When set, content artifacts (WAL, checkpoints, and the graph
+    /// snapshot the db layer writes) are sealed through it. `None` is the plaintext default.
+    cipher: Option<Arc<dyn Cipher>>,
 }
 
 impl IncrementalStorage {
-    /// Create or open incremental storage
+    /// Create or open incremental storage with no encryption (plaintext on disk).
     pub fn new<P: AsRef<Path>>(base_path: P, config: IncrementalConfig) -> Result<Self> {
+        Self::new_with_cipher(base_path, config, None)
+    }
+
+    /// Create or open incremental storage, optionally encrypting content artifacts through a
+    /// caller-supplied [`Cipher`].
+    ///
+    /// Fail closed on an encryption mismatch: opening an encrypted store without a cipher, or an
+    /// existing plaintext store *with* one, is an error rather than a silent plaintext read or a
+    /// store that mixes framings. A newly created encrypted store gets a random `store_id` and its
+    /// manifest is persisted immediately so the id survives a crash before the first checkpoint.
+    pub fn new_with_cipher<P: AsRef<Path>>(
+        base_path: P,
+        config: IncrementalConfig,
+        cipher: Option<Arc<dyn Cipher>>,
+    ) -> Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
 
         // Create directory if needed
@@ -509,7 +588,8 @@ impl IncrementalStorage {
 
         // Load or create manifest
         let manifest_path = base_path.join("manifest.json");
-        let manifest = if manifest_path.exists() {
+        let existed = manifest_path.exists();
+        let mut manifest: Manifest = if existed {
             let data = fs::read_to_string(&manifest_path)
                 .map_err(|e| RagError::StorageError(format!("Failed to read manifest: {}", e)))?;
             serde_json::from_str(&data)
@@ -518,20 +598,55 @@ impl IncrementalStorage {
             Manifest::default()
         };
 
+        // Fail-closed encryption/cipher consistency checks.
+        if existed {
+            if manifest.encrypted && cipher.is_none() {
+                return Err(RagError::Decryption(
+                    "store is encrypted but no cipher was supplied to open it".into(),
+                ));
+            }
+            if !manifest.encrypted && cipher.is_some() {
+                return Err(RagError::Decryption(
+                    "cannot add encryption to an existing plaintext store; create a new encrypted \
+                     store and migrate the data"
+                        .into(),
+                ));
+            }
+        } else if cipher.is_some() {
+            // Fresh encrypted store: mint a random id and record it, plaintext, so a reopen can
+            // read it before decrypting anything.
+            manifest.encrypted = true;
+            manifest.store_id = rand::random::<[u8; 16]>();
+        }
+
         // Open WAL writer
         let wal_path = base_path.join(format!(
             "wal_{:05}.log",
             manifest.current_checkpoint.unwrap_or(0)
         ));
-        let wal_writer = WalWriter::open(&wal_path, config.sync_on_write)?;
+        let wal_writer = WalWriter::open(
+            &wal_path,
+            config.sync_on_write,
+            cipher.clone(),
+            manifest.store_id,
+        )?;
 
-        Ok(Self {
+        let storage = Self {
             base_path,
             config,
             manifest,
             wal_writer: Some(wal_writer),
             ops_since_sync: 0,
-        })
+            cipher,
+        };
+
+        // Persist the manifest for a freshly created encrypted store so store_id/encrypted are
+        // durable even if nothing is checkpointed before a crash.
+        if !existed && storage.cipher.is_some() {
+            storage.save_manifest()?;
+        }
+
+        Ok(storage)
     }
 
     /// Log an add operation to WAL
@@ -604,11 +719,25 @@ impl IncrementalStorage {
         let (compressed, _stats) = compression::compress_with(&data, self.config.checkpoint_codec)?;
         let compressed_size = compressed.len();
 
+        // Seal the payload when encrypting (the .bin holds the serialized documents; the .meta
+        // sidecar below holds only counts and stays plaintext). Bound to this checkpoint id so an
+        // older checkpoint cannot be rolled back under a newer manifest.
+        let payload = match &self.cipher {
+            Some(c) => seal_artifact(
+                c.as_ref(),
+                Role::Checkpoint,
+                &self.manifest.store_id,
+                checkpoint_id,
+                &compressed,
+            ),
+            None => compressed,
+        };
+
         // Write checkpoint file
         let checkpoint_path = self
             .base_path
             .join(format!("checkpoint_{:05}.bin", checkpoint_id));
-        Self::write_atomic_file(&checkpoint_path, &compressed)
+        Self::write_atomic_file(&checkpoint_path, &payload)
             .map_err(|e| RagError::StorageError(format!("Failed to write checkpoint: {}", e)))?;
 
         // Create checkpoint metadata
@@ -694,8 +823,25 @@ impl IncrementalStorage {
         let checkpoint_path = self
             .base_path
             .join(format!("checkpoint_{:05}.bin", checkpoint_id));
-        let compressed = fs::read(&checkpoint_path)
+        let raw = fs::read(&checkpoint_path)
             .map_err(|e| RagError::StorageError(format!("Failed to read checkpoint: {}", e)))?;
+        // Decrypt when a cipher is set. Fail closed, and verify the payload is a checkpoint sealed
+        // under this exact id (rollback resistance) before trusting it.
+        let compressed = match &self.cipher {
+            Some(c) => {
+                let (role, generation, pt) =
+                    open_artifact(c.as_ref(), &self.manifest.store_id, &raw)
+                        .map_err(|e| RagError::Decryption(e.to_string()))?;
+                if role != Role::Checkpoint || generation != checkpoint_id {
+                    return Err(RagError::Decryption(format!(
+                        "checkpoint payload is {role:?} generation {generation}, expected a \
+                         Checkpoint sealed under id {checkpoint_id}"
+                    )));
+                }
+                pt
+            }
+            None => raw,
+        };
         let data = compression::decompress(&compressed)?;
 
         // Deserialize. For a v0 checkpoint this parse IS the compatibility check:
@@ -759,7 +905,7 @@ impl IncrementalStorage {
             return Ok(Vec::new());
         }
 
-        let mut reader = WalReader::open(&wal_path)?;
+        let mut reader = WalReader::open(&wal_path, self.cipher.clone(), self.manifest.store_id)?;
         reader.read_from(checkpoint_seq)
     }
 
@@ -842,7 +988,12 @@ impl IncrementalStorage {
         // Open new WAL FIRST (before deleting old).
         // This ensures we always have a valid WAL even if deletion fails.
         let new_wal_path = self.base_path.join(format!("wal_{:05}.log", checkpoint_id));
-        let new_writer = WalWriter::open(&new_wal_path, self.config.sync_on_write)?;
+        let new_writer = WalWriter::open(
+            &new_wal_path,
+            self.config.sync_on_write,
+            self.cipher.clone(),
+            self.manifest.store_id,
+        )?;
         self.wal_writer = Some(new_writer);
 
         // Now safe to delete old WAL.
@@ -966,6 +1117,171 @@ mod tests {
             embedding: vec![0.1; dim],
             metadata: None,
         }
+    }
+
+    /// A toy authenticated cipher for the storage tests. NOT real crypto (a real caller supplies
+    /// XChaCha20-Poly1305): XOR keystream + an FNV tag over key || aad || plaintext, which is
+    /// enough to detect a wrong key and a wrong AAD. Mirrors the one in `encryption::tests`.
+    struct ToyCipher {
+        key: u8,
+    }
+    impl ToyCipher {
+        fn tag(&self, aad: &[u8], pt: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in std::iter::once(&self.key).chain(aad).chain(pt) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+    }
+    impl Cipher for ToyCipher {
+        fn seal(&self, pt: &[u8], aad: &[u8]) -> Vec<u8> {
+            let mut out = self.tag(aad, pt).to_le_bytes().to_vec();
+            out.extend(pt.iter().map(|&b| b ^ self.key));
+            out
+        }
+        fn open(
+            &self,
+            ct: &[u8],
+            aad: &[u8],
+        ) -> std::result::Result<Vec<u8>, crate::storage::encryption::CipherError> {
+            use crate::storage::encryption::CipherError;
+            if ct.len() < 8 {
+                return Err(CipherError("short".into()));
+            }
+            let (t, body) = ct.split_at(8);
+            let pt: Vec<u8> = body.iter().map(|&b| b ^ self.key).collect();
+            if self.tag(aad, &pt) != u64::from_le_bytes(t.try_into().unwrap()) {
+                return Err(CipherError("auth".into()));
+            }
+            Ok(pt)
+        }
+    }
+
+    /// The acceptance test from issue #50: an encrypted store writes no plaintext content to any
+    /// file on disk, round-trips with the key, and fails closed without it (or with a wrong one).
+    #[test]
+    fn encrypted_store_leaves_no_plaintext_and_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let marker = "TOPSECRET_MARKER_9f3a2b";
+        let cipher: Arc<dyn Cipher> = Arc::new(ToyCipher { key: 0x5a });
+
+        let docs = vec![
+            Document {
+                id: "d1".into(),
+                content: format!("meeting notes {marker}"),
+                embedding: vec![0.1, 0.2, 0.3, 0.4],
+                metadata: Some(serde_json::json!({ "note": marker })),
+            },
+            Document {
+                id: "d2".into(),
+                content: "ordinary".into(),
+                embedding: vec![0.4, 0.3, 0.2, 0.1],
+                metadata: None,
+            },
+        ];
+        {
+            let mut s = IncrementalStorage::new_with_cipher(
+                dir.path(),
+                IncrementalConfig::default(),
+                Some(cipher.clone()),
+            )
+            .unwrap();
+            for d in &docs {
+                s.log_add(d).unwrap();
+            }
+            s.checkpoint(
+                &docs,
+                IndexMetadata {
+                    document_count: docs.len(),
+                    embedding_dim: 4,
+                    index_type: "test".into(),
+                },
+            )
+            .unwrap();
+            s.sync().unwrap();
+        }
+
+        // No file on disk may contain the marker (seeded into both content and metadata).
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                let bytes = std::fs::read(&p).unwrap();
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                    "{} leaked the plaintext marker",
+                    p.display()
+                );
+            }
+        }
+
+        // With the key, the checkpoint round-trips the documents (marker recovered).
+        let s = IncrementalStorage::new_with_cipher(
+            dir.path(),
+            IncrementalConfig::default(),
+            Some(cipher.clone()),
+        )
+        .unwrap();
+        let (loaded, _) = s
+            .load_checkpoint::<Vec<Document>>()
+            .unwrap()
+            .expect("checkpoint present");
+        assert!(
+            loaded.iter().any(|d| d.content.contains(marker)),
+            "marker not recovered with the key"
+        );
+        drop(s);
+
+        // Fail closed: opening an encrypted store with no cipher is an error, not a plaintext read.
+        assert!(
+            matches!(
+                IncrementalStorage::new(dir.path(), IncrementalConfig::default()),
+                Err(RagError::Decryption(_))
+            ),
+            "opening an encrypted store without a cipher must fail closed"
+        );
+
+        // Fail closed: a wrong key opens the store (the manifest is plaintext) but cannot read the
+        // payload — never a silent fallback.
+        let wrong: Arc<dyn Cipher> = Arc::new(ToyCipher { key: 0x5b });
+        let s = IncrementalStorage::new_with_cipher(
+            dir.path(),
+            IncrementalConfig::default(),
+            Some(wrong),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                s.load_checkpoint::<Vec<Document>>(),
+                Err(RagError::Decryption(_))
+            ),
+            "a wrong key must fail to read the checkpoint, not return garbage"
+        );
+    }
+
+    /// A store created without a cipher stays plaintext and opens exactly as before — the default
+    /// path is untouched for existing users.
+    #[test]
+    fn plaintext_store_is_unchanged_without_a_cipher() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut s = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+            let docs = vec![create_test_document("a", 4)];
+            s.checkpoint(
+                &docs,
+                IndexMetadata {
+                    document_count: 1,
+                    embedding_dim: 4,
+                    index_type: "t".into(),
+                },
+            )
+            .unwrap();
+            s.sync().unwrap();
+            assert!(!s.manifest().encrypted);
+        }
+        let s = IncrementalStorage::new(dir.path(), IncrementalConfig::default()).unwrap();
+        assert!(s.load_checkpoint::<Vec<Document>>().unwrap().is_some());
     }
 
     /// A checkpoint written by this build round-trips; one claiming a different

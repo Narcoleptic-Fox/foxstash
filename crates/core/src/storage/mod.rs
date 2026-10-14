@@ -47,6 +47,7 @@
 //! ```
 
 pub mod compression;
+pub mod encryption;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod file;
@@ -55,6 +56,9 @@ pub mod file;
 pub mod incremental;
 
 pub use compression::{best_codec, compress, compress_with, decompress, Codec, CompressionStats};
+pub use encryption::{
+    open_artifact, seal_artifact, Cipher, CipherError, Role, StoreId, ENC_FORMAT_VERSION,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use file::FileStorage;

@@ -2417,6 +2417,90 @@ fn snapshot_round_trip_is_verbatim_in_every_storage() {
     }
 }
 
+/// The byte-level snapshot APIs (`snapshot_to_bytes` / `snapshot_from_bytes`) must produce the
+/// exact bytes the file path writes and reconstruct an identical index. They exist so a caller
+/// (`foxstash-db`) can encrypt the snapshot before it hits disk, so any divergence would make an
+/// encrypted store load something different from a plaintext one. Covers `Storage::Mouse`, which
+/// is bulk-build-only, and the garbage-input path, which must error rather than misread.
+#[test]
+fn snapshot_byte_apis_match_the_file_path_and_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut rng = StdRng::seed_from_u64(91);
+    let dim = 32;
+    let docs: Vec<crate::Document> = (0..300)
+        .map(|i| crate::Document {
+            id: format!("d{i}"),
+            content: format!("c{i}"),
+            embedding: (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect(),
+            metadata: if i % 5 == 0 {
+                Some(serde_json::json!({"i": i}))
+            } else {
+                None
+            },
+        })
+        .collect();
+    let queries: Vec<Vec<f32>> = (0..10)
+        .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
+        .collect();
+
+    for (label, storage) in [("f32", Storage::F32), ("mouse", Storage::Mouse)] {
+        let config = HNSWConfig {
+            metric: DistanceMetric::Cosine,
+            m: 10,
+            m0: 20,
+            ef_construction: 120,
+            storage,
+            rerank_candidates: if storage == Storage::F32 { 0 } else { 40 },
+            seed: Some(5),
+            ..Default::default()
+        };
+        let src = HNSWIndex::build_parallel_from_documents(docs.clone(), config);
+
+        // The two serializers must agree byte for byte.
+        let bytes = src.snapshot_to_bytes().expect("to_bytes");
+        let path = dir.path().join(format!("{label}.snap"));
+        src.snapshot_to_file(&path).expect("to_file");
+        let file_bytes = std::fs::read(&path).expect("read snapshot file");
+        assert_eq!(bytes, file_bytes, "{label}: to_bytes differs from to_file");
+
+        // from_bytes reconstructs the same index as from_file (and as the source).
+        let from_bytes = HNSWIndex::snapshot_from_bytes(&bytes).expect("from_bytes");
+        let from_file = HNSWIndex::snapshot_from_file(&path).expect("from_file");
+        assert_eq!(
+            from_bytes.nodes, src.nodes,
+            "{label}: from_bytes arena differs from source"
+        );
+        assert_eq!(
+            from_bytes.nodes, from_file.nodes,
+            "{label}: from_bytes arena differs from from_file"
+        );
+        assert_eq!(from_bytes.ids, src.ids, "{label}: ids differ");
+        assert_eq!(
+            from_bytes.metadata, src.metadata,
+            "{label}: metadata differs"
+        );
+        for q in &queries {
+            let a: Vec<(String, u32)> = src
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            let b: Vec<(String, u32)> = from_bytes
+                .search(q, 10)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            assert_eq!(a, b, "{label}: search differs after from_bytes");
+        }
+    }
+
+    // A truncated or foreign buffer must error, not misread or abort on a garbage length prefix.
+    assert!(HNSWIndex::snapshot_from_bytes(b"not a snapshot").is_err());
+    assert!(HNSWIndex::snapshot_from_bytes(&[]).is_err());
+}
+
 /// A snapshot is a same-version cache: a stamp from any other version (or a truncated
 /// arena) must refuse to load with a clear error, never misread.
 #[test]

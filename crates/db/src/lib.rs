@@ -50,7 +50,11 @@ use foxstash_core::index::{HNSWConfig, Storage};
 // here, so `foxstash-db` (and thus `foxstash-wasm`) failed to compile for wasm even though every
 // *use* of it below is already wasm-gated. The import must carry the same gate.
 #[cfg(not(target_arch = "wasm32"))]
+use foxstash_core::storage::Cipher;
+#[cfg(not(target_arch = "wasm32"))]
 use foxstash_core::storage::IncrementalConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use thiserror::Error;
 
@@ -104,8 +108,13 @@ pub enum DbError {
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Configuration for opening a [`VectorStore`].
+///
+/// `Debug` is hand-written rather than derived: [`Self::cipher`] holds caller key material behind
+/// a trait object, and a derived `Debug` would both fail to compile (a cipher is not `Debug`, by
+/// design, so a key cannot be logged) and risk printing secrets. The manual impl reports only
+/// whether a cipher is set.
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbConfig {
     /// HNSW index configuration.
     pub hnsw: HNSWConfig,
@@ -140,6 +149,28 @@ pub struct DbConfig {
     pub fit_threshold: usize,
     /// Default hybrid search configuration.
     pub hybrid: HybridConfig,
+    /// Caller-supplied cipher for encryption at rest. When set, every collection opened with this
+    /// config seals its WAL, checkpoints, and graph snapshots through it; the plaintext manifest
+    /// is unaffected. `None` is the plaintext default. foxstash holds no key and runs no KDF; the
+    /// caller owns the key material. See [`foxstash_core::storage::Cipher`].
+    pub cipher: Option<Arc<dyn Cipher>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for DbConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbConfig")
+            .field("hnsw", &self.hnsw)
+            .field("storage", &self.storage)
+            .field("bm25", &self.bm25)
+            .field("embedding_dim", &self.embedding_dim)
+            .field("auto_checkpoint", &self.auto_checkpoint)
+            .field("fit_threshold", &self.fit_threshold)
+            .field("hybrid", &self.hybrid)
+            // Never print key material; report presence only.
+            .field("cipher", &self.cipher.as_ref().map(|_| "<set>"))
+            .finish()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -153,6 +184,7 @@ impl Default for DbConfig {
             auto_checkpoint: true,
             fit_threshold: 10_000,
             hybrid: HybridConfig::default(),
+            cipher: None,
         }
     }
 }
@@ -188,6 +220,14 @@ impl DbConfig {
 
     pub fn with_hybrid(mut self, hybrid: HybridConfig) -> Self {
         self.hybrid = hybrid;
+        self
+    }
+
+    /// Encrypt this store's content at rest through a caller-supplied cipher. See
+    /// [`foxstash_core::storage::Cipher`]. Set at creation; opening an existing plaintext store
+    /// with a cipher (or an encrypted one without) fails closed.
+    pub fn with_cipher(mut self, cipher: Arc<dyn Cipher>) -> Self {
+        self.cipher = Some(cipher);
         self
     }
 }

@@ -79,6 +79,10 @@ pub struct Collection {
     /// checkpoint it belongs to — `IncrementalStorage` does not expose its path.
     base_path: std::path::PathBuf,
     config: DbConfig,
+    /// This store's id, read from the manifest at open. Bound into the AAD of the graph snapshot
+    /// when `config.cipher` is set, matching the WAL/checkpoint binding core applies. All-zero for
+    /// a plaintext store.
+    store_id: foxstash_core::storage::StoreId,
     inner: RwLock<CollectionInner>,
     storage: Mutex<IncrementalStorage>,
     mutation_lock: Mutex<()>,
@@ -139,8 +143,13 @@ impl Collection {
     pub fn open(name: &str, path: &Path, config: DbConfig) -> Result<Self> {
         Self::reject_incremental_quantized_storage(&config)?;
 
-        let storage =
-            IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
+        let storage = IncrementalStorage::new_with_cipher(
+            path,
+            config.storage.clone(),
+            config.cipher.clone(),
+        )
+        .map_err(DbError::Core)?;
+        let store_id = storage.manifest().store_id;
 
         let state = recovery::recover(&storage, &config, path)?;
 
@@ -155,6 +164,7 @@ impl Collection {
             name: name.to_string(),
             base_path: path.to_path_buf(),
             config,
+            store_id,
             inner: RwLock::new(CollectionInner {
                 index: state.index,
                 id_map: state.id_map,
@@ -184,12 +194,18 @@ impl Collection {
             )));
         }
 
-        let storage =
-            IncrementalStorage::new(path, config.storage.clone()).map_err(DbError::Core)?;
+        let storage = IncrementalStorage::new_with_cipher(
+            path,
+            config.storage.clone(),
+            config.cipher.clone(),
+        )
+        .map_err(DbError::Core)?;
+        let store_id = storage.manifest().store_id;
 
         Ok(Self {
             name: name.to_string(),
             base_path: path.to_path_buf(),
+            store_id,
             inner: RwLock::new(CollectionInner {
                 index: HNSWIndex::new(config.embedding_dim, Self::staging_hnsw(&config)),
                 id_map: IdMap::new(),
@@ -554,7 +570,7 @@ impl Collection {
         // Snapshot the freshly compacted graph, not the pre-compaction one.
         {
             let path = self.graph_snapshot_path(checkpoint_meta.id);
-            if let Err(err) = new_index.snapshot_to_file(&path) {
+            if let Err(err) = self.write_snapshot(&new_index, &path, checkpoint_meta.id) {
                 debug!(?err, ?path, "graph snapshot not written; open will rebuild");
             }
             self.prune_graph_snapshots(checkpoint_meta.id);
@@ -998,9 +1014,36 @@ impl Collection {
     /// recovery falls back to rebuilding whenever it is missing, stale or written
     /// by another build. So a failure here must not fail the checkpoint — the
     /// durable data is the checkpoint, and this only ever saves time.
+    /// Write the graph snapshot for `checkpoint_id`, sealing it through `config.cipher` when set
+    /// (role `Snapshot`, bound to this store and checkpoint id). Best-effort, like the plaintext
+    /// path: recovery rebuilds from the authenticated checkpoint if it is missing.
+    fn write_snapshot(
+        &self,
+        index: &HNSWIndex,
+        path: &std::path::Path,
+        checkpoint_id: u64,
+    ) -> foxstash_core::Result<()> {
+        match &self.config.cipher {
+            Some(c) => {
+                let bytes = index.snapshot_to_bytes()?;
+                let sealed = foxstash_core::storage::seal_artifact(
+                    c.as_ref(),
+                    foxstash_core::storage::Role::Snapshot,
+                    &self.store_id,
+                    checkpoint_id,
+                    &bytes,
+                );
+                std::fs::write(path, sealed).map_err(|e| {
+                    foxstash_core::RagError::StorageError(format!("snapshot write failed: {e}"))
+                })
+            }
+            None => index.snapshot_to_file(path),
+        }
+    }
+
     fn write_graph_snapshot(&self, inner: &CollectionInner, checkpoint_id: u64) {
         let path = self.graph_snapshot_path(checkpoint_id);
-        if let Err(err) = inner.index.snapshot_to_file(&path) {
+        if let Err(err) = self.write_snapshot(&inner.index, &path, checkpoint_id) {
             debug!(?err, ?path, "graph snapshot not written; open will rebuild");
         }
         self.prune_graph_snapshots(checkpoint_id);
@@ -1135,6 +1178,126 @@ mod tests {
             storage: IncrementalConfig::default(),
             ..Default::default()
         }
+    }
+
+    /// Toy authenticated cipher for the encryption test. NOT real crypto (a real caller supplies
+    /// XChaCha20-Poly1305): XOR keystream + an FNV tag over key || aad || plaintext.
+    struct ToyCipher {
+        key: u8,
+    }
+    impl ToyCipher {
+        fn tag(&self, aad: &[u8], pt: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for &b in std::iter::once(&self.key).chain(aad).chain(pt) {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+    }
+    impl foxstash_core::storage::Cipher for ToyCipher {
+        fn seal(&self, pt: &[u8], aad: &[u8]) -> Vec<u8> {
+            let mut out = self.tag(aad, pt).to_le_bytes().to_vec();
+            out.extend(pt.iter().map(|&b| b ^ self.key));
+            out
+        }
+        fn open(
+            &self,
+            ct: &[u8],
+            aad: &[u8],
+        ) -> std::result::Result<Vec<u8>, foxstash_core::storage::CipherError> {
+            use foxstash_core::storage::CipherError;
+            if ct.len() < 8 {
+                return Err(CipherError("short".into()));
+            }
+            let (t, body) = ct.split_at(8);
+            let pt: Vec<u8> = body.iter().map(|&b| b ^ self.key).collect();
+            if self.tag(aad, &pt) != u64::from_le_bytes(t.try_into().unwrap()) {
+                return Err(CipherError("auth".into()));
+            }
+            Ok(pt)
+        }
+    }
+
+    fn snapshot_path_in(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map(|x| x == "snapshot").unwrap_or(false))
+    }
+
+    /// Full #50 acceptance test at the db layer: an encrypted collection writes no plaintext
+    /// content to ANY file on disk — including the graph snapshot, which holds contents and
+    /// vectors — round-trips with the key, and fails closed without it or on a tampered snapshot.
+    #[test]
+    fn encrypted_collection_leaves_no_plaintext_and_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let marker = "PHI_MARKER_c4e1b7";
+        let cipher: Arc<dyn foxstash_core::storage::Cipher> = Arc::new(ToyCipher { key: 0x3c });
+        let config = cfg(4).with_cipher(cipher.clone());
+
+        {
+            let c = Collection::create("c", &path, config.clone()).unwrap();
+            for i in 0..50 {
+                c.insert(
+                    format!("d{i}"),
+                    format!("meeting {i} {marker}"),
+                    vec![i as f32, 0.0, 0.0, 1.0],
+                    Some(json!({ "note": marker })),
+                )
+                .unwrap();
+            }
+            c.compact().unwrap(); // forces a checkpoint + graph snapshot
+            c.flush().unwrap();
+            assert!(
+                snapshot_path_in(&path).is_some(),
+                "compact should have written a graph snapshot to encrypt"
+            );
+        }
+
+        // No file in the collection dir may contain the marker (content or metadata).
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                let bytes = std::fs::read(&p).unwrap();
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                    "{} leaked the plaintext marker",
+                    p.display()
+                );
+            }
+        }
+
+        // With the key: reopen and recover the documents (marker present in content).
+        {
+            let c = Collection::open("c", &path, config.clone()).unwrap();
+            assert_eq!(c.len(), 50);
+            let hits = c.search(&[0.0, 0.0, 0.0, 1.0], 50, None).unwrap();
+            assert!(
+                hits.iter().any(|h| h.content.contains(marker)),
+                "marker not recovered with the key"
+            );
+        }
+
+        // Fail closed: reopening an encrypted collection with no cipher is an error.
+        assert!(
+            Collection::open("c", &path, cfg(4)).is_err(),
+            "opening an encrypted collection without a cipher must fail closed"
+        );
+
+        // Fail closed: a tampered snapshot errors on open, never a silent rebuild.
+        let snap = snapshot_path_in(&path).expect("snapshot present");
+        let mut bytes = std::fs::read(&snap).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&snap, bytes).unwrap();
+        assert!(
+            Collection::open("c", &path, config).is_err(),
+            "a tampered snapshot must fail closed, not silently rebuild from the checkpoint"
+        );
     }
 
     #[test]
