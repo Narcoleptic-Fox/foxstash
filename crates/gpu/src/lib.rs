@@ -2376,10 +2376,7 @@ mod tests {
         for (g, cp) in gpu.iter().zip(&cpu) {
             let gs: std::collections::HashSet<&str> = g.iter().map(|r| r.id.as_str()).collect();
             let cs: std::collections::HashSet<&str> = cp.iter().map(|r| r.id.as_str()).collect();
-            assert_eq!(
-                gs, cs,
-                "GPU Mouse rerank != CPU Mouse rerank — kernel bug"
-            );
+            assert_eq!(gs, cs, "GPU Mouse rerank != CPU Mouse rerank — kernel bug");
         }
     }
 }

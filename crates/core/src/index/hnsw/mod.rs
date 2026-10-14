@@ -1058,9 +1058,9 @@ impl HNSWIndex {
             // Mouse keeps no f32 and returns early in the walk/rerank, so this is off its path.
             // `get_all_documents`/`requantize` would reach it — reconstruct via the codebook there
             // rather than paying to retain f32. Experimental mode, not yet exposed to bindings.
-            Storage::Mouse => panic!(
-                "Storage::Mouse retains no exact f32 vectors; rerank uses the residual code"
-            ),
+            Storage::Mouse => {
+                panic!("Storage::Mouse retains no exact f32 vectors; rerank uses the residual code")
+            }
         }
     }
 
