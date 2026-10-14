@@ -93,7 +93,7 @@ impl JsDocument {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The embedding cannot be converted to a Vec<f32>
+    /// - The embedding cannot be converted to a `Vec<f32>`
     /// - The metadata cannot be serialized to JSON
     ///
     /// # Example

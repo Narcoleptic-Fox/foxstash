@@ -106,7 +106,7 @@ pub mod sift {
         }
 
         /// Load `<root>/<name>/{base,query,groundtruth}.npy`, then verify it is
-        /// actually the dataset it claims to be (see [`MANIFEST`]).
+        /// actually the dataset it claims to be (see `MANIFEST`).
         pub fn load(root: impl AsRef<Path>, name: &str) -> std::io::Result<Self> {
             use std::io::{Error, ErrorKind};
             let bad = |m: String| Error::new(ErrorKind::InvalidData, m);

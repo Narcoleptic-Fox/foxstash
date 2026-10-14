@@ -117,7 +117,7 @@ pub struct HNSWConfig {
     /// results. If you need either — golden-file tests, debugging a specific graph, regulated
     /// reproducibility — set `build_strategy: BuildStrategy::Sequential` as well as `seed`.
     ///
-    /// Incremental [`HNSWIndex::add`] and [`HNSWIndex::add_embedding`] **are** reproducible at a
+    /// Incremental [`HNSWIndex::add`](super::HNSWIndex::add) and [`HNSWIndex::add_embedding`](super::HNSWIndex::add_embedding) **are** reproducible at a
     /// fixed seed: they are sequential by nature, so they have no thread race to lose determinism
     /// to. (They
     /// were not, until 1.0. `random_level` called `rand::rng()` per insert with `config.seed`
@@ -157,7 +157,7 @@ pub struct HNSWConfig {
 
     /// Relabel nodes in BFS order after the build so graph-adjacent nodes sit at nearby arena
     /// offsets — a pure locality win worth **+10–15% query QPS** at zero recall cost (the walk's
-    /// bottleneck is per-hop cache misses, not compute; see [`HNSWIndex::reorder_for_locality`]).
+    /// bottleneck is per-hop cache misses, not compute; see [`HNSWIndex::reorder_for_locality`](super::HNSWIndex::reorder_for_locality)).
     /// It is transparent: returned document ids are unchanged, only faster.
     ///
     /// **Default `true`** — this is a free lunch for query-heavy indexes, which is most of them.
@@ -168,14 +168,14 @@ pub struct HNSWConfig {
     pub reorder_for_locality: bool,
 }
 
-/// Distance metric for [`HNSWIndex`]. **Every** storage mode honours it.
+/// Distance metric for [`HNSWIndex`](super::HNSWIndex). **Every** storage mode honours it.
 ///
 /// That sentence is the whole point, and it was not always true. This library used to ship three
 /// standalone quantized index types (`SQ8HNSWIndex`, `RaBitQHNSWIndex`, `PQHNSWIndex`), and not
 /// one of them had a `metric` field: all three were hardcoded L2, while [`HNSWConfig`] defaults
 /// to **cosine**. So swapping index type to save memory silently changed *the question being
 /// asked*, and every caller escaped only by passing `L2` by hand. Worse, the same bug lived
-/// inside [`HNSWIndex`] itself for a release — the quantized traversal ignored `config.metric`
+/// inside [`HNSWIndex`](super::HNSWIndex) itself for a release — the quantized traversal ignored `config.metric`
 /// and always ranked by L2, which is what made SQ8 read 71.4% recall when it was really capable
 /// of 99.33%. A metric bug does not look like a crash. It looks like a mediocre quantizer.
 ///
@@ -524,7 +524,7 @@ impl HNSWConfig {
     }
 }
 
-/// Where an [`HNSWIndex`]'s memory actually goes. See [`HNSWIndex::memory_breakdown`].
+/// Where an [`HNSWIndex`](super::HNSWIndex)'s memory actually goes. See [`HNSWIndex::memory_breakdown`](super::HNSWIndex::memory_breakdown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBreakdown {
     /// Contiguous f32 vectors — the irreducible cost of the data itself.

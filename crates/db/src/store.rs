@@ -157,8 +157,8 @@ impl VectorStore {
     /// Unload a collection, removing it from the in-memory registry.
     ///
     /// **Does not** delete files from disk — the collection can be recovered
-    /// by calling [`get_or_create_collection`] again. To permanently delete,
-    /// use [`delete_collection`] or remove the directory manually after unloading.
+    /// by calling [`Self::get_or_create_collection`] again. To permanently delete,
+    /// use [`Self::delete_collection`] or remove the directory manually after unloading.
     pub fn unload_collection(&self, name: &str) -> Result<()> {
         Self::validate_collection_name(name)?;
 

@@ -320,7 +320,7 @@ impl Searcher<'_> {
 /// # Memory layout
 ///
 /// Everything touched while traversing the graph lives in one interleaved arena,
-/// [`Self::nodes`], with a node's neighbours and its vector in the *same* contiguous
+/// `nodes`, with a node's neighbours and its vector in the *same* contiguous
 /// block. Visiting a node is therefore a single random memory read.
 ///
 /// This used to be Struct-of-Arrays — the vector in `embeddings`, the neighbours in
@@ -819,7 +819,7 @@ impl HNSWIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`RagError::FullPrecisionDropped`] if the index was built with
+    /// Returns [`RagError::FullPrecisionDropped`](crate::RagError::FullPrecisionDropped) if the index was built with
     /// `rerank_candidates: 0`. That configuration *discards the f32 vectors entirely* — it is
     /// the smallest index foxstash can build — so there is nothing left to rerank against, and
     /// raising the pool afterwards cannot be honored. Rejecting this is the whole reason the

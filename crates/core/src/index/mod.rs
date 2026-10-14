@@ -66,39 +66,10 @@
 //!   feature look inherently bad, and then nobody re-measures it. This library has now been bitten
 //!   by that four separate times; see `benchmarks/RESULTS.md`.
 //!
-//! The [`ProductQuantizer`](crate::vector::product_quantize::ProductQuantizer) primitive is kept.
-//! It is a perfectly good quantizer. It is just not a viable way to traverse a graph.
-//!
 //! A plain zero-threshold binary quantizer is not offered: on non-negative data (SIFT, and
 //! most embedding models) every bit is set and the code carries no information — it measured
 //! 1.2% recall@10. RaBitQ centers each vector before thresholding, which is the whole
-//! difference. See `crate::vector::quantize` for the comparison.
-//!
-//! # Streaming Operations
-//!
-//! use foxstash_core::index::streaming::{BatchBuilder, BatchConfig};
-//! use foxstash_core::index::HNSWIndex;
-//! use foxstash_core::Document;
-//!
-//! let mut index = HNSWIndex::with_defaults(4);
-//!
-//! let config = BatchConfig::default()
-//!     .with_batch_size(1000)
-//!     .with_progress(|p| println!("Progress: {}/{}", p.completed, p.total.unwrap_or(0)));
-//!
-//! let documents = vec![
-//!     Document { id: "a".into(), content: "alpha".into(), embedding: vec![1.0, 0.0, 0.0, 0.0], metadata: None },
-//!     Document { id: "b".into(), content: "beta".into(),  embedding: vec![0.0, 1.0, 0.0, 0.0], metadata: None },
-//!     Document { id: "c".into(), content: "gamma".into(), embedding: vec![0.0, 0.0, 1.0, 0.0], metadata: None },
-//! ];
-//!
-//! let mut builder = BatchBuilder::new(&mut index, config);
-//! for doc in documents {
-//!     builder.add(doc).unwrap();
-//! }
-//! let result = builder.finish();
-//! assert_eq!(result.documents_indexed, 3);
-//! ```
+//! difference.
 
 pub mod flat;
 pub mod hnsw;
