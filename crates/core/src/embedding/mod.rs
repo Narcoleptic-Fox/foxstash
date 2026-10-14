@@ -30,6 +30,8 @@
 //! # }
 //! ```
 
+pub mod embeddinggemma2;
+
 #[cfg(feature = "onnx")]
 mod onnx;
 
