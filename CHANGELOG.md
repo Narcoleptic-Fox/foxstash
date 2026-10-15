@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-10-15
+
+### Added
+
+- **Encryption at rest** via a caller-supplied cipher. A new `Cipher` trait (`seal(plaintext, aad)` / `open(ciphertext, aad)`) in `foxstash_core::storage`, wired through `DbConfig::with_cipher` and `IncrementalStorage::new_with_cipher`, encrypts the WAL, checkpoints, and graph snapshots when configured. foxstash holds no key and runs no KDF; the caller owns the key material. Each artifact's AAD binds its role, a per-store id, and a generation, so a rolled-back or foreign artifact cannot be swapped in. Fail-closed: a wrong key, failed tag, or missing cipher for an encrypted store is a hard `RagError::Decryption`, never a silent fallback. The manifest stays plaintext (counts and dimensions only). Plaintext is the default and existing stores are unchanged. Adds `HNSWIndex::snapshot_to_bytes` / `snapshot_from_bytes`.
+- **EmbeddingGemma 2 helpers** (`foxstash_core::embedding::embeddinggemma2`): query/document prompt formatting for all seven model-card tasks, and `truncate_matryoshka` (leading-dim slice + L2 renormalize) for the card dims 128/256/512/768. Pure, no model dependency — a sidecar caller supplies precomputed vectors as before.
+
 ## [0.7.0] - 2026-10-14
 
 ### Added
@@ -117,6 +124,7 @@ The "1.0 audit" release: one index, one config, one metric; −5,380 lines.
 - ONNX embedding support available but may have platform-specific limitations on Windows
 - WASM support is experimental
 
+[0.8.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.4.1...v0.5.0
