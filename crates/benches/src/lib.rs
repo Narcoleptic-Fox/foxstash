@@ -77,6 +77,35 @@ pub mod sift {
             queries: 1_000,
             dim: 768,
         },
+        // The same rustdocs45k documents re-embedded with EmbeddingGemma 2 (issue #51), so the
+        // storage sweep is a clean v1-vs-v2 of one text corpus. Built by
+        // `benchmarks/python/build_embgemma2_dataset.py`.
+        Spec {
+            name: "embgemma2-rustdocs45k",
+            base: 45_000,
+            queries: 1_000,
+            dim: 768,
+        },
+        // Matryoshka truncations of embgemma2-rustdocs45k (leading dims, renormalized), built by
+        // `benchmarks/python/truncate_matryoshka_datasets.py`, for the recall-vs-dim sweep.
+        Spec {
+            name: "embgemma2-rustdocs45k-512d",
+            base: 45_000,
+            queries: 1_000,
+            dim: 512,
+        },
+        Spec {
+            name: "embgemma2-rustdocs45k-256d",
+            base: 45_000,
+            queries: 1_000,
+            dim: 256,
+        },
+        Spec {
+            name: "embgemma2-rustdocs45k-128d",
+            base: 45_000,
+            queries: 1_000,
+            dim: 128,
+        },
     ];
 
     /// A loaded ANN benchmark dataset with its shipped ground truth.
