@@ -19,6 +19,33 @@ use serde_json::Value;
 use std::path::Path;
 use tracing::debug;
 
+/// Proof returned by [`Collection::purge`] that the purged documents are gone from every on-disk
+/// artifact, not merely hidden from search (issue #59).
+///
+/// `purge` deletes the ids, then compacts `keep_checkpoints` times so the pre-purge checkpoint and
+/// graph snapshot are pruned (a single `compact` at the default `keep_checkpoints = 2` leaves the
+/// previous generation on disk, still holding the content). `purge_generation` is the first
+/// checkpoint written after the deletes; nothing older survives, so no surviving artifact contains
+/// the purged content. See the KB page `projects/foxstash/deletion-retention`.
+///
+/// Note: this erases the plaintext artifacts. Unlinked blocks are not zeroed; for cryptographic
+/// erasure, pair with encryption at rest and key rotation.
+#[derive(Debug, Clone)]
+pub struct PurgeReport {
+    /// How many of the requested ids existed and were deleted.
+    pub documents_deleted: usize,
+    /// The first checkpoint id written after the deletes. Every surviving artifact has an id `>=`
+    /// this, so none holds the purged content.
+    pub purge_generation: u64,
+    /// How many compactions ran (`keep_checkpoints`, at least 1).
+    pub compactions: usize,
+    /// On-disk artifact files removed by the purge (checkpoints, graph snapshots, WAL segments).
+    pub removed_artifacts: Vec<String>,
+    /// The lowest artifact generation still on disk. The guarantee is
+    /// `surviving_min_generation >= purge_generation`.
+    pub surviving_min_generation: u64,
+}
+
 /// Mutable state behind the read-write lock.
 struct CollectionInner {
     index: HNSWIndex,
@@ -503,9 +530,14 @@ impl Collection {
 
     /// Soft-delete a document by ID. Returns `true` if the document existed.
     pub fn delete(&self, id: &str) -> Result<bool> {
-        // Held for exclusion only — this path calls nothing that needs proof.
-        let _mutation = self.begin_mutation();
+        let mutation = self.begin_mutation();
+        self.delete_locked(id, &mutation)
+    }
 
+    /// Body of [`Self::delete`] for callers already holding the mutation lock (e.g.
+    /// [`Self::purge`]). `parking_lot` is not reentrant, so a locked caller must not re-enter
+    /// `delete`; same `_locked` convention as `fit_locked`.
+    fn delete_locked(&self, id: &str, _mutation: &MutationGuard<'_>) -> Result<bool> {
         // Hold write lock for the entire operation to prevent TOCTOU races.
         let mut inner = self.inner.write();
         if !inner.id_map.is_live(id) {
@@ -626,9 +658,14 @@ impl Collection {
 
     /// Compact: rebuild index from live documents only, checkpoint, reclaim tombstones.
     pub fn compact(&self) -> Result<()> {
-        // Held for exclusion only — this path calls nothing that needs proof.
-        let _mutation = self.begin_mutation();
+        let mutation = self.begin_mutation();
+        self.compact_locked(&mutation).map(|_| ())
+    }
 
+    /// Body of [`Self::compact`] for callers already holding the mutation lock (e.g.
+    /// [`Self::purge`]). Returns the id of the checkpoint it wrote, so a caller can reason about
+    /// which generations now survive on disk.
+    fn compact_locked(&self, _mutation: &MutationGuard<'_>) -> Result<u64> {
         // Hold write lock for the entire operation to prevent concurrent mutations
         // from being silently dropped during the swap.
         let mut inner = self.inner.write();
@@ -701,7 +738,97 @@ impl Collection {
         inner.text_index = new_text_index;
 
         debug!(name = %self.name, doc_count, "compaction complete");
-        Ok(())
+        Ok(checkpoint_meta.id)
+    }
+
+    /// Hard-delete documents and guarantee their content is gone from every on-disk artifact.
+    ///
+    /// [`delete`](Self::delete) is a soft tombstone: the content stays in the WAL, the current
+    /// checkpoint and every graph snapshot until compaction, and a *single* [`compact`](Self::compact)
+    /// at the default `keep_checkpoints = 2` still leaves the previous checkpoint and snapshot on
+    /// disk. `purge` deletes the ids, then compacts `keep_checkpoints` times (at least once) so
+    /// every artifact older than the first post-delete checkpoint is pruned, and returns a
+    /// [`PurgeReport`] proving nothing older than that generation survives. See issue #59.
+    ///
+    /// Erases the plaintext artifacts; it does not zero the underlying disk blocks. For
+    /// cryptographic erasure, pair with encryption at rest (`DbConfig::with_cipher`) and key
+    /// rotation.
+    pub fn purge(&self, ids: &[&str]) -> Result<PurgeReport> {
+        let mutation = self.begin_mutation();
+
+        let before: std::collections::HashSet<String> = self
+            .scan_artifact_files()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        let mut documents_deleted = 0;
+        for id in ids {
+            if self.delete_locked(id, &mutation)? {
+                documents_deleted += 1;
+            }
+        }
+
+        // It takes `keep_checkpoints` compactions to push the pre-purge checkpoint past the
+        // pruning cutoff (`keep == 0` prunes aggressively, so one compaction suffices).
+        let keep = self.config.storage.keep_checkpoints.max(1);
+        let mut purge_generation = 0u64;
+        for i in 0..keep {
+            let gen = self.compact_locked(&mutation)?;
+            if i == 0 {
+                purge_generation = gen; // first post-delete checkpoint; nothing older may survive
+            }
+        }
+
+        let after = self.scan_artifact_files();
+        let after_names: std::collections::HashSet<String> =
+            after.iter().map(|(name, _)| name.clone()).collect();
+        let mut removed_artifacts: Vec<String> = before.difference(&after_names).cloned().collect();
+        removed_artifacts.sort();
+        let surviving_min_generation = after
+            .iter()
+            .map(|(_, gen)| *gen)
+            .min()
+            .unwrap_or(purge_generation);
+
+        // The guarantee. A surviving artifact older than the purge generation would still hold the
+        // purged content, so this is a hard error rather than a silent partial purge.
+        if surviving_min_generation < purge_generation {
+            return Err(DbError::Validation(format!(
+                "purge did not erase pre-purge artifacts: surviving generation \
+                 {surviving_min_generation} is older than purge generation {purge_generation}"
+            )));
+        }
+
+        Ok(PurgeReport {
+            documents_deleted,
+            purge_generation,
+            compactions: keep,
+            removed_artifacts,
+            surviving_min_generation,
+        })
+    }
+
+    /// The generation-numbered on-disk artifacts (`checkpoint_NNNNN.{bin,meta}`,
+    /// `graph_NNNNN.snapshot`, `wal_NNNNN.log`) as `(filename, generation)`. Files without a
+    /// generation (the manifest) are ignored.
+    fn scan_artifact_files(&self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.base_path) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            for prefix in ["checkpoint_", "graph_", "wal_"] {
+                if let Some(rest) = name.strip_prefix(prefix) {
+                    if let Some(gen) = rest.split('.').next().and_then(|s| s.parse::<u64>().ok()) {
+                        out.push((name.clone(), gen));
+                    }
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Number of live (non-tombstoned) documents.
@@ -3612,5 +3739,140 @@ mod tests {
                 "after reopen: d{i} should be in its own top-5"
             );
         }
+    }
+
+    // ─── Issue #59: purge(ids) ────────────────────────────────────────────────────────────────
+
+    /// Lowest generation among on-disk checkpoint / graph-snapshot / WAL files, or `None` if none.
+    fn min_artifact_generation(dir: &std::path::Path) -> Option<u64> {
+        let mut min = None;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            for prefix in ["checkpoint_", "graph_", "wal_"] {
+                if let Some(rest) = name.strip_prefix(prefix) {
+                    if let Some(g) = rest.split('.').next().and_then(|s| s.parse::<u64>().ok()) {
+                        min = Some(min.map_or(g, |m: u64| m.min(g)));
+                    }
+                    break;
+                }
+            }
+        }
+        min
+    }
+
+    fn vec3(seed: usize) -> Vec<f32> {
+        let mut s = (seed as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+        (0..3)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((s >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// `purge` must erase the purged documents from every on-disk artifact, at any
+    /// `keep_checkpoints`. The fixture forces a checkpoint *before* the delete so the purged doc
+    /// lives in a checkpoint (not only the WAL, which any single compact clears) — the case the
+    /// retention bug actually hits.
+    fn purge_erases_from_disk(keep: usize) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let cfg = || {
+            DbConfig {
+                storage: foxstash_core::storage::incremental::IncrementalConfig::default()
+                    .with_keep_checkpoints(keep),
+                ..DbConfig::default()
+            }
+            .with_embedding_dim(3)
+        };
+
+        {
+            let c = Collection::create("c", &path, cfg()).unwrap();
+            for i in 0..40 {
+                c.insert(format!("d{i}"), format!("content {i}"), vec3(i), None)
+                    .unwrap();
+            }
+            // Force a checkpoint so the to-be-purged docs are captured in a checkpoint + snapshot.
+            c.compact().unwrap();
+
+            let report = c.purge(&["d0", "d1", "d2"]).unwrap();
+            assert_eq!(report.documents_deleted, 3);
+            assert_eq!(report.compactions, keep.max(1));
+            assert!(
+                report.surviving_min_generation >= report.purge_generation,
+                "keep={keep}: an artifact older than the purge generation survived \
+                 (min {} < purge {})",
+                report.surviving_min_generation,
+                report.purge_generation,
+            );
+            // Nothing on disk predates the purge generation.
+            assert!(
+                min_artifact_generation(&path).unwrap() >= report.purge_generation,
+                "keep={keep}: a pre-purge artifact file remains on disk"
+            );
+        }
+
+        // Reopen: the purged docs cannot be recovered from any surviving artifact.
+        let c2 = Collection::open("c", &path, cfg()).unwrap();
+        assert_eq!(c2.len(), 37);
+        for i in 0..3 {
+            assert!(
+                c2.get(&format!("d{i}")).unwrap().is_none(),
+                "keep={keep}: purged d{i} came back after reopen"
+            );
+        }
+        for i in 3..40 {
+            assert!(
+                c2.get(&format!("d{i}")).unwrap().is_some(),
+                "keep={keep}: survivor d{i} was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_erases_from_disk_keep_1() {
+        purge_erases_from_disk(1);
+    }
+
+    #[test]
+    fn purge_erases_from_disk_keep_2() {
+        purge_erases_from_disk(2);
+    }
+
+    /// Sabotage: with `keep_checkpoints = 2`, a *single* `compact` after a delete must NOT erase
+    /// the content — the pre-delete checkpoint survives one compaction. This is exactly why
+    /// `purge` compacts `keep_checkpoints` times, and it proves the guarantee is not vacuous.
+    #[test]
+    fn single_compact_at_keep_2_leaves_the_pre_delete_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+        let cfg = DbConfig {
+            storage: foxstash_core::storage::incremental::IncrementalConfig::default()
+                .with_keep_checkpoints(2),
+            ..DbConfig::default()
+        }
+        .with_embedding_dim(3);
+
+        let c = Collection::create("c", &path, cfg).unwrap();
+        for i in 0..40 {
+            c.insert(format!("d{i}"), format!("content {i}"), vec3(i), None)
+                .unwrap();
+        }
+        c.compact().unwrap(); // checkpoint generation G (holds d0)
+        let gen_with_content = min_artifact_generation(&path).unwrap();
+
+        c.delete("d0").unwrap();
+        c.compact().unwrap(); // a SINGLE compaction -> generation G+1
+
+        // At keep=2, generation G (which still contains d0) is retained after one compaction.
+        assert_eq!(
+            min_artifact_generation(&path).unwrap(),
+            gen_with_content,
+            "a single compact at keep_checkpoints=2 should leave the pre-delete checkpoint on disk"
+        );
     }
 }
