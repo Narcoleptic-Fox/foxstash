@@ -2,11 +2,10 @@
 //!
 //! Run: cargo run -p foxstash-benches --example multibit_qps_smoke --release
 //!
-//! NOT a benchmark — a regression tripwire. The coco 2026-07-15 sweep measured the
-//! unpacked side-table TurboQuant at 40–165 QPS vs RaBitQ's 900–2,800 (10–40x). After
-//! arena-packing, TurboQuant and TurboRabit should sit in the same order of magnitude
-//! as RaBitQ (they read comparable bytes per node visit through the same kind of
-//! kernel). If either is still >5x off RaBitQ here, do NOT burn a VIBE sweep — the
+//! NOT a benchmark — a regression tripwire. Early unpacked side-table multi-bit codes measured
+//! 40–165 QPS vs RaBitQ's 900–2,800 (10–40x). After arena-packing, TurboRabit should sit in the
+//! same order of magnitude as RaBitQ (they read comparable bytes per node visit through the same
+//! kind of kernel). If it is still >5x off RaBitQ here, do NOT burn a VIBE sweep — the
 //! packing has a hole.
 //!
 //! Clustered cosine data at 768-d (the RAG case); recall@10 printed alongside so a QPS
@@ -101,19 +100,12 @@ fn main() {
         "{:<14} {:>9} {:>10} {:>9}",
         "storage", "build_s", "QPS", "recall@10"
     );
-    // TurboQuant is deprecated in favour of TurboRabit. Benchmarking it anyway is
-    // the point of this smoke test: the deprecation claims TurboRabit dominates it
-    // at every bit budget, and that claim is only worth anything if the comparison
-    // keeps running. Drop these rows when the variant is actually removed.
-    #[allow(deprecated)]
-    for (label, storage, tb, rb) in [
-        ("f32", Storage::F32, 2, 3),
-        ("sq8", Storage::SQ8, 2, 3),
-        ("rabitq", Storage::RaBitQ, 2, 3),
-        ("turboquant3", Storage::TurboQuant, 3, 3),
-        ("turboquant4", Storage::TurboQuant, 4, 3),
-        ("turborabit3", Storage::TurboRabit, 2, 3),
-        ("turborabit4", Storage::TurboRabit, 2, 4),
+    for (label, storage, rb) in [
+        ("f32", Storage::F32, 3),
+        ("sq8", Storage::SQ8, 3),
+        ("rabitq", Storage::RaBitQ, 3),
+        ("turborabit3", Storage::TurboRabit, 3),
+        ("turborabit4", Storage::TurboRabit, 4),
     ] {
         let config = HNSWConfig {
             metric: DistanceMetric::Cosine,
@@ -122,7 +114,6 @@ fn main() {
             ef_construction: 200,
             ef_search: ef,
             storage,
-            turbo_bits: tb,
             rabit_bits: rb,
             rerank_candidates: if storage == Storage::F32 { 0 } else { rerank },
             seed: Some(7),

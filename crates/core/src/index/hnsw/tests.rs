@@ -382,7 +382,6 @@ fn search_layer_considers_neighbors_beyond_fixed_stack_batch() {
     let qprep = QueryPrep {
         norm: 1.0,
         rabitq: None,
-        turboquant: None,
         turborabit: None,
         filter: None,
     };
@@ -1630,109 +1629,10 @@ fn rabitq_vec_words_matches_documented_layout() {
     assert_eq!(vec_words(Storage::RaBitQ, 128, 0) * 4, 24);
 }
 
-/// End-to-end recall gate for `Storage::RaBitQ`, built the same way the benchmarks do
-/// (`build_parallel`, which builds the graph in exact f32 space and only quantizes the
-/// traversal storage afterward — see `convert_parallel_to_index`).
-///
-/// Ground truth is exact brute-force L2 over the base set. Queries are HELD OUT: distinct
-/// vectors near (not equal to) cluster centers, never inserted into the index. Querying
-/// with an indexed vector would re-derive that vector's own RaBitQ code and could score
-/// well even against a broken estimator — see `lesson_untestable_by_construction`. Data is
-/// clustered, not uniform-random, for the same reason every other recall test here is:
-/// uniform-random vectors have no structure to lose and every ANN scores ~60% on them
-/// regardless of whether the graph or the metric is correct.
-/// End-to-end recall through the real index under [`Storage::TurboQuant`] + cosine — a public
-/// storage variant with no integration test is a shipped bug (`lesson_untested_public_options`).
-/// Held-out queries only (never self-retrieval), clustered data, and a discriminating-power
-/// floor: with the estimator sabotaged this recall collapses (verified separately). Also checks
-/// that more bits ⇒ at least as much recall, end to end.
-#[test]
-#[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
-fn turboquant_recall_on_clustered_data_with_held_out_queries() {
-    let mut rng = StdRng::seed_from_u64(2025);
-    let dim = 96;
-    let n_clusters = 16;
-    let per_cluster = 40;
-    let centers: Vec<Vec<f32>> = (0..n_clusters)
-        .map(|_| (0..dim).map(|_| rng.random::<f32>() * 4.0 - 2.0).collect())
-        .collect();
-    let jitter = |rng: &mut StdRng, c: &[f32]| -> Vec<f32> {
-        c.iter()
-            .map(|x| x + rng.random::<f32>() * 0.5 - 0.25)
-            .collect()
-    };
-    let base: Vec<Vec<f32>> = (0..n_clusters * per_cluster)
-        .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
-        .collect();
-    let queries: Vec<Vec<f32>> = (0..60)
-        .map(|i| jitter(&mut rng, &centers[i % n_clusters]))
-        .collect();
-
-    let k = 10;
-    // Cosine ground truth (TurboQuant estimates cosine similarity).
-    let cos = |a: &[f32], b: &[f32]| -> f32 {
-        let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-        for (x, y) in a.iter().zip(b) {
-            d += x * y;
-            na += x * x;
-            nb += y * y;
-        }
-        d / (na.sqrt() * nb.sqrt()).max(1e-9)
-    };
-    let truth: Vec<HashSet<usize>> = queries
-        .iter()
-        .map(|q| {
-            let mut s: Vec<(f32, usize)> = base
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (cos(v, q), i))
-                .collect();
-            s.sort_by(|a, b| b.0.total_cmp(&a.0));
-            s.into_iter().take(k).map(|(_, i)| i).collect()
-        })
-        .collect();
-
-    let recall_for = |bits: usize| -> f32 {
-        let config = HNSWConfig {
-            metric: DistanceMetric::Cosine,
-            m: 16,
-            m0: 32,
-            ef_construction: 200,
-            ef_search: 200,
-            storage: Storage::TurboQuant,
-            turbo_bits: bits,
-            rerank_candidates: 50,
-            seed: Some(9),
-            ..Default::default()
-        };
-        let index = HNSWIndex::build_parallel(base.clone(), config);
-        let mut total = 0.0f32;
-        for (q, gt) in queries.iter().zip(&truth) {
-            let got: HashSet<usize> = index
-                .search(q, k)
-                .expect("search")
-                .into_iter()
-                .filter_map(|r| r.id.parse::<usize>().ok())
-                .collect();
-            total += gt.intersection(&got).count() as f32 / k as f32;
-        }
-        total / queries.len() as f32
-    };
-
-    let r2 = recall_for(2);
-    let r4 = recall_for(4);
-    // Non-vacuous floor (sabotaging the estimator collapses this), and more bits never hurt.
-    assert!(r2 > 0.6, "TurboQuant b=2 recall too low end-to-end: {r2}");
-    assert!(
-        r4 >= r2 - 0.05,
-        "b=4 ({r4}) unexpectedly far below b=2 ({r2})"
-    );
-}
-
-/// End-to-end recall through the real index under [`Storage::TurboRabit`] — same contract
-/// as the TurboQuant test above (public variant + no integration test = shipped bug), and
-/// additionally under **both metrics**: honest L2 support is TurboRabit's differentiator
-/// over TurboQuant, so an untested L2 path here would be the untested half of the point.
+/// End-to-end recall through the real index under [`Storage::TurboRabit`] — a public storage
+/// variant with no integration test is a shipped bug (`lesson_untested_public_options`), and
+/// additionally under **both metrics**: honest L2 support is TurboRabit's differentiator, so an
+/// untested L2 path here would be the untested half of the point.
 #[test]
 fn turborabit_recall_on_clustered_data_with_held_out_queries() {
     let mut rng = StdRng::seed_from_u64(2026);
@@ -1816,7 +1716,7 @@ fn turborabit_recall_on_clustered_data_with_held_out_queries() {
         total / queries.len() as f32
     };
 
-    // Cosine: floor + more-bits-never-hurt, same contract as the TurboQuant test.
+    // Cosine: floor + more-bits-never-hurt.
     let truth_cos = truth_for(&cos, true);
     let r2 = recall_for(DistanceMetric::Cosine, 2, &truth_cos);
     let r4 = recall_for(DistanceMetric::Cosine, 4, &truth_cos);
@@ -1868,7 +1768,6 @@ fn turborabit_packed_walk_matches_module_estimator() {
         let qprep = QueryPrep {
             norm: crate::vector::simd::norm_simd(&query),
             rabitq: None,
-            turboquant: None,
             turborabit: Some(&prep),
             filter: None,
         };
@@ -1890,54 +1789,6 @@ fn turborabit_packed_walk_matches_module_estimator() {
             assert!(
                     rel < 1e-4,
                     "{metric:?} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
-                );
-        }
-    }
-}
-
-/// Same pin for TurboQuant: arena `[gamma][qjl][nibbles]` + LUT/signed-sum kernels
-/// must equal `TurboQuantizer::estimate_ip` on a fresh encode. Odd dim stresses the
-/// half-used final nibble byte; b=4 exercises the full 8-entry LUT, b=1 the
-/// no-nibble-section layout.
-#[test]
-#[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
-fn turboquant_packed_walk_matches_module_estimator() {
-    let mut rng = StdRng::seed_from_u64(78);
-    let dim = 97;
-    let base: Vec<Vec<f32>> = (0..80)
-        .map(|_| (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect())
-        .collect();
-    let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
-
-    for bits in [1usize, 2, 4] {
-        let config = HNSWConfig {
-            metric: DistanceMetric::Cosine,
-            storage: Storage::TurboQuant,
-            turbo_bits: bits,
-            rerank_candidates: 10,
-            seed: Some(5),
-            ..Default::default()
-        };
-        let index = HNSWIndex::build_parallel(base.clone(), config);
-        let tq = index.turboquant.as_ref().expect("quantizer fitted");
-        let prep = index.prepare_turboquant_query(&query).expect("prepared");
-        let qprep = QueryPrep {
-            norm: crate::vector::simd::norm_simd(&query),
-            rabitq: None,
-            turboquant: Some(&prep),
-            turborabit: None,
-            filter: None,
-        };
-        for node_id in 0..index.len() {
-            let packed = index.distance_to_node(&query, node_id, &qprep);
-            let mut unit = index.get_embedding(node_id).to_vec();
-            crate::vector::ops::normalize(&mut unit);
-            let ip = tq.estimate_ip(&prep, &tq.encode(&unit));
-            let expected = (1.0 - ip).clamp(0.0, 2.0);
-            let rel = (packed - expected).abs() / expected.abs().max(1e-4);
-            assert!(
-                    rel < 1e-3,
-                    "b={bits} node {node_id}: packed walk {packed} != module {expected} (rel {rel:.2e})"
                 );
         }
     }
@@ -2099,7 +1950,6 @@ fn presets_and_auto_storage_are_sane() {
 /// changed result, not a crash. Also checks the permutation is a bijection (every id
 /// still present exactly once).
 #[test]
-#[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
 fn reorder_for_locality_preserves_search_results() {
     let mut rng = StdRng::seed_from_u64(41);
     let dim = 80;
@@ -2123,11 +1973,10 @@ fn reorder_for_locality_preserves_search_results() {
         })
         .collect();
 
-    for (storage, tb, rb) in [
-        (Storage::F32, 2, 3),
-        (Storage::SQ8, 2, 3),
-        (Storage::TurboRabit, 2, 4),
-        (Storage::TurboQuant, 3, 3),
+    for (storage, rb) in [
+        (Storage::F32, 3),
+        (Storage::SQ8, 3),
+        (Storage::TurboRabit, 4),
     ] {
         let config = HNSWConfig {
             metric: DistanceMetric::Cosine,
@@ -2136,7 +1985,6 @@ fn reorder_for_locality_preserves_search_results() {
             ef_construction: 200,
             ef_search: 100,
             storage,
-            turbo_bits: tb,
             rabit_bits: rb,
             rerank_candidates: if storage == Storage::F32 { 0 } else { 50 },
             seed: Some(5),
@@ -2171,7 +2019,6 @@ fn reorder_for_locality_preserves_search_results() {
 /// layer-0 neighbour lists, upper layers, entry point — not via a recall proxy
 /// (measure-the-output applies to the *quantizer*; the graph has an exact answer).
 #[test]
-#[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
 fn requantize_preserves_graph_and_searches_in_every_storage() {
     let mut rng = StdRng::seed_from_u64(31);
     let dim = 96;
@@ -2232,15 +2079,13 @@ fn requantize_preserves_graph_and_searches_in_every_storage() {
         })
         .collect();
 
-    for (storage, tb, rb, floor) in [
-        (Storage::SQ8, 2, 3, 0.85),
-        (Storage::RaBitQ, 2, 3, 0.35), // 1-bit is legitimately coarse; floor is non-vacuous
-        (Storage::TurboQuant, 3, 3, 0.55),
-        (Storage::TurboRabit, 2, 3, 0.80),
+    for (storage, rb, floor) in [
+        (Storage::SQ8, 3, 0.85),
+        (Storage::RaBitQ, 3, 0.35), // 1-bit is legitimately coarse; floor is non-vacuous
+        (Storage::TurboRabit, 3, 0.80),
     ] {
         let new_config = HNSWConfig {
             storage,
-            turbo_bits: tb,
             rabit_bits: rb,
             rerank_candidates: 50,
             ..src_config.clone()
@@ -2333,9 +2178,8 @@ fn requantize_rejects_bad_inputs() {
 /// JSON path is merely equivalent-ish (file.rs re-inserts through `add()`, so the parallel
 /// builder hands back a different graph). Every config field is set off its default —
 /// the save/load bug-class this guards against is a field silently dropped on one side
-/// (the wasm path shipped exactly that: `turbo_bits` was never serialized).
+/// (the wasm path shipped exactly that: a quant-bits field was never serialized).
 #[test]
-#[allow(deprecated)] // exercises Storage::TurboQuant, deprecated until 0.8 removal
 fn snapshot_round_trip_is_verbatim_in_every_storage() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut rng = StdRng::seed_from_u64(77);
@@ -2351,7 +2195,6 @@ fn snapshot_round_trip_is_verbatim_in_every_storage() {
         ("f32", Storage::F32),
         ("sq8", Storage::SQ8),
         ("rabitq", Storage::RaBitQ),
-        ("turboquant", Storage::TurboQuant),
         ("turborabit", Storage::TurboRabit),
         // Mouse is bulk-build-only (no incremental add), and this test adds a doc — it has
         // tested by the snapshot round-trip tests.
@@ -2364,7 +2207,6 @@ fn snapshot_round_trip_is_verbatim_in_every_storage() {
             ef_construction: 150,
             ef_search: 80,
             storage,
-            turbo_bits: 4,
             rabit_bits: 2,
             rerank_candidates: if storage == Storage::F32 { 0 } else { 40 },
             seed: Some(9),
@@ -4443,8 +4285,8 @@ fn memory_breakdown_payload_and_links_track_their_inputs() {
 /// `push_node` and `convert_parallel_to_index` are two implementations of the same encoding,
 /// and every multi-bit test in this file went through the parallel one. That left the nibble
 /// packing in `push_node` — `nib[i / 2] |= c << (4 * (i % 2))`, written once per mode —
-/// completely unexercised for `TurboQuant` and `TurboRabit`: mutation testing could replace
-/// the `%` with `+` in all three copies and nothing failed.
+/// completely unexercised for `TurboRabit`: mutation testing could replace
+/// the `%` with `+` and nothing failed.
 ///
 /// This is the shape the repo keeps rediscovering. `storage_pareto` swept three of six
 /// variants; the existing sequential smoke test above sweeps `SQ8` and `RaBitQ` and stops;
@@ -4455,47 +4297,46 @@ fn memory_breakdown_payload_and_links_track_their_inputs() {
 /// selection needs exact f32 distances it does not retain. That it *refuses* rather than
 /// silently building a bad graph is asserted separately below.
 #[test]
-#[allow(deprecated)] // TurboQuant is deprecated but still public, so it still must work.
 fn multibit_storage_encodes_the_same_through_both_builders() {
     let (base, queries) = rerank_fixture(32);
-    for storage in [Storage::TurboQuant, Storage::TurboRabit] {
-        let recall_of = |build_strategy| {
-            let index = HNSWIndex::build(
-                base.clone(),
-                HNSWConfig {
-                    metric: DistanceMetric::Cosine,
-                    m: 8,
-                    m0: 16,
-                    ef_construction: 60,
-                    ef_search: 60,
-                    storage,
-                    rabit_bits: 4,
-                    turbo_bits: 2,
-                    rerank_candidates: 50,
-                    seed: Some(4),
-                    build_strategy,
-                    ..Default::default()
-                },
-            );
-            recall_against_exact(&index, &base, &queries, 10)
-        };
-        let seq = recall_of(BuildStrategy::Sequential);
-        let par = recall_of(BuildStrategy::Parallel);
+    // TurboRabit is the one nibble-packed storage that supports both builders (Mouse is
+    // bulk-build-only, asserted separately below).
+    let storage = Storage::TurboRabit;
+    let recall_of = |build_strategy| {
+        let index = HNSWIndex::build(
+            base.clone(),
+            HNSWConfig {
+                metric: DistanceMetric::Cosine,
+                m: 8,
+                m0: 16,
+                ef_construction: 60,
+                ef_search: 60,
+                storage,
+                rabit_bits: 4,
+                rerank_candidates: 50,
+                seed: Some(4),
+                build_strategy,
+                ..Default::default()
+            },
+        );
+        recall_against_exact(&index, &base, &queries, 10)
+    };
+    let seq = recall_of(BuildStrategy::Sequential);
+    let par = recall_of(BuildStrategy::Parallel);
 
-        // Absolute floor first: a broken nibble pack does not degrade gracefully, it destroys
-        // the code. Then agreement, because the two builders encode the same vectors and only
-        // their graphs differ.
-        assert!(
-            seq > 0.5,
-            "{storage:?} via BuildStrategy::Sequential recalls {seq:.4} — the sequential \
-             encode path (push_node) is broken"
-        );
-        assert!(
-            (seq - par).abs() < 0.15,
-            "{storage:?} encodes differently in the two builders: sequential {seq:.4} vs \
-             parallel {par:.4}"
-        );
-    }
+    // Absolute floor first: a broken nibble pack does not degrade gracefully, it destroys
+    // the code. Then agreement, because the two builders encode the same vectors and only
+    // their graphs differ.
+    assert!(
+        seq > 0.5,
+        "{storage:?} via BuildStrategy::Sequential recalls {seq:.4} — the sequential \
+         encode path (push_node) is broken"
+    );
+    assert!(
+        (seq - par).abs() < 0.15,
+        "{storage:?} encodes differently in the two builders: sequential {seq:.4} vs \
+         parallel {par:.4}"
+    );
 }
 
 /// `Storage::Mouse` refuses the sequential builder rather than building a bad graph.

@@ -1241,8 +1241,7 @@ fn rabitq_signed_sum_scalar(rq: &[f32], bits: &[u8]) -> f32 {
 /// The multi-bit storages need this per **bit-plane**: a B-bit TurboRabit code
 /// decomposes as `uᵢ + c_B = ½·Σₖ 2ᵏ·(2·bitₖ(i) − 1)`, so its packed estimator is
 /// `B` calls to this one proven kernel (`dsq = dtc² + qn² + ½·f_rescale·Σₖ 2ᵏ·Sₖ`)
-/// rather than a new unsafe path per storage mode. TurboQuant's QJL term is the
-/// same shape over the sketched query. Packing convention is identical to
+/// rather than a new unsafe path per storage mode. Packing convention is identical to
 /// [`rabitq_asymmetric_l2_simd`]: `bits[i/8]` bit `i%8`.
 #[inline]
 pub fn rabitq_signed_sum(rq: &[f32], bits: &[u8]) -> f32 {
@@ -1261,11 +1260,9 @@ pub fn rabitq_signed_sum(rq: &[f32], bits: &[u8]) -> f32 {
 /// `Σ levels[nibbleᵢ] · pqᵢ` — dot of a nibble-packed code sequence, dequantized
 /// through a ≤8-entry `f32` LUT, against a full-precision query.
 ///
-/// This is TurboQuant's packed MSE term: its Lloyd–Max levels are affine in the
-/// code bits only up to 2 MSE bits (the symmetric 4-level codebook happens to be
-/// exactly affine; the 8-level one is not), so the bit-plane trick above cannot
-/// dequantize them — a real gather is needed. With ≤3 MSE bits the whole codebook
-/// fits one AVX2 register and `vpermd` does the gather in-register.
+/// A general nibble-code-times-LUT dot for codes whose dequantized levels are not affine in the
+/// code bits, so the bit-plane trick above cannot dequantize them and a real gather is needed.
+/// With ≤3 code bits the whole LUT fits one AVX2 register and `vpermd` does the gather in-register.
 ///
 /// Packing: nibble `i` lives in `nibbles[i/2]`, low nibble for even `i` (LSB-first,
 /// mirroring the bit convention of [`rabitq_signed_sum`]). `levels` may have fewer
@@ -1345,8 +1342,8 @@ fn nibble_lut_dot_scalar(pq: &[f32], nibbles: &[u8], lut: &[f32; 8]) -> f32 {
 /// full-precision query, converting the code value directly (no LUT).
 ///
 /// This is TurboRabit's FUSED kernel: the Extended-RaBitQ estimate is *linear in
-/// the code value* (`dsq = dtc² + qn² + f_rescale·(⟨u,rq⟩ + c_B·Σrq)`), so unlike
-/// TurboQuant's Lloyd–Max levels there is nothing to gather — one `cvtepi32_ps` +
+/// the code value* (`dsq = dtc² + qn² + f_rescale·(⟨u,rq⟩ + c_B·Σrq)`), so there is
+/// nothing to gather — one `cvtepi32_ps` +
 /// one FMA per lane replaces the previous B bit-plane passes (B×dim FMAs and B
 /// horizontal reductions collapse to dim FMAs and one). Packing convention is
 /// identical to [`nibble_lut_dot_simd`]: nibble `i` in `nibbles[i/2]`, low nibble

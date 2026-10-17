@@ -32,35 +32,20 @@ pub(super) const fn rabitq_bit_words(dim: usize) -> usize {
 /// every case the codes sit in the same arena as the links, so a node visit still touches
 /// exactly one contiguous block.
 /// Words needed for `dim` nibble-packed codes (4 bits/dim, byte-packed then word-rounded) —
-/// TurboQuant's MSE indices. Byte-granular like [`rabitq_bit_words`], for the same reason.
+/// TurboRabit's magnitude codes. Byte-granular like [`rabitq_bit_words`], for the same reason.
 #[inline(always)]
 pub(super) const fn nibble_words(dim: usize) -> usize {
     dim.div_ceil(2).div_ceil(4)
 }
 
-/// `quant_bits` is the active multi-bit budget: `turbo_bits` under `TurboQuant`,
-/// `rabit_bits` under `TurboRabit`, ignored (pass 0) otherwise — see
-/// [`HNSWConfig::quant_bits`].
+/// `quant_bits` is the active multi-bit budget: `rabit_bits` under `TurboRabit`, ignored
+/// (pass 0) otherwise — see [`HNSWConfig::quant_bits`].
 #[inline(always)]
-#[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
-pub(super) const fn vec_words(storage: Storage, dim: usize, quant_bits: usize) -> usize {
+pub(super) const fn vec_words(storage: Storage, dim: usize, _quant_bits: usize) -> usize {
     match storage {
         Storage::F32 => dim,
         Storage::SQ8 => dim.div_ceil(4),
         Storage::RaBitQ => 2 + rabitq_bit_words(dim),
-        // `[gamma][qjl sign bits][mse nibbles]` — the nibble section exists only when
-        // there are MSE bits (`total_bits > 1`); `total_bits = 1` is a pure QJL sketch.
-        // Nibbles are sized by the FWHT-PADDED dim (next power of two): the structured
-        // rotation quantizes in the padded space, so `TurboCode::idx` is padded-length.
-        // The qjl section stays at the raw dim (the sketch runs over the unpadded residual).
-        Storage::TurboQuant => {
-            1 + rabitq_bit_words(dim)
-                + if quant_bits > 1 {
-                    nibble_words(crate::vector::turboquant::fht_padded_dim(dim))
-                } else {
-                    0
-                }
-        }
         // `[dtc_sq][f_rescale][nibble-packed codes]` — one 4-bit slot per coordinate
         // regardless of B (bounded 1..=4 at fit time), read by the FUSED kernel: the
         // Extended-RaBitQ estimate is linear in the code value, so one cvt+FMA per

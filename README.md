@@ -118,9 +118,6 @@ Two newer codes trade a little recall headroom for a much smaller footprint.
   vectors, so incremental `add()` cannot select graph edges and the `Collection` layer refuses it.
   Build it once over the whole corpus with `HNSWIndex::build` / `build_parallel`.
 
-`Storage::TurboQuant` is **deprecated** as of 0.7 (removal in 0.8); `TurboRabit` dominates it at
-every bit budget, so migrate to `TurboRabit` or `SQ8`.
-
 > ### ⚠️ Pick your storage mode by dimension — the two swap places
 >
 > The right code depends on your dimension, and the two **trade places**:

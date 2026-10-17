@@ -176,7 +176,6 @@ impl FilterMask {
 struct QueryPrep<'a> {
     norm: f32,
     rabitq: Option<&'a crate::vector::rabitq::PreparedQuery>,
-    turboquant: Option<&'a crate::vector::turboquant::PreparedQuery>,
     turborabit: Option<&'a crate::vector::turborabit::PreparedQuery>,
     /// Filtered search's admit gate: `Some(f)` ⇒ a node enters the result heap only if `f(node_id)`.
     /// `Some` only from [`HNSWIndex::search_filtered`] (a prebuilt [`FilterMask`], `|id| mask.contains(id)`)
@@ -483,11 +482,6 @@ pub struct HNSWIndex {
     /// (not once per node visit — see [`Self::distance_to_node`]).
     rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
 
-    // === TurboQuant storage (None unless Storage::TurboQuant) ===
-    /// Data-oblivious multi-bit quantizer (rotation + Gaussian sketch + derived codebook).
-    /// Codes are arena-packed per node as `[gamma][qjl bits][mse nibbles]`.
-    turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
-
     // === TurboRabit storage (None unless Storage::TurboRabit) ===
     /// Extended-RaBitQ B-bit quantizer (centroid + rotation, fitted like RaBitQ's).
     /// Codes are arena-packed per node as `[dtc_sq][f_rescale][B bit-planes]`.
@@ -647,7 +641,6 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
-            turboquant: None,
             turborabit: None,
             mouse_res: Vec::new(),
             mouse_rc: Vec::new(),
@@ -670,7 +663,6 @@ impl HNSWIndex {
     /// `RaBitQ`: fits [`RaBitQuantizer`](crate::vector::rabitq::RaBitQuantizer) — a corpus
     /// centroid plus a shared random rotation — used by [`Self::push_node`] to encode each
     /// vector and by [`Self::distance_to_node`] to prepare each query.
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn fit_codebook(&mut self, embeddings: &[Vec<f32>]) {
         if embeddings.is_empty() {
             return;
@@ -708,28 +700,11 @@ impl HNSWIndex {
                     self.rabitq = Some(crate::vector::rabitq::RaBitQuantizer::fit(embeddings));
                 }
             }
-            // Data-oblivious: needs only `dim` and the bit budget, never the data itself.
-            Storage::TurboQuant => {
-                // Hard bound, not a clamp: the arena layout (`vec_words`) reads the raw
-                // config value, so silently coercing it here would make the quantizer and
-                // the layout disagree about the block size. ≤ 4 total bits = ≤ 3 MSE bits,
-                // the most one nibble + the 8-entry `vpermd` LUT kernel can dequantize.
-                assert!(
-                    (1..=4).contains(&self.config.turbo_bits),
-                    "turbo_bits must be in 1..=4 (got {}): the packed MSE kernel dequantizes \
-                     through an 8-entry LUT",
-                    self.config.turbo_bits
-                );
-                self.turboquant = Some(crate::vector::turboquant::TurboQuantizer::new(
-                    self.embedding_dim,
-                    self.config.turbo_bits,
-                ));
-            }
             // Fitted exactly like RaBitQ (centroid + rotation) — including the cosine
             // unit-normalization trick, which works for the same reason: the estimator
             // computes squared L2, and on unit vectors that is 2·cosine_distance exactly.
             Storage::TurboRabit => {
-                // Same hard-bound rationale as TurboQuant above. ≤ 4 because codes are
+                // ≤ 4 because codes are
                 // nibble-packed for the fused kernel — and because b=4 already reaches
                 // F32 recall (coco 0.9998), so 5..8 would be a second layout for a range
                 // with no measured use case (an untested public option = a shipped bug).
@@ -819,13 +794,11 @@ impl HNSWIndex {
     /// (via `build()`/`build_parallel()`, or [`Self::train`]) — checked by looking at the
     /// codebook state itself rather than a separate `bool` flag, so there is no second
     /// source of truth that could drift out of sync with it.
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn is_trained(&self) -> bool {
         match self.config.storage {
             Storage::F32 => true,
             Storage::SQ8 => !self.q_scale.is_empty(),
             Storage::RaBitQ => self.rabitq.is_some(),
-            Storage::TurboQuant => self.turboquant.is_some(),
             Storage::TurboRabit => self.turborabit.is_some(),
             Storage::Mouse => self.turborabit.is_some(),
         }
@@ -1146,14 +1119,13 @@ impl HNSWIndex {
     /// +1.3% on SIFT1M — inside run-to-run noise, and not worth `unsafe` in the hottest
     /// accessor in the library. The bounds check is not what separates us from hnswlib.
     #[inline(always)]
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn get_embedding(&self, node_id: usize) -> &[f32] {
         match self.config.storage {
             Storage::F32 => {
                 let start = node_id * self.stride + self.hdr;
                 bytemuck::cast_slice(&self.nodes[start..start + self.embedding_dim])
             }
-            Storage::SQ8 | Storage::RaBitQ | Storage::TurboQuant | Storage::TurboRabit => {
+            Storage::SQ8 | Storage::RaBitQ | Storage::TurboRabit => {
                 debug_assert!(
                     !self.full.is_empty(),
                     "full-precision vectors were dropped (rerank_candidates = 0); \
@@ -1295,7 +1267,6 @@ impl HNSWIndex {
     /// Every construction path must go through this. The sequential builder previously
     /// pushed the vector and forgot to grow the layer-0 storage, which panicked on every
     /// input; a single append keeps the arena's invariant impossible to half-satisfy.
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn push_node(&mut self, embedding: &[f32]) {
         debug_assert_eq!(embedding.len(), self.embedding_dim);
         let base = self.nodes.len();
@@ -1343,37 +1314,6 @@ impl HNSWIndex {
                 let bytes: &mut [u8] =
                     bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + bit_words]);
                 bytes[..code.bits.len()].copy_from_slice(&code.bits);
-                if self.config.rerank_candidates > 0 && !self.vectors_external {
-                    self.full.extend_from_slice(embedding);
-                }
-            }
-            Storage::TurboQuant => {
-                // TurboQuant assumes unit-norm input (its codebook is derived for N(0,1/d) on the
-                // sphere), so encode a normalized copy unconditionally. The cold `full` array
-                // keeps the ORIGINAL for exact rerank. Block: `[gamma][qjl bits][mse nibbles]` —
-                // qjl is already bit-packed by `encode`; the byte-per-coordinate `idx` is packed
-                // to nibbles here (mse_bits ≤ 3 guaranteed by `fit_codebook`, so codes fit).
-                let tq = self
-                    .turboquant
-                    .as_ref()
-                    .expect("TurboQuant storage requires fit_codebook to run before push_node");
-                let mut unit = embedding.to_vec();
-                crate::vector::ops::normalize(&mut unit);
-                let code = tq.encode(&unit);
-                self.nodes[v] = code.gamma.to_bits();
-                let bit_words = rabitq_bit_words(self.embedding_dim);
-                let qjl_bytes: &mut [u8] =
-                    bytemuck::cast_slice_mut(&mut self.nodes[v + 1..v + 1 + bit_words]);
-                qjl_bytes[..code.qjl.len()].copy_from_slice(&code.qjl);
-                if !code.idx.is_empty() {
-                    let nw = nibble_words(tq.padded_dim());
-                    let start = v + 1 + bit_words;
-                    let nib: &mut [u8] =
-                        bytemuck::cast_slice_mut(&mut self.nodes[start..start + nw]);
-                    for (i, &c) in code.idx.iter().enumerate() {
-                        nib[i / 2] |= c << (4 * (i % 2));
-                    }
-                }
                 if self.config.rerank_candidates > 0 && !self.vectors_external {
                     self.full.extend_from_slice(embedding);
                 }
@@ -1588,7 +1528,6 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
-            turboquant: None,
             turborabit: None,
             mouse_res: Vec::new(),
             mouse_rc: Vec::new(),
@@ -1723,7 +1662,6 @@ impl HNSWIndex {
             q_scale: self.q_scale.clone(),
             full,
             rabitq: self.rabitq.clone(),
-            turboquant: self.turboquant.clone(),
             turborabit: self.turborabit.clone(),
             mouse_res: if self.mouse_res.is_empty() {
                 Vec::new()
@@ -1792,7 +1730,6 @@ impl HNSWIndex {
             q_scale: self.q_scale.clone(),
             full: self.full.clone(),
             rabitq: self.rabitq.clone(),
-            turboquant: self.turboquant.clone(),
             turborabit: self.turborabit.clone(),
             mouse_res: self.mouse_res.clone(),
             mouse_rc: self.mouse_rc.clone(),
@@ -1909,7 +1846,6 @@ impl HNSWIndex {
             q_scale: snap.q_scale,
             full: snap.full,
             rabitq: snap.rabitq,
-            turboquant: snap.turboquant,
             turborabit: snap.turborabit,
             mouse_res: snap.mouse_res,
             mouse_rc: snap.mouse_rc,
@@ -2402,12 +2338,10 @@ impl HNSWIndex {
         // `Storage::RaBitQ` exists to avoid.
         let query_norm = crate::vector::simd::norm_simd(query);
         let rq_prepared = self.prepare_rabitq_query(query);
-        let tq_prepared = self.prepare_turboquant_query(query);
         let tr_prepared = self.prepare_turborabit_query(query);
         let qprep = QueryPrep {
             norm: query_norm,
             rabitq: rq_prepared.as_ref(),
-            turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
             filter,
         };
@@ -2731,12 +2665,10 @@ impl HNSWIndex {
         let query_norm = crate::vector::simd::norm_simd(&node_embedding);
         // See `search_inner`: prepared once per inserted node, not once per distance call.
         let rq_prepared = self.prepare_rabitq_query(&node_embedding);
-        let tq_prepared = self.prepare_turboquant_query(&node_embedding);
         let tr_prepared = self.prepare_turborabit_query(&node_embedding);
         let qprep = QueryPrep {
             norm: query_norm,
             rabitq: rq_prepared.as_ref(),
-            turboquant: tq_prepared.as_ref(),
             turborabit: tr_prepared.as_ref(),
             // Insert path never runs under Mouse (bulk-build-only; add() is rejected).
             filter: None, // builds are never filtered
@@ -3094,26 +3026,6 @@ impl HNSWIndex {
         Some(rq.prepare_query(&query))
     }
 
-    /// Prepare a query for [`Storage::TurboQuant`] traversal: rotate + sketch a unit-normalized
-    /// copy so both sides of the estimator share the same (unit-sphere) geometry the codes use.
-    /// `None` under any other storage.
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
-    fn prepare_turboquant_query(
-        &self,
-        query: &[f32],
-    ) -> Option<crate::vector::turboquant::PreparedQuery> {
-        if self.config.storage != Storage::TurboQuant {
-            return None;
-        }
-        let tq = self
-            .turboquant
-            .as_ref()
-            .expect("TurboQuant storage requires fit_codebook to run before any query");
-        let mut unit = query.to_vec();
-        crate::vector::ops::normalize(&mut unit);
-        Some(tq.prepare_query(&unit))
-    }
-
     /// Prepare a query for [`Storage::TurboRabit`] traversal: same cosine convention as
     /// [`Self::prepare_rabitq_query`] (unit-normalize under cosine, raw under L2), so the
     /// estimator's squared-L2 output stays an exact affine function of cosine distance.
@@ -3148,7 +3060,6 @@ impl HNSWIndex {
     /// No test ever constructed a quantized index with the default metric, so nothing caught
     /// it — classic could-not-fail.
     #[inline]
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     fn distance_to_node(&self, query: &[f32], node_id: usize, qprep: &QueryPrep) -> f32 {
         // Under SQ8 the walk reads 8-bit codes straight out of the node's own block and
         // never touches `full`. This is the whole point of the storage mode: the block
@@ -3206,41 +3117,6 @@ impl HNSWIndex {
                 // defensively — cosine distance is bounded to [0, 2] by definition, and the
                 // estimator's own `.max(0.0)` only guards the lower bound.
                 DistanceMetric::Cosine => (raw * 0.5).clamp(0.0, 2.0),
-            };
-        }
-
-        // Under TurboQuant the walk reads `[gamma][qjl bits][mse nibbles]` from the node's own
-        // arena block. The MSE term dequantizes the nibble codes through the Lloyd–Max LUT
-        // (`nibble_lut_dot_simd`); the QJL term is the 1-bit signed-sum kernel over the
-        // sketched query. Codes were encoded from unit-normalized vectors, so the estimate
-        // is of cosine similarity. Must match `TurboQuantizer::estimate_ip` exactly — the
-        // `packed_walk_matches_module_estimator` tests are the guard.
-        if self.config.storage == Storage::TurboQuant {
-            let prepared = qprep.turboquant.expect(
-                "Storage::TurboQuant traversal requires a query prepared via prepare_turboquant_query",
-            );
-            let tq = self
-                .turboquant
-                .as_ref()
-                .expect("TurboQuant codebook missing during traversal");
-            let v = node_id * self.stride + self.hdr;
-            let gamma = f32::from_bits(self.nodes[v]);
-            let bit_words = rabitq_bit_words(self.embedding_dim);
-            let qjl: &[u8] = bytemuck::cast_slice(&self.nodes[v + 1..v + 1 + bit_words]);
-            let s = crate::vector::simd::rabitq_signed_sum(prepared.sq(), qjl);
-            let mut ip = gamma * tq.qjl_scale() * s;
-            if tq.mse_bits() > 0 {
-                let start = v + 1 + bit_words;
-                let nib: &[u8] =
-                    bytemuck::cast_slice(&self.nodes[start..start + nibble_words(tq.padded_dim())]);
-                ip += crate::vector::simd::nibble_lut_dot_simd(prepared.pq(), nib, tq.levels());
-            }
-            return match self.config.metric {
-                // Cosine distance in [0, 2]; the estimate is unbiased but noisy, so clamp.
-                DistanceMetric::Cosine => (1.0 - ip).clamp(0.0, 2.0),
-                // TODO: norm-aware L2 encoding. For now a monotone-in-cosine proxy — TurboQuant is
-                // exercised under cosine in the VIBE sweep, so this path is not on the hot road yet.
-                DistanceMetric::L2 => (2.0 * (1.0 - ip)).clamp(0.0, 4.0),
             };
         }
 
@@ -3949,7 +3825,6 @@ impl HNSWIndex {
             q_scale: Vec::new(),
             full: Vec::new(),
             rabitq: None,
-            turboquant: None,
             turborabit: None,
             mouse_res: Vec::new(),
             mouse_rc: Vec::new(),

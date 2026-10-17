@@ -96,20 +96,15 @@ pub struct SerializedHNSWConfig {
     pub rerank_candidates: usize,
     #[serde(default)]
     pub seed: Option<u64>,
-    /// Bit budgets for the multi-bit storages. Same bug class as the block above — a config
-    /// field added to `HNSWConfig` (TurboQuant, then TurboRabit) without being wired here
-    /// would silently load as the default. Non-zero defaults (not `#[serde(default)]`) so
-    /// pre-existing blobs come back with the values they were effectively built with.
-    #[serde(default = "default_turbo_bits")]
-    pub turbo_bits: usize,
+    /// Bit budget for the multi-bit storage (TurboRabit). Same bug class as the block above — a
+    /// config field added to `HNSWConfig` without being wired here would silently load as the
+    /// default. Non-zero default (not `#[serde(default)]`) so pre-existing blobs come back with the
+    /// value they were effectively built with. (A legacy `turbo_bits` field may be present in old
+    /// blobs; serde ignores unknown fields, so it is dropped on load.)
     #[serde(default = "default_rabit_bits")]
     pub rabit_bits: usize,
     #[serde(default = "default_reorder_for_locality")]
     pub reorder_for_locality: bool,
-}
-
-fn default_turbo_bits() -> usize {
-    foxstash_core::index::HNSWConfig::default().turbo_bits
 }
 
 fn default_rabit_bits() -> usize {
@@ -627,7 +622,6 @@ pub fn serialize_hnsw_index(
             storage: config.storage,
             rerank_candidates: config.rerank_candidates,
             seed: config.seed,
-            turbo_bits: config.turbo_bits,
             rabit_bits: config.rabit_bits,
             reorder_for_locality: config.reorder_for_locality,
         },
@@ -691,7 +685,6 @@ pub fn deserialize_hnsw_index(
     config.storage = data.config.storage;
     config.rerank_candidates = data.config.rerank_candidates;
     config.seed = data.config.seed;
-    config.turbo_bits = data.config.turbo_bits;
     config.rabit_bits = data.config.rabit_bits;
     config.reorder_for_locality = data.config.reorder_for_locality;
 
@@ -773,7 +766,6 @@ mod tests {
             rerank_candidates: 33,          // default is 0
             seed: Some(4242),               // default is None
             build_strategy: BuildStrategy::Sequential,
-            turbo_bits: 4,               // default is 2
             rabit_bits: 5,               // default is 3
             reorder_for_locality: false, // default is true
         };
@@ -816,7 +808,6 @@ mod tests {
         assert_eq!(got.use_heuristic, config.use_heuristic);
         assert_eq!(got.extend_candidates, config.extend_candidates);
         assert_eq!(got.keep_pruned_connections, config.keep_pruned_connections);
-        assert_eq!(got.turbo_bits, config.turbo_bits, "turbo_bits was lost");
         assert_eq!(got.rabit_bits, config.rabit_bits, "rabit_bits was lost");
         assert_eq!(
             got.reorder_for_locality, config.reorder_for_locality,
@@ -892,7 +883,6 @@ mod tests {
                 metric: DistanceMetric::Cosine,
                 storage: Storage::F32,
                 rerank_candidates: 0,
-                turbo_bits: 2,
                 rabit_bits: 3,
                 reorder_for_locality: true,
                 seed: None,
@@ -924,7 +914,6 @@ mod tests {
                 metric: DistanceMetric::Cosine,
                 storage: Storage::F32,
                 rerank_candidates: 0,
-                turbo_bits: 2,
                 rabit_bits: 3,
                 reorder_for_locality: true,
                 seed: None,

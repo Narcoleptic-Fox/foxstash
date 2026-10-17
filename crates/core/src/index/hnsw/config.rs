@@ -144,14 +144,9 @@ pub struct HNSWConfig {
     /// should be measured on your data, not assumed.
     pub rerank_candidates: usize,
 
-    /// Total bits per dimension for [`Storage::TurboQuant`] (`b`): `b−1` MSE bits + 1 QJL bit.
-    /// Ignored by every other storage mode. `b = 2` (≈2.5 bits/dim, between RaBitQ and SQ8) is a
-    /// sensible default; sweep `{2, 3, 4}` to trade memory for recall. Must be ≥ 1.
-    pub turbo_bits: usize,
-
     /// Total bits per dimension for [`Storage::TurboRabit`] (`B`): 1 sign bit + `B−1`
     /// magnitude bits. Ignored by every other storage mode. `B = 1` is exactly classic
-    /// RaBitQ; sweep `{2, 3, 4}` against `turbo_bits` at matched budgets. Must be in
+    /// RaBitQ; sweep `{2, 3, 4}` to trade memory for recall. Must be in
     /// `1..=4` (nibble-packed codes; b=4 already reaches F32 recall).
     pub rabit_bits: usize,
 
@@ -312,25 +307,6 @@ pub enum Storage {
     /// neighbours before the exact rescore sees them. If recall goes down when you search
     /// harder, raise [`HNSWConfig::rerank_candidates`] before suspecting the quantizer.
     RaBitQ,
-    /// Data-oblivious multi-bit TurboQuant codes (see [`crate::vector::turboquant`]).
-    ///
-    /// A separate, self-contained alternative to [`Storage::RaBitQ`]: `b−1` MSE bits per
-    /// coordinate plus a 1-bit QJL residual, with an unbiased inner-product estimator and a
-    /// codebook **derived** from the known post-rotation Gaussian (no k-means on the data). The
-    /// bit budget `b` is set by [`HNSWConfig::turbo_bits`]. Correctness-first integration stores
-    /// codes in a parallel array; arena-packing is a later QPS optimization.
-    ///
-    /// **Deprecated (0.7, removal in 0.8).** [`Storage::TurboRabit`] (Extended RaBitQ) dominates it
-    /// at every matched bit budget and, unlike plain TurboQuant, holds on out-of-distribution data
-    /// where TurboQuant collapses — recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set
-    /// (see `docs/projects/foxstash/experiments.md` § Phase 4). Prefer `TurboRabit`, or `SQ8` for a
-    /// robust default.
-    #[deprecated(
-        since = "0.7.0",
-        note = "dominated by Storage::TurboRabit at every bit budget and collapses on OOD data; \
-                scheduled for removal in 0.8 — use Storage::TurboRabit or Storage::SQ8"
-    )]
-    TurboQuant,
     /// Extended RaBitQ — B-bit codes with the RaBitQ unbiased estimator (see
     /// [`crate::vector::turborabit`]).
     ///
@@ -338,8 +314,8 @@ pub enum Storage {
     /// frozen as the 1-bit baseline): the signed grid `{u − (2^B−1)/2}`, encoded by the
     /// optimal-rescale critical-value sweep, estimated by the same folded
     /// `dtc² + ‖q−c‖² − 2ℓ²⟨v,rq⟩/⟨r,v⟩` algebra. `B` is set by [`HNSWConfig::rabit_bits`].
-    /// Correctness-first integration stores codes in a parallel array; arena-packing is the
-    /// same later QPS optimization as TurboQuant's.
+    /// Correctness-first integration stores codes in a parallel array; arena-packing is a later
+    /// QPS optimization.
     TurboRabit,
     /// **Mouse** — TurboRabit's 4-bit walk + an 8-bit residual rerank, and **no retained f32**.
     ///
@@ -366,8 +342,8 @@ pub enum Storage {
 impl Storage {
     /// Whether reranking under this mode needs the retained full-precision vectors (`full`).
     ///
-    /// True for every mode whose rerank rescores against f32 — `SQ8`, `RaBitQ`, `TurboQuant`,
-    /// `TurboRabit`. False for:
+    /// True for every mode whose rerank rescores against f32 — `SQ8`, `RaBitQ`, `TurboRabit`.
+    /// False for:
     ///
     /// - [`Storage::F32`], which never reranks (the walk is already exact), and
     /// - [`Storage::Mouse`], whose **8-bit residual code *is* the rerank representation** — it
@@ -400,7 +376,6 @@ impl Default for HNSWConfig {
             seed: None,
             storage: Storage::default(),
             rerank_candidates: 100,
-            turbo_bits: 2,
             rabit_bits: 3,
             reorder_for_locality: true,
         }
@@ -408,15 +383,13 @@ impl Default for HNSWConfig {
 }
 
 impl HNSWConfig {
-    /// The bit budget the active storage mode actually reads: `turbo_bits` under
-    /// [`Storage::TurboQuant`], `rabit_bits` under [`Storage::TurboRabit`], `0` otherwise.
+    /// The bit budget the active storage mode actually reads: `rabit_bits` under
+    /// [`Storage::TurboRabit`], `0` otherwise.
     /// The arena layout ([`vec_words`]) is a function of this, so it must be resolved the
     /// same way everywhere — one accessor, not per-call-site matches that could drift.
     #[inline]
-    #[allow(deprecated)] // internal handling of Storage::TurboQuant until its 0.8 removal
     pub(crate) fn quant_bits(&self) -> usize {
         match self.storage {
-            Storage::TurboQuant => self.turbo_bits,
             Storage::TurboRabit => self.rabit_bits,
             _ => 0,
         }

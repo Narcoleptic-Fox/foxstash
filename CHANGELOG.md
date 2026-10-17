@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **`Storage::TurboQuant`** and its `turbo_bits` config field (**breaking**). Deprecated since 0.7.0: dominated by `Storage::TurboRabit` (Extended RaBitQ) at every matched bit budget, and unlike plain TurboQuant it collapses on out-of-distribution data (recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set). Migrate to `Storage::TurboRabit` (set the budget via `rabit_bits`) or `Storage::SQ8`. The Python binding no longer accepts `"turboquant[N]"` storage strings. Snapshot format bumped to v5 (a v4 snapshot is rejected rather than misparsed).
+
 ## [0.8.0] - 2026-10-15
 
 ### Added

@@ -3,8 +3,8 @@
 //!
 //! Deliberately **separate from and independent of** [`super::rabitq`]. RaBitQ
 //! is the frozen 1-bit baseline; TurboRabit is its B-bit extension, implemented
-//! from the paper + the authors' RaBitQ-Library and measured against both the
-//! baseline and [`super::turboquant`]. Shared helpers (rotation, Gaussian
+//! from the paper + the authors' RaBitQ-Library and measured against the
+//! 1-bit baseline. Shared helpers (rotation, Gaussian
 //! sampling) are duplicated on purpose so RaBitQ stays frozen; each copy
 //! carries its own tests.
 //!

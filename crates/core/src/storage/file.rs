@@ -1051,11 +1051,9 @@ impl From<HNSWConfigWrapper> for crate::index::HNSWConfig {
             keep_pruned_connections: wrapper.keep_pruned_connections,
             storage: wrapper.storage,
             rerank_candidates: wrapper.rerank_candidates,
-            // NOT persisted by the wrapper yet — TurboQuant save/load is out of scope for the
-            // current in-memory VIBE experiment. Defaulted so a reloaded config is valid; wire
-            // into HNSWConfigWrapper before relying on TurboQuant across a save/load.
-            turbo_bits: crate::index::HNSWConfig::default().turbo_bits,
-            // Same status as `turbo_bits` directly above: TurboRabit save/load is not wired yet.
+            // NOT persisted by the wrapper yet: TurboRabit save/load is not wired here. Defaulted
+            // so a reloaded config is valid; wire into HNSWConfigWrapper before relying on
+            // TurboRabit across a save/load.
             rabit_bits: crate::index::HNSWConfig::default().rabit_bits,
             // Inert on this path regardless: `to_index` rebuilds via `add()`, which does not
             // reorder. Defaulted so the config is valid.
