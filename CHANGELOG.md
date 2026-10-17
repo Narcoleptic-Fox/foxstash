@@ -5,15 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.0] - 2026-10-17
+
+A breaking release: `Storage::TurboQuant` is removed. The headline non-breaking work is the
+resident-memory cut for reranking collections, a true-delete `purge`, and a configurable native/wasm
+construction surface.
 
 ### Added
 
-- **Configurable native C ABI and wasm construction** (issue #61). The native ABI gains `rag_create_with_config(dim, *const FoxstashConfig)`, `rag_default_config(*mut FoxstashConfig)`, and `rag_train(handle, sample, n, dim)`, exposing the metric, storage mode, reranking, graph degree, seed and other `HNSWConfig` knobs (via stable integer enum codes) that bare `rag_create` left at their defaults — previously 0 of ~16 fields were reachable from C. The wasm binding gains `LocalRAG.withConfig(dim, config)` (a plain JS object with string metric/storage) and `LocalRAG.train(sample)`. A quantized storage mode requires `train` on a sample before it accepts documents; `f32` does not.
+- **`Collection::purge(ids)`** returning a `PurgeReport`: a true-delete that erases the documents from
+  every on-disk artifact, not just from search results. `delete` is a soft tombstone, and a single
+  `compact` at the default `keep_checkpoints = 2` leaves the previous checkpoint and graph snapshot
+  on disk still holding the content; `purge` deletes then compacts `keep_checkpoints` times so every
+  artifact older than the first post-delete checkpoint is pruned, and the report proves
+  `surviving_min_generation >= purge_generation` (a violation is a hard error, never a silent partial
+  purge). It erases the plaintext artifacts; `fs::remove_file` does not zero blocks, so cryptographic
+  erasure still needs encryption at rest plus key rotation. (#59)
+- **Externalized rerank vectors** so a reranking `Collection` keeps the full f32 embeddings **once**,
+  not twice. The index reranks against the document store via a new `VectorSource` trait and
+  `HNSWIndex::with_vectors` / `build_parallel_from_documents_external` / `node_ids`, instead of
+  holding its own `full` copy. Saves one f32 copy resident (`n * dim * 4`; measured 74.3 → 15.8 MiB
+  of index footprint at 20k × 768). Transparent to `Collection` callers; the standalone `HNSWIndex`
+  path is unchanged. Applies to the quantized + fitted + `rerank_candidates > 0` case (F32/staging is
+  unchanged). Snapshot format carries a `vectors_external` flag. (#58)
+- **Configurable native C ABI and wasm construction** (#61). The native ABI gains
+  `rag_create_with_config(dim, *const FoxstashConfig)`, `rag_default_config(*mut FoxstashConfig)`, and
+  `rag_train(handle, sample, n, dim)`, exposing the metric, storage mode, reranking, graph degree,
+  seed and other `HNSWConfig` knobs (via stable integer enum codes) that bare `rag_create` left at
+  their defaults — previously 0 of ~16 fields were reachable from C. The wasm binding gains
+  `LocalRAG.withConfig(dim, config)` (a plain JS object with string metric/storage) and
+  `LocalRAG.train(sample)`. A quantized storage mode requires `train` on a sample before it accepts
+  documents; `f32` does not.
 
 ### Removed
 
 - **`Storage::TurboQuant`** and its `turbo_bits` config field (**breaking**). Deprecated since 0.7.0: dominated by `Storage::TurboRabit` (Extended RaBitQ) at every matched bit budget, and unlike plain TurboQuant it collapses on out-of-distribution data (recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set). Migrate to `Storage::TurboRabit` (set the budget via `rabit_bits`) or `Storage::SQ8`. The Python binding no longer accepts `"turboquant[N]"` storage strings. Snapshot format bumped to v5 (a v4 snapshot is rejected rather than misparsed).
+
+### Dependencies
+
+- `zstd` 0.13 → 0.14 (optional `zstd` feature); `rand` 0.9 → 0.10 in the GPU add-on. CI actions bumped (`checkout` v7, `setup-python` v7, `labeler` v7).
 
 ## [0.8.0] - 2026-10-15
 
@@ -134,6 +164,7 @@ The "1.0 audit" release: one index, one config, one metric; −5,380 lines.
 - ONNX embedding support available but may have platform-specific limitations on Windows
 - WASM support is experimental
 
+[0.9.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/Narcoleptic-Fox/foxstash/compare/v0.5.0...v0.6.0
