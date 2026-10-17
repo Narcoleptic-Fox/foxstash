@@ -1975,7 +1975,7 @@ impl LeanVecIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     /// GPU SQ8 flat scan must recover most of the exact (f32 brute-force) top-k on real-ish data.
     /// 8-bit quantization ⇒ high-but-not-perfect recall, and a flat scan has no navigation loss.

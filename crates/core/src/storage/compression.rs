@@ -207,7 +207,7 @@ pub fn best_codec() -> Codec {
 
     #[cfg(all(feature = "zstd", not(feature = "lz4")))]
     {
-        return Codec::Zstd;
+        Codec::Zstd
     }
 
     #[cfg(not(any(feature = "lz4", feature = "zstd")))]
