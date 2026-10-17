@@ -6,7 +6,7 @@ description = "Optional GPU flat-scan backend for foxstash (CubeCL: CUDA/ROCm/Vu
 
 [dependencies]
 foxstash-core = { path = "../core" }
-cubecl = { version = "0.10", features = ["wgpu"] }
+cubecl = { version = "0.11", features = ["wgpu"] }
 bytemuck = "1"
 
 [features]
