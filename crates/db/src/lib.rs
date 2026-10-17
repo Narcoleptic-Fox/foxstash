@@ -240,7 +240,7 @@ pub use text_index::TextIndex;
 // ── Re-exports: desktop only ──
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use collection::Collection;
+pub use collection::{Collection, PurgeReport};
 #[cfg(not(target_arch = "wasm32"))]
 pub use filter::Filter;
 #[cfg(not(target_arch = "wasm32"))]
