@@ -105,6 +105,11 @@ trait RagIndex: Send + Sync {
     fn len(&self) -> usize;
     fn clear(&mut self);
     fn save(&self, storage: &FileStorage, name: &str) -> Result<(), String>;
+    /// Fit the quantization codebook from a sample, so a quantized index can accept `add`.
+    /// A no-op precondition for `Storage::F32`; unsupported for a flat index.
+    fn train(&mut self, _sample: &[Vec<f32>]) -> Result<(), String> {
+        Err("train() is only supported for an HNSW index".to_string())
+    }
 }
 
 impl RagIndex for FlatIndex {
@@ -157,6 +162,10 @@ impl RagIndex for HNSWIndex {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+
+    fn train(&mut self, sample: &[Vec<f32>]) -> Result<(), String> {
+        self.train(sample).map_err(|e| e.to_string())
+    }
 }
 
 /// Opaque handle to RAG index.
@@ -186,6 +195,146 @@ pub struct SearchResult {
     pub id: *mut c_char,
     pub content: *mut c_char,
     pub score: f32,
+}
+
+// =============================================================================
+// Configuration (issue #61)
+// =============================================================================
+
+/// Distance metric codes for [`FoxstashConfig::metric`]. Stable integers, not the Rust enum.
+pub const FOXSTASH_METRIC_COSINE: u32 = 0;
+pub const FOXSTASH_METRIC_L2: u32 = 1;
+
+/// Storage mode codes for [`FoxstashConfig::storage`]. Stable integers, not the Rust enum.
+pub const FOXSTASH_STORAGE_F32: u32 = 0;
+pub const FOXSTASH_STORAGE_SQ8: u32 = 1;
+pub const FOXSTASH_STORAGE_RABITQ: u32 = 2;
+pub const FOXSTASH_STORAGE_TURBORABIT: u32 = 3;
+pub const FOXSTASH_STORAGE_MOUSE: u32 = 4;
+
+/// C-compatible view of the tuning knobs on `HNSWConfig`, so a native caller can select a metric,
+/// a quantized storage mode, reranking, graph degree and so on — none of which the bare
+/// `rag_create` exposes (issue #61). Build one with [`rag_default_config`], tweak the fields, and
+/// pass it to [`rag_create_with_config`]. Booleans are `i32` (0 = false), `seed` is `i64`
+/// (negative = unseeded), and `ml <= 0` means "derive the HNSW default `1/ln(m)`".
+#[repr(C)]
+pub struct FoxstashConfig {
+    pub metric: u32,
+    pub m: usize,
+    pub m0: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+    pub ml: f32,
+    pub use_heuristic: i32,
+    pub extend_candidates: i32,
+    pub keep_pruned_connections: i32,
+    pub seed: i64,
+    pub storage: u32,
+    pub rerank_candidates: usize,
+    pub rabit_bits: usize,
+    pub reorder_for_locality: i32,
+}
+
+fn metric_from_code(code: u32) -> Result<foxstash_core::index::DistanceMetric, String> {
+    use foxstash_core::index::DistanceMetric;
+    match code {
+        FOXSTASH_METRIC_COSINE => Ok(DistanceMetric::Cosine),
+        FOXSTASH_METRIC_L2 => Ok(DistanceMetric::L2),
+        other => Err(format!(
+            "unknown metric code {other} (expected 0=cosine, 1=l2)"
+        )),
+    }
+}
+
+fn storage_from_code(code: u32) -> Result<foxstash_core::index::Storage, String> {
+    use foxstash_core::index::Storage;
+    match code {
+        FOXSTASH_STORAGE_F32 => Ok(Storage::F32),
+        FOXSTASH_STORAGE_SQ8 => Ok(Storage::SQ8),
+        FOXSTASH_STORAGE_RABITQ => Ok(Storage::RaBitQ),
+        FOXSTASH_STORAGE_TURBORABIT => Ok(Storage::TurboRabit),
+        FOXSTASH_STORAGE_MOUSE => Ok(Storage::Mouse),
+        other => Err(format!(
+            "unknown storage code {other} (expected 0=f32, 1=sq8, 2=rabitq, 3=turborabit, 4=mouse)"
+        )),
+    }
+}
+
+impl FoxstashConfig {
+    fn to_hnsw(&self) -> Result<foxstash_core::index::HNSWConfig, String> {
+        let defaults = foxstash_core::index::HNSWConfig::default();
+        let m = if self.m == 0 { defaults.m } else { self.m };
+        Ok(foxstash_core::index::HNSWConfig {
+            metric: metric_from_code(self.metric)?,
+            m,
+            m0: if self.m0 == 0 { m * 2 } else { self.m0 },
+            ef_construction: if self.ef_construction == 0 {
+                defaults.ef_construction
+            } else {
+                self.ef_construction
+            },
+            ef_search: if self.ef_search == 0 {
+                defaults.ef_search
+            } else {
+                self.ef_search
+            },
+            ml: if self.ml > 0.0 {
+                self.ml
+            } else {
+                1.0 / (m as f32).ln()
+            },
+            use_heuristic: self.use_heuristic != 0,
+            extend_candidates: self.extend_candidates != 0,
+            keep_pruned_connections: self.keep_pruned_connections != 0,
+            build_strategy: defaults.build_strategy,
+            seed: if self.seed < 0 {
+                None
+            } else {
+                Some(self.seed as u64)
+            },
+            storage: storage_from_code(self.storage)?,
+            rerank_candidates: self.rerank_candidates,
+            rabit_bits: if self.rabit_bits == 0 {
+                defaults.rabit_bits
+            } else {
+                self.rabit_bits
+            },
+            reorder_for_locality: self.reorder_for_locality != 0,
+        })
+    }
+}
+
+/// Fill `out` with the default `HNSWConfig` values, expressed as a [`FoxstashConfig`]. A caller
+/// tweaks the fields it cares about and passes the struct to [`rag_create_with_config`]; the
+/// fields it leaves alone stay at the library defaults. Returns 0, or -1 if `out` is NULL.
+///
+/// # Safety
+/// `out` must be a valid, writable pointer to a `FoxstashConfig`.
+#[no_mangle]
+pub extern "C" fn rag_default_config(out: *mut FoxstashConfig) -> i32 {
+    if out.is_null() {
+        set_last_error("Output config pointer is NULL".to_string());
+        return -1;
+    }
+    let d = foxstash_core::index::HNSWConfig::default();
+    let cfg = FoxstashConfig {
+        metric: FOXSTASH_METRIC_COSINE,
+        m: d.m,
+        m0: d.m0,
+        ef_construction: d.ef_construction,
+        ef_search: d.ef_search,
+        ml: d.ml,
+        use_heuristic: d.use_heuristic as i32,
+        extend_candidates: d.extend_candidates as i32,
+        keep_pruned_connections: d.keep_pruned_connections as i32,
+        seed: -1,
+        storage: FOXSTASH_STORAGE_F32,
+        rerank_candidates: d.rerank_candidates,
+        rabit_bits: d.rabit_bits,
+        reorder_for_locality: d.reorder_for_locality as i32,
+    };
+    unsafe { *out = cfg };
+    0
 }
 
 // =============================================================================
@@ -254,6 +403,138 @@ pub extern "C" fn rag_create(embedding_dim: usize, use_hnsw: i32) -> *mut RagHan
             ptr::null_mut()
         }
     }
+}
+
+/// Create an HNSW index with an explicit [`FoxstashConfig`] (issue #61), exposing the metric,
+/// storage mode, reranking, graph degree and other knobs that [`rag_create`] leaves at their
+/// defaults. Returns a handle, or NULL on failure (check `rag_last_error`).
+///
+/// A **quantized** storage mode (`sq8`, `rabitq`, `turborabit`, `mouse`) needs a fitted codebook
+/// before it will accept documents: call [`rag_train`] with a representative sample first, then
+/// [`rag_add_document`]. Under `f32` (the default) no training is needed. `mouse` additionally
+/// cannot be grown incrementally at all (it keeps no exact vectors) and so is not usable through
+/// this incremental ABI; it is accepted here only to round-trip the enum.
+///
+/// # Arguments
+/// * `embedding_dim` - Dimensionality of embeddings.
+/// * `config` - Pointer to a [`FoxstashConfig`] (see [`rag_default_config`]).
+///
+/// # Safety
+/// `config` must be a valid pointer to a `FoxstashConfig` for the duration of the call.
+#[no_mangle]
+pub extern "C" fn rag_create_with_config(
+    embedding_dim: usize,
+    config: *const FoxstashConfig,
+) -> *mut RagHandle {
+    clear_last_error();
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if embedding_dim == 0 {
+            set_last_error("Embedding dimension must be greater than 0".to_string());
+            return ptr::null_mut();
+        }
+        if embedding_dim > 100000 {
+            set_last_error("Embedding dimension too large (max 100000)".to_string());
+            return ptr::null_mut();
+        }
+        if config.is_null() {
+            set_last_error("Config pointer is NULL".to_string());
+            return ptr::null_mut();
+        }
+
+        let hnsw_config = match unsafe { &*config }.to_hnsw() {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(format!("Invalid config: {e}"));
+                return ptr::null_mut();
+            }
+        };
+
+        let index: Box<dyn RagIndex> = Box::new(HNSWIndex::new(embedding_dim, hnsw_config));
+        let handle = RagHandle {
+            index: RwLock::new(index),
+            storage: Mutex::new(None),
+            embedding_dim,
+        };
+        Box::into_raw(Box::new(handle))
+    }));
+
+    match result {
+        Ok(ptr) => ptr,
+        Err(_) => {
+            set_last_error("Panic occurred during index creation".to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Fit the quantization codebook of an index created with a quantized [`FoxstashConfig`], from a
+/// representative sample of vectors, so it can accept documents via [`rag_add_document`] (issue
+/// #61). A no-op-friendly call under `f32` (returns success). `sample` is a flat row-major array
+/// of `n_vectors * embedding_dim` floats.
+///
+/// Returns 0 on success, -1 on failure (check `rag_last_error`).
+///
+/// # Safety
+/// `handle` must be a valid `RagHandle`, and `sample` must point to at least
+/// `n_vectors * embedding_dim` `f32` values.
+#[no_mangle]
+pub extern "C" fn rag_train(
+    handle: *mut RagHandle,
+    sample: *const f32,
+    n_vectors: usize,
+    embedding_dim: usize,
+) -> i32 {
+    clear_last_error();
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            set_last_error("Handle is NULL".to_string());
+            return -1;
+        }
+        if sample.is_null() {
+            set_last_error("Sample pointer is NULL".to_string());
+            return -1;
+        }
+        let handle = unsafe { &*handle };
+        if embedding_dim != handle.embedding_dim {
+            set_last_error(format!(
+                "Sample dimension mismatch: expected {}, got {}",
+                handle.embedding_dim, embedding_dim
+            ));
+            return -1;
+        }
+        if n_vectors == 0 {
+            set_last_error("Sample must contain at least one vector".to_string());
+            return -1;
+        }
+
+        let flat = unsafe { std::slice::from_raw_parts(sample, n_vectors * embedding_dim) };
+        let vectors: Vec<Vec<f32>> = flat
+            .chunks_exact(embedding_dim)
+            .map(|row| row.to_vec())
+            .collect();
+
+        let mut index = match handle.index.write() {
+            Ok(g) => g,
+            Err(_) => {
+                set_last_error("Index lock poisoned".to_string());
+                return -1;
+            }
+        };
+        match index.train(&vectors) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_last_error(format!("train failed: {e}"));
+                -1
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        set_last_error("Panic occurred during train".to_string());
+        -1
+    })
 }
 
 /// Destroy a RAG index and free all associated memory.
@@ -1469,5 +1750,137 @@ mod tests {
     fn test_rag_handle_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RagHandle>();
+    }
+
+    // ─── Issue #61: config surface ───────────────────────────────────────────────────────────
+
+    fn default_config() -> FoxstashConfig {
+        let mut cfg = std::mem::MaybeUninit::<FoxstashConfig>::uninit();
+        assert_eq!(rag_default_config(cfg.as_mut_ptr()), 0);
+        // SAFETY: rag_default_config writes every field on success.
+        unsafe { cfg.assume_init() }
+    }
+
+    #[test]
+    fn test_create_with_config_f32_defaults_work() {
+        let cfg = default_config();
+        assert_eq!(cfg.storage, FOXSTASH_STORAGE_F32);
+        assert_eq!(cfg.metric, FOXSTASH_METRIC_COSINE);
+
+        let handle = rag_create_with_config(3, &cfg);
+        assert!(!handle.is_null());
+        let id = CString::new("d0").unwrap();
+        let content = CString::new("c").unwrap();
+        let emb = [1.0f32, 0.0, 0.0];
+        assert_eq!(
+            rag_add_document(handle, id.as_ptr(), content.as_ptr(), emb.as_ptr(), 3),
+            0,
+            "f32 index should accept a document without training"
+        );
+        assert_eq!(rag_count(handle), 1);
+        rag_destroy(handle);
+    }
+
+    #[test]
+    fn test_create_with_config_quantized_requires_train_then_works() {
+        // A quantized storage mode reaches the index via the config (bare rag_create cannot do
+        // this — it only builds a default f32 index).
+        let mut cfg = default_config();
+        cfg.storage = FOXSTASH_STORAGE_SQ8;
+        cfg.rerank_candidates = 20;
+
+        let dim = 8usize;
+        let handle = rag_create_with_config(dim, &cfg);
+        assert!(!handle.is_null());
+
+        let vector = |i: usize| -> Vec<f32> {
+            let mut s = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..dim)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((s >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+        let corpus: Vec<Vec<f32>> = (0..40).map(vector).collect();
+
+        // Adding before training a quantized index must fail with a clear error, not silently.
+        let id = CString::new("early").unwrap();
+        let content = CString::new("c").unwrap();
+        assert_eq!(
+            rag_add_document(
+                handle,
+                id.as_ptr(),
+                content.as_ptr(),
+                corpus[0].as_ptr(),
+                dim
+            ),
+            -1,
+            "a quantized index should refuse add() before train()"
+        );
+
+        // Train the codebook from the sample, then the same add succeeds.
+        let flat: Vec<f32> = corpus.iter().flatten().copied().collect();
+        assert_eq!(
+            rag_train(handle, flat.as_ptr(), corpus.len(), dim),
+            0,
+            "train should succeed on a valid sample"
+        );
+        for (i, v) in corpus.iter().enumerate() {
+            let id = CString::new(format!("d{i}")).unwrap();
+            assert_eq!(
+                rag_add_document(handle, id.as_ptr(), content.as_ptr(), v.as_ptr(), dim),
+                0,
+                "add should succeed after train"
+            );
+        }
+        assert_eq!(rag_count(handle), 40);
+
+        // Self-retrieval: the configured SQ8 + rerank index returns the query's own id.
+        let mut results: *mut SearchResult = ptr::null_mut();
+        let mut count: usize = 0;
+        assert_eq!(
+            rag_search(handle, corpus[7].as_ptr(), dim, 5, &mut results, &mut count),
+            0
+        );
+        let hits: Vec<String> = unsafe {
+            std::slice::from_raw_parts(results, count)
+                .iter()
+                .map(|r| CStr::from_ptr(r.id).to_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(
+            hits.iter().any(|h| h == "d7"),
+            "d7 should be in its own top-5, got {hits:?}"
+        );
+        rag_free_results(results, count);
+        rag_destroy(handle);
+    }
+
+    #[test]
+    fn test_create_with_config_rejects_unknown_codes() {
+        let mut cfg = default_config();
+        cfg.storage = 99;
+        assert!(
+            rag_create_with_config(3, &cfg).is_null(),
+            "an unknown storage code must be rejected"
+        );
+        assert!(!rag_last_error().is_null());
+
+        let mut cfg = default_config();
+        cfg.metric = 99;
+        assert!(
+            rag_create_with_config(3, &cfg).is_null(),
+            "an unknown metric code must be rejected"
+        );
+        assert!(!rag_last_error().is_null());
+    }
+
+    #[test]
+    fn test_create_with_config_null_rejected() {
+        assert!(rag_create_with_config(3, ptr::null()).is_null());
+        assert!(rag_default_config(ptr::null_mut()) == -1);
     }
 }
