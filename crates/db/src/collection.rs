@@ -26,8 +26,134 @@ struct CollectionInner {
     /// Flat document store for get-by-id and checkpoint serialization.
     /// Positions align with the id_map, but tombstoned entries may be stale.
     documents: Vec<Document>,
+    /// Maps each **index node id** to its position in `documents` (issue #58). Lets the index
+    /// rerank against this store instead of keeping its own f32 copy, when it was built with
+    /// externalized vectors (`index.vectors_external()`). Empty for a non-external (F32 / staging /
+    /// rerank-disabled) index, which does not need it. The invariant, maintained by every mutation,
+    /// is `node_doc[n]` = the position in `documents` of the document that became node `n`:
+    /// identity for incremental inserts (node id grows with `documents`), the builder's provenance
+    /// map after a shuffled bulk build or compaction.
+    node_doc: Vec<u32>,
     text_index: InvertedIndex,
     tokenizer: SimpleTokenizer,
+}
+
+/// A [`VectorSource`](foxstash_core::index::VectorSource) view over a collection's document store,
+/// so an externalized index reranks against the one f32 copy the collection already holds rather
+/// than a second copy of its own. `vector(node)` resolves the node id to a document position via
+/// `node_doc`, then returns that document's embedding. See issue #58.
+pub(crate) struct DocVectors<'a> {
+    documents: &'a [Document],
+    node_doc: &'a [u32],
+}
+
+impl<'a> DocVectors<'a> {
+    pub(crate) fn new(documents: &'a [Document], node_doc: &'a [u32]) -> Self {
+        Self {
+            documents,
+            node_doc,
+        }
+    }
+}
+
+impl foxstash_core::index::VectorSource for DocVectors<'_> {
+    #[inline]
+    fn vector(&self, node: usize) -> &[f32] {
+        &self.documents[self.node_doc[node] as usize].embedding
+    }
+}
+
+/// Build an index from documents, choosing the externalized-vector path (issue #58) when it pays —
+/// a quantized storage with reranking on — otherwise the standard owned-`full` build. Returns the
+/// index and its `node_doc` map (empty for the non-external path, which does not use one).
+///
+/// The documents are pushed into the collection's store in the same order they are passed here, so
+/// the builder's node → input-index provenance is exactly the node → document-position map.
+fn build_index_from_documents(
+    documents: Vec<Document>,
+    cfg: foxstash_core::index::HNSWConfig,
+) -> HNSWIndex {
+    if cfg.storage != foxstash_core::index::Storage::F32 && cfg.rerank_candidates > 0 {
+        HNSWIndex::build_parallel_from_documents_external(documents, cfg).0
+    } else {
+        HNSWIndex::build_parallel_from_documents(documents, cfg)
+    }
+}
+
+/// The node → document-position map (`node_doc`) for a freshly rebuilt index, derived from the
+/// index's node ids through `id_map`. Empty for a non-external index, which needs none. Works
+/// whether `documents` was reset to the live set (compaction) or left as the full append-only list
+/// (fit): `id_map` positions always index `documents`, and every node's id is a live id after a
+/// build-from-live-docs. See issue #58.
+fn derive_node_doc(index: &HNSWIndex, id_map: &IdMap) -> Vec<u32> {
+    if !index.vectors_external() {
+        return Vec::new();
+    }
+    index
+        .node_ids()
+        .iter()
+        .map(|id| {
+            id_map
+                .get(id)
+                .expect("every node of a freshly built external index must be a live id")
+                as u32
+        })
+        .collect()
+}
+
+/// Add one document to the in-memory state under the write lock: tombstone any previous version,
+/// insert into the graph, and record it in the id map, text index and document store. The single
+/// implementation shared by `insert` and the incremental branch of `insert_many`, so the graph
+/// insert and its `node_doc` bookkeeping exist in exactly one place.
+///
+/// Handles both an externalized index (#58 — vectors sourced from `documents`, `node_doc` grown by
+/// identity since an incremental node id equals its document position) and a normal owned-`full`
+/// index. On a graph-insert error the `documents` / `node_doc` pushes are rolled back so their
+/// lengths stay in lockstep with the index.
+fn add_document_locked(inner: &mut CollectionInner, doc: Document) -> Result<()> {
+    // Clean up old inverted-index postings before tombstoning; id_map.get() returns None after
+    // remove(), so capture the old position first.
+    if let Some(old_pos) = inner.id_map.get(&doc.id) {
+        inner.text_index.remove(old_pos);
+    }
+    inner.id_map.remove(&doc.id);
+
+    if inner.index.vectors_external() {
+        let CollectionInner {
+            index,
+            documents,
+            node_doc,
+            id_map,
+            text_index,
+            tokenizer,
+        } = inner;
+        let new_pos = documents.len(); // == index.len() == node_doc.len() (invariant)
+        let tokens = tokenizer.tokenize(&doc.content);
+        let doc_id = doc.id.clone();
+        documents.push(doc);
+        node_doc.push(new_pos as u32);
+        let add_result = {
+            let src = DocVectors {
+                documents: &*documents,
+                node_doc: &*node_doc,
+            };
+            index.add_borrowed_with_vectors(&documents[new_pos], &src)
+        };
+        if let Err(e) = add_result {
+            documents.pop();
+            node_doc.pop();
+            return Err(DbError::Core(e));
+        }
+        let pos = id_map.insert(doc_id);
+        text_index.add(pos, &tokens);
+    } else {
+        inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
+        let pos = inner.id_map.insert(doc.id.clone());
+        let tokens = inner.tokenizer.tokenize(&doc.content);
+        inner.text_index.add(pos, &tokens);
+        inner.documents.push(doc);
+    }
+    Ok(())
 }
 
 /// Proof that the holder has exclusive right to mutate a [`Collection`].
@@ -169,6 +295,7 @@ impl Collection {
                 index: state.index,
                 id_map: state.id_map,
                 documents: state.documents,
+                node_doc: state.node_doc,
                 text_index: state.text_index,
                 tokenizer: SimpleTokenizer::new(),
             }),
@@ -210,6 +337,7 @@ impl Collection {
                 index: HNSWIndex::new(config.embedding_dim, Self::staging_hnsw(&config)),
                 id_map: IdMap::new(),
                 documents: Vec::new(),
+                node_doc: Vec::new(),
                 text_index: InvertedIndex::with_config(config.bm25.clone()),
                 tokenizer: SimpleTokenizer::new(),
             }),
@@ -269,18 +397,7 @@ impl Collection {
         // Then mutate in-memory state.
         {
             let mut inner = self.inner.write();
-            // Clean up old inverted index postings before tombstoning.
-            // id_map.get() returns None after remove(), so capture old_pos first.
-            if let Some(old_pos) = inner.id_map.get(&id) {
-                inner.text_index.remove(old_pos);
-            }
-            // Tombstone previous version if re-inserting same ID (no-op if absent).
-            inner.id_map.remove(&id);
-            inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
-            let pos = inner.id_map.insert(id);
-            let tokens = inner.tokenizer.tokenize(&doc.content);
-            inner.text_index.add(pos, &tokens);
-            inner.documents.push(doc);
+            add_document_locked(&mut inner, doc)?;
         }
 
         self.maybe_auto_fit_locked(&mutation)?;
@@ -342,11 +459,10 @@ impl Collection {
         {
             let mut inner = self.inner.write();
             if inner.id_map.live_count() == 0 && inner.documents.is_empty() {
-                // Empty: build the whole graph in parallel.
-                inner.index = HNSWIndex::build_parallel_from_documents(
-                    documents.clone(),
-                    self.config.hnsw.clone(),
-                );
+                // Empty: build the whole graph in parallel. Externalizes the rerank vectors when
+                // the target storage pays for it (#58), in which case the index keeps no `full`.
+                inner.index =
+                    build_index_from_documents(documents.clone(), self.config.hnsw.clone());
                 // The index permutes internally, so id_map/text_index positions
                 // are assigned here in insertion order, exactly as the sequential
                 // path would — they index `documents`, not index slots.
@@ -356,17 +472,11 @@ impl Collection {
                     inner.text_index.add(pos, &tokens);
                     inner.documents.push(doc);
                 }
+                // node id -> document position, from the built index's (shuffled) node order.
+                inner.node_doc = derive_node_doc(&inner.index, &inner.id_map);
             } else {
                 for doc in documents {
-                    if let Some(old_pos) = inner.id_map.get(&doc.id) {
-                        inner.text_index.remove(old_pos);
-                    }
-                    inner.id_map.remove(&doc.id);
-                    inner.index.add_borrowed(&doc).map_err(DbError::Core)?;
-                    let pos = inner.id_map.insert(doc.id.clone());
-                    let tokens = inner.tokenizer.tokenize(&doc.content);
-                    inner.text_index.add(pos, &tokens);
-                    inner.documents.push(doc);
+                    add_document_locked(&mut inner, doc)?;
                 }
             }
         }
@@ -472,10 +582,16 @@ impl Collection {
         match filter {
             None => {
                 let fetch = self.unfiltered_fetch_count(&inner, k);
-                let raw_batch = inner
-                    .index
-                    .search_batch(queries, fetch)
-                    .map_err(DbError::Core)?;
+                let raw_batch = if inner.index.vectors_external() {
+                    let src = DocVectors {
+                        documents: &inner.documents,
+                        node_doc: &inner.node_doc,
+                    };
+                    inner.index.with_vectors(&src).search_batch(queries, fetch)
+                } else {
+                    inner.index.search_batch(queries, fetch)
+                }
+                .map_err(DbError::Core)?;
 
                 Ok(raw_batch
                     .into_iter()
@@ -536,8 +652,7 @@ impl Collection {
         // `build_parallel_from_documents` trains internally from the corpus it is
         // given, which is exactly what compaction has in hand. (This was a real
         // bug: compact() on a fitted collection failed outright.)
-        let mut new_index =
-            HNSWIndex::build_parallel_from_documents(live_docs.clone(), rebuild_cfg);
+        let mut new_index = build_index_from_documents(live_docs.clone(), rebuild_cfg);
         if live_docs.is_empty() {
             // build_parallel_from_documents returns a dimensionless index for an
             // empty corpus; keep the collection's own dimension so later inserts
@@ -552,6 +667,9 @@ impl Collection {
             let tokens = inner.tokenizer.tokenize(&doc.content);
             new_text_index.add(pos, &tokens);
         }
+        // node id -> document position for the rebuilt (shuffled) graph. `documents` is reset to
+        // `live_docs` below, so this aligns. Empty for a non-external (staging / F32) rebuild.
+        let new_node_doc = derive_node_doc(&new_index, &new_id_map);
 
         let checkpoint_meta = {
             let mut storage = self.storage.lock();
@@ -579,6 +697,7 @@ impl Collection {
         inner.index = new_index;
         inner.id_map = new_id_map;
         inner.documents = live_docs;
+        inner.node_doc = new_node_doc;
         inner.text_index = new_text_index;
 
         debug!(name = %self.name, doc_count, "compaction complete");
@@ -592,6 +711,17 @@ impl Collection {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Test-only: whether the backing index externalizes its rerank vectors (#58), and whether its
+    /// `node_doc` map is length-consistent with the index. Used to prove the external path is
+    /// actually exercised rather than silently falling back to an owned-`full` index.
+    #[cfg(test)]
+    fn external_state(&self) -> (bool, bool) {
+        let inner = self.inner.read();
+        let ext = inner.index.vectors_external();
+        let consistent = !ext || inner.node_doc.len() == inner.index.len();
+        (ext, consistent)
     }
 
     /// Collection name.
@@ -697,7 +827,16 @@ impl Collection {
             Vec::new()
         } else {
             let fetch = (k * 2 + inner.id_map.tombstone_count()).min(inner.index.len());
-            let raw = inner.index.search(query, fetch).map_err(DbError::Core)?;
+            let raw = if inner.index.vectors_external() {
+                let src = DocVectors {
+                    documents: &inner.documents,
+                    node_doc: &inner.node_doc,
+                };
+                inner.index.with_vectors(&src).search(query, fetch)
+            } else {
+                inner.index.search(query, fetch)
+            }
+            .map_err(DbError::Core)?;
             raw.into_iter()
                 .filter(|r| {
                     inner.id_map.is_live(&r.id)
@@ -887,8 +1026,12 @@ impl Collection {
         if live_docs.is_empty() {
             return Ok(());
         }
-        // Rebuild at the target storage. Trains from the whole corpus.
-        inner.index = HNSWIndex::build_parallel_from_documents(live_docs, self.config.hnsw.clone());
+        // Rebuild at the target storage. Trains from the whole corpus. Externalizes the rerank
+        // vectors when the target pays for it (#58). `documents` is left as the full append-only
+        // list (fit is not a compaction), and `derive_node_doc` maps each node to its document
+        // position through the unchanged `id_map`.
+        inner.index = build_index_from_documents(live_docs, self.config.hnsw.clone());
+        inner.node_doc = derive_node_doc(&inner.index, &inner.id_map);
         debug!(
             storage = ?self.config.hnsw.storage,
             docs = inner.index.len(),
@@ -944,12 +1087,22 @@ impl Collection {
         // One native filtered graph walk per query, fanned across rayon workers by core — same
         // predicate as the single-query path. Replaces the former progressive over-fetch (which
         // re-ran the whole batch at 2×/4×/8×/full scan until every query filled `k`).
-        inner
-            .index
-            .search_batch_filtered_by(queries, k, |id, metadata| {
-                inner.id_map.is_live(id) && filter.matches(metadata)
-            })
-            .map_err(DbError::Core)
+        let allow = |id: &str, metadata: Option<&Value>| {
+            inner.id_map.is_live(id) && filter.matches(metadata)
+        };
+        if inner.index.vectors_external() {
+            let src = DocVectors {
+                documents: &inner.documents,
+                node_doc: &inner.node_doc,
+            };
+            inner
+                .index
+                .with_vectors(&src)
+                .search_batch_filtered_by(queries, k, allow)
+        } else {
+            inner.index.search_batch_filtered_by(queries, k, allow)
+        }
+        .map_err(DbError::Core)
     }
 
     /// Unfiltered search: query HNSW, exclude tombstones.
@@ -962,7 +1115,16 @@ impl Collection {
         // Over-fetch to compensate for tombstones, clamped to index size
         // to avoid requesting more results than the index can return.
         let fetch = (k + inner.id_map.tombstone_count()).min(inner.index.len());
-        let raw = inner.index.search(query, fetch).map_err(DbError::Core)?;
+        let raw = if inner.index.vectors_external() {
+            let src = DocVectors {
+                documents: &inner.documents,
+                node_doc: &inner.node_doc,
+            };
+            inner.index.with_vectors(&src).search(query, fetch)
+        } else {
+            inner.index.search(query, fetch)
+        }
+        .map_err(DbError::Core)?;
 
         let results: Vec<SearchResult> = raw
             .into_iter()
@@ -987,12 +1149,22 @@ impl Collection {
         k: usize,
         filter: &Filter,
     ) -> Result<Vec<SearchResult>> {
-        inner
-            .index
-            .search_filtered_by(query, k, |id, metadata| {
-                inner.id_map.is_live(id) && filter.matches(metadata)
-            })
-            .map_err(DbError::Core)
+        let allow = |id: &str, metadata: Option<&Value>| {
+            inner.id_map.is_live(id) && filter.matches(metadata)
+        };
+        if inner.index.vectors_external() {
+            let src = DocVectors {
+                documents: &inner.documents,
+                node_doc: &inner.node_doc,
+            };
+            inner
+                .index
+                .with_vectors(&src)
+                .search_filtered_by(query, k, allow)
+        } else {
+            inner.index.search_filtered_by(query, k, allow)
+        }
+        .map_err(DbError::Core)
     }
 
     /// Collect all live (non-tombstoned) documents, deduplicating by ID.
@@ -3338,6 +3510,107 @@ mod tests {
         }
         for i in 0..120 {
             assert!(reopened.get(&format!("live-{i}")).unwrap().is_some());
+        }
+    }
+
+    /// End-to-end exercise of the externalized-rerank path (#58): a quantized + reranking
+    /// collection must externalize its vectors on fit, keep searching correctly across post-fit
+    /// insert / compact, survive a reopen through the external graph snapshot, and never retain a
+    /// second f32 copy in the index.
+    #[test]
+    fn external_rerank_collection_fits_compacts_and_reopens() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let make_cfg = || {
+            let hnsw = foxstash_core::index::HNSWConfig {
+                storage: foxstash_core::index::Storage::TurboRabit,
+                rabit_bits: 4,
+                rerank_candidates: 64,
+                ..Default::default()
+            };
+            DbConfig {
+                hnsw,
+                fit_threshold: 0, // fit explicitly
+                ..DbConfig::default()
+            }
+            .with_embedding_dim(16)
+        };
+
+        let vector = |i: usize| -> Vec<f32> {
+            let mut state = (i as u64).wrapping_mul(6_364_136_223_846_793_005) + 1;
+            (0..16)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 33) as f32 / (1u32 << 31) as f32) - 0.5
+                })
+                .collect()
+        };
+
+        {
+            let c = Collection::create("c", &path, make_cfg()).unwrap();
+            for i in 0..300 {
+                c.insert(format!("d{i}"), format!("content {i}"), vector(i), None)
+                    .unwrap();
+            }
+            // Staging (F32) is not externalized.
+            assert_eq!(c.external_state(), (false, true));
+
+            c.fit().unwrap();
+            // Now quantized + reranking: the index must externalize its vectors.
+            let (ext, consistent) = c.external_state();
+            assert!(
+                ext,
+                "a fitted TurboRabit+rerank collection should externalize vectors"
+            );
+            assert!(
+                consistent,
+                "node_doc length must match the index node count"
+            );
+
+            // Self-retrieval still works through the external rerank.
+            for i in [0usize, 150, 299] {
+                let hits = c.search(&vector(i), 5, None).unwrap();
+                assert!(
+                    hits.iter().any(|h| h.id == format!("d{i}")),
+                    "fitted external: d{i} should be in its own top-5"
+                );
+            }
+
+            // Post-fit insert goes through the incremental external path.
+            c.insert("post".into(), "after fit".into(), vector(1000), None)
+                .unwrap();
+            assert!(c.external_state().0);
+            let hits = c.search(&vector(1000), 5, None).unwrap();
+            assert!(hits.iter().any(|h| h.id == "post"));
+
+            // Compaction rebuilds external and realigns node_doc.
+            c.compact().unwrap();
+            let (ext, consistent) = c.external_state();
+            assert!(
+                ext && consistent,
+                "compaction must preserve the external, aligned state"
+            );
+
+            c.flush().unwrap();
+        }
+
+        // Reopen: recovery loads the external graph snapshot and re-derives node_doc.
+        let c2 = Collection::open("c", &path, make_cfg()).unwrap();
+        assert_eq!(c2.len(), 301);
+        // get() returns the exact stored embedding (the document store survived).
+        let got = c2.get("post").unwrap().unwrap();
+        assert_eq!(got.embedding, vector(1000));
+        // Search still finds documents by content after the reopen.
+        for i in [0usize, 299] {
+            let hits = c2.search(&vector(i), 5, None).unwrap();
+            assert!(
+                hits.iter().any(|h| h.id == format!("d{i}")),
+                "after reopen: d{i} should be in its own top-5"
+            );
         }
     }
 }

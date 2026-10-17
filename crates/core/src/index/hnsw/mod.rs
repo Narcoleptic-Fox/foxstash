@@ -300,7 +300,7 @@ impl Searcher<'_> {
     /// [`RagError::DimensionMismatch`](crate::RagError::DimensionMismatch) if `query` is not
     /// the index's dimension.
     pub fn search(&mut self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.index.search_inner(query, k, &mut self.ctx, None)
+        self.index.search_inner(query, k, &mut self.ctx, None, None)
     }
 
     /// Distance computations performed since the last [`Self::reset_stats`].
@@ -323,6 +323,105 @@ impl Searcher<'_> {
 /// `nodes`, with a node's neighbours and its vector in the *same* contiguous
 /// block. Visiting a node is therefore a single random memory read.
 ///
+/// An external owner of the full-precision vectors, supplied so the index does not have to keep
+/// its own `full` copy.
+///
+/// The exact-rerank stage (and, during construction, neighbour selection) needs the original f32
+/// vector for a node. A standalone [`HNSWIndex`] keeps those in its own `full` array. When the
+/// index lives inside a `foxstash-db` `Collection`, the Collection already holds every embedding
+/// in its document store, so it lends them here instead — one f32 copy in resident RAM rather than
+/// two. See the `with_vectors` / `*_external` methods.
+///
+/// `vector(node)` must return the exact f32 embedding for the given **index node id**, in the same
+/// orientation the index was built with (the original embedding; cosine is scale-invariant, so no
+/// renormalization). The caller guarantees `node` is a valid id for this index. `Sync` because the
+/// batch search path rescores pools across rayon threads.
+pub trait VectorSource: Sync {
+    /// The exact f32 embedding for index node `node`.
+    fn vector(&self, node: usize) -> &[f32];
+}
+
+/// An [`HNSWIndex`] bound to an external [`VectorSource`] for the duration of a search, created by
+/// [`HNSWIndex::with_vectors`]. Its methods mirror the index's own search API but rescore the
+/// rerank pool against the bound source. The rerank logic itself is not duplicated — these are
+/// thin wrappers over the same `search_inner` the standalone path uses, with the vector source
+/// injected (see issue #58).
+pub struct BoundIndex<'a> {
+    index: &'a HNSWIndex,
+    src: &'a dyn VectorSource,
+}
+
+impl<'a> BoundIndex<'a> {
+    /// See [`HNSWIndex::search`]. Reranks against the bound [`VectorSource`].
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        thread_local! {
+            static CTX: std::cell::RefCell<SearchContext> =
+                std::cell::RefCell::new(SearchContext::new(0));
+        }
+        CTX.with(|c| {
+            self.index
+                .search_inner(query, k, &mut c.borrow_mut(), None, Some(self.src))
+        })
+    }
+
+    /// See [`HNSWIndex::search_filtered_by`]. Reranks against the bound [`VectorSource`].
+    pub fn search_filtered_by<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        allow: F,
+    ) -> Result<Vec<SearchResult>>
+    where
+        F: Fn(&str, Option<&serde_json::Value>) -> bool,
+    {
+        let admit = |id: usize| allow(&self.index.ids[id], self.index.metadata[id].as_ref());
+        thread_local! {
+            static CTX: std::cell::RefCell<SearchContext> =
+                std::cell::RefCell::new(SearchContext::new(0));
+        }
+        CTX.with(|c| {
+            self.index
+                .search_inner(query, k, &mut c.borrow_mut(), Some(&admit), Some(self.src))
+        })
+    }
+
+    /// See [`HNSWIndex::search_batch`]. Reranks against the bound [`VectorSource`].
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize) -> Result<Vec<Vec<SearchResult>>> {
+        use rayon::prelude::*;
+        queries
+            .par_iter()
+            .map_init(
+                || SearchContext::new(self.index.len()),
+                |ctx, query| self.index.search_inner(query, k, ctx, None, Some(self.src)),
+            )
+            .collect()
+    }
+
+    /// See [`HNSWIndex::search_batch_filtered_by`]. Reranks against the bound [`VectorSource`].
+    pub fn search_batch_filtered_by<F>(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        allow: F,
+    ) -> Result<Vec<Vec<SearchResult>>>
+    where
+        F: Fn(&str, Option<&serde_json::Value>) -> bool + Sync,
+    {
+        use rayon::prelude::*;
+        let admit = |id: usize| allow(&self.index.ids[id], self.index.metadata[id].as_ref());
+        queries
+            .par_iter()
+            .map_init(
+                || SearchContext::new(self.index.len()),
+                |ctx, query| {
+                    self.index
+                        .search_inner(query, k, ctx, Some(&admit), Some(self.src))
+                },
+            )
+            .collect()
+    }
+}
+
 /// This used to be Struct-of-Arrays — the vector in `embeddings`, the neighbours in
 /// `connections_l0`, the norm in `norms`, three separate allocations — on the theory that
 /// SoA gives "better cache locality". It does, for a linear scan. Graph traversal never
@@ -430,6 +529,13 @@ pub struct HNSWIndex {
     /// `Sequential`) while an index grown by `add()` never was, at any seed. The bug survived
     /// because its test, `random_level_never_panics`, asserted only that the call did not panic.
     level_rng: StdRng,
+
+    /// When true, this index keeps **no** `full` f32 rerank pool of its own: the exact vectors are
+    /// supplied at search/insert time by an external [`VectorSource`] (a `Collection`'s document
+    /// store). A standalone index is always `false` and owns its `full`. See `with_vectors` and
+    /// `build_parallel_from_documents_external`. Persisted in the snapshot so a reload stays honest
+    /// about whether `full` is present.
+    vectors_external: bool,
 }
 
 /// **The** neighbour-selection algorithm. HNSW paper, Algorithm 4 (SELECT-NEIGHBORS-HEURISTIC).
@@ -525,6 +631,7 @@ impl HNSWIndex {
         let level_rng = StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random));
         Self {
             level_rng,
+            vectors_external: false,
             embedding_dim,
             stride: node_stride(
                 config.m0,
@@ -992,7 +1099,7 @@ impl HNSWIndex {
                 continue;
             }
 
-            index.insert_node(node_id, level);
+            index.insert_node(node_id, level, None);
 
             if level > index.max_layer {
                 index.max_layer = level;
@@ -1061,6 +1168,22 @@ impl HNSWIndex {
             Storage::Mouse => {
                 panic!("Storage::Mouse retains no exact f32 vectors; rerank uses the residual code")
             }
+        }
+    }
+
+    /// The exact f32 embedding for a node, from an external [`VectorSource`] when one is supplied,
+    /// otherwise from the index's own storage via [`Self::get_embedding`].
+    ///
+    /// This is the single accessor every f32 read routes through. `ext = None` is the standalone
+    /// path and is byte-for-byte the old behaviour. `ext = Some(..)` is the embedded-in-`Collection`
+    /// path: the index keeps no `full`, and the vectors come from the Collection's document store.
+    /// The injected source is the *only* thing that differs between the two — the rerank loop,
+    /// `exact_distance` and neighbour selection stay one implementation.
+    #[inline(always)]
+    fn embedding_of<'a>(&'a self, node_id: usize, ext: Option<&'a dyn VectorSource>) -> &'a [f32] {
+        match ext {
+            Some(src) => src.vector(node_id),
+            None => self.get_embedding(node_id),
         }
     }
 
@@ -1198,7 +1321,7 @@ impl HNSWIndex {
                         (((x - self.q_min[d]) / s).round().clamp(0.0, 255.0)) as u8
                     };
                 }
-                if self.config.rerank_candidates > 0 {
+                if self.config.rerank_candidates > 0 && !self.vectors_external {
                     self.full.extend_from_slice(embedding);
                 }
             }
@@ -1220,7 +1343,7 @@ impl HNSWIndex {
                 let bytes: &mut [u8] =
                     bytemuck::cast_slice_mut(&mut self.nodes[v + 2..v + 2 + bit_words]);
                 bytes[..code.bits.len()].copy_from_slice(&code.bits);
-                if self.config.rerank_candidates > 0 {
+                if self.config.rerank_candidates > 0 && !self.vectors_external {
                     self.full.extend_from_slice(embedding);
                 }
             }
@@ -1251,7 +1374,7 @@ impl HNSWIndex {
                         nib[i / 2] |= c << (4 * (i % 2));
                     }
                 }
-                if self.config.rerank_candidates > 0 {
+                if self.config.rerank_candidates > 0 && !self.vectors_external {
                     self.full.extend_from_slice(embedding);
                 }
             }
@@ -1275,7 +1398,7 @@ impl HNSWIndex {
                 for (i, &c) in code.codes.iter().enumerate() {
                     nib[i / 2] |= c << (4 * (i % 2));
                 }
-                if self.config.rerank_candidates > 0 {
+                if self.config.rerank_candidates > 0 && !self.vectors_external {
                     self.full.extend_from_slice(embedding);
                 }
             }
@@ -1448,6 +1571,8 @@ impl HNSWIndex {
         // `ids`/`contents`/`metadata`), then hand layer 0 to the arena.
         let mut index = Self {
             level_rng: StdRng::seed_from_u64(new_config.seed.unwrap_or_else(rand::random)),
+            // requantize rebuilds a standalone index from exact vectors and populates `full`.
+            vectors_external: false,
             embedding_dim: self.embedding_dim,
             stride: node_stride(
                 new_config.m0,
@@ -1586,6 +1711,8 @@ impl HNSWIndex {
 
         Self {
             level_rng: StdRng::seed_from_u64(self.config.seed.unwrap_or_else(rand::random)),
+            // Reordering preserves whether this index owns its f32 or sources them externally.
+            vectors_external: self.vectors_external,
             embedding_dim: dim,
             stride,
             hdr: self.hdr,
@@ -1678,6 +1805,7 @@ impl HNSWIndex {
                 .collect(),
             entry_point: self.entry_point,
             max_layer: self.max_layer,
+            vectors_external: self.vectors_external,
         }
     }
 
@@ -1770,6 +1898,7 @@ impl HNSWIndex {
             .collect::<Result<_>>()?;
         Ok(Self {
             level_rng: StdRng::seed_from_u64(snap.config.seed.unwrap_or_else(rand::random)),
+            vectors_external: snap.vectors_external,
             embedding_dim: snap.embedding_dim,
             stride,
             hdr: node_hdr_len(snap.config.m0),
@@ -1810,7 +1939,7 @@ impl HNSWIndex {
             embedding,
             metadata,
         } = document;
-        self.add_parts(&embedding, id, content, metadata)
+        self.add_parts(&embedding, id, content, metadata, None)
     }
 
     /// Add a document the caller wants to keep, cloning only what the index must own.
@@ -1833,6 +1962,27 @@ impl HNSWIndex {
             document.id.clone(),
             document.content.clone(),
             document.metadata.clone(),
+            None,
+        )
+    }
+
+    /// Like [`Self::add_borrowed`], but for an index built with externalized vectors
+    /// (`vectors_external`): the index keeps no `full` of its own, so the exact vectors needed for
+    /// neighbour selection during the insert are read from `src` instead. `src` must already cover
+    /// every existing node **and** this new node at its about-to-be-assigned id (`self.len()`), so
+    /// the caller pushes the document into its own store before calling this. See issue #58 and
+    /// `foxstash-db`'s `Collection`.
+    pub fn add_borrowed_with_vectors(
+        &mut self,
+        document: &Document,
+        src: &dyn VectorSource,
+    ) -> Result<()> {
+        self.add_parts(
+            &document.embedding,
+            document.id.clone(),
+            document.content.clone(),
+            document.metadata.clone(),
+            Some(src),
         )
     }
 
@@ -1892,6 +2042,7 @@ impl HNSWIndex {
         id: String,
         content: String,
         metadata: Option<serde_json::Value>,
+        ext: Option<&dyn VectorSource>,
     ) -> Result<()> {
         self.validate_embedding_for_add(embedding)?;
 
@@ -1917,7 +2068,7 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        self.insert_node(node_id, node_level);
+        self.insert_node(node_id, node_level, ext);
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -1997,7 +2148,7 @@ impl HNSWIndex {
             return Ok(());
         }
 
-        self.insert_node(node_id, node_level);
+        self.insert_node(node_id, node_level, None);
 
         // Update entry point if this node has more layers
         if node_level > self.max_layer {
@@ -2026,7 +2177,7 @@ impl HNSWIndex {
             static CTX: std::cell::RefCell<SearchContext> =
                 std::cell::RefCell::new(SearchContext::new(0));
         }
-        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), None))
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), None, None))
     }
 
     /// Search, returning only results whose node is allowed by `filter` — up to `k` of them.
@@ -2058,7 +2209,7 @@ impl HNSWIndex {
             static CTX: std::cell::RefCell<SearchContext> =
                 std::cell::RefCell::new(SearchContext::new(0));
         }
-        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(&admit)))
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(&admit), None))
     }
 
     /// Filtered search against a **predicate**, for one-off filters that aren't worth a
@@ -2090,7 +2241,7 @@ impl HNSWIndex {
             static CTX: std::cell::RefCell<SearchContext> =
                 std::cell::RefCell::new(SearchContext::new(0));
         }
-        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(&admit)))
+        CTX.with(|c| self.search_inner(query, k, &mut c.borrow_mut(), Some(&admit), None))
     }
 
     /// Build a reusable [`FilterMask`] by testing every document against `pred` once (O(n)).
@@ -2136,7 +2287,7 @@ impl HNSWIndex {
             .par_iter()
             .map_init(
                 || SearchContext::new(self.len()),
-                |ctx, query| self.search_inner(query, k, ctx, None),
+                |ctx, query| self.search_inner(query, k, ctx, None, None),
             )
             .collect()
     }
@@ -2165,7 +2316,7 @@ impl HNSWIndex {
             .par_iter()
             .map_init(
                 || SearchContext::new(self.len()),
-                |ctx, query| self.search_inner(query, k, ctx, Some(&admit)),
+                |ctx, query| self.search_inner(query, k, ctx, Some(&admit), None),
             )
             .collect()
     }
@@ -2181,18 +2332,58 @@ impl HNSWIndex {
         }
     }
 
+    /// Bind an external [`VectorSource`] to this index for the duration of a search.
+    ///
+    /// Returns a [`BoundIndex`] whose search methods rescore the rerank pool against `src` instead
+    /// of the index's own `full` array. This is how a `foxstash-db` `Collection` searches an index
+    /// built with [`Self::build_parallel_from_documents_external`]: the exact vectors come from the
+    /// Collection's document store, so they are not duplicated inside the index. For a standalone
+    /// index that owns its `full`, binding a source is unnecessary (plain [`Self::search`] works),
+    /// though doing so is harmless as long as `src` returns the same vectors.
+    pub fn with_vectors<'a>(&'a self, src: &'a dyn VectorSource) -> BoundIndex<'a> {
+        BoundIndex { index: self, src }
+    }
+
+    /// True if this index was built with externalized vectors (no owned `full`): it must be
+    /// searched via [`Self::with_vectors`] and grown via [`Self::add_borrowed_with_vectors`]. See
+    /// issue #58.
+    pub fn vectors_external(&self) -> bool {
+        self.vectors_external
+    }
+
+    /// The external id of each node, indexed by node id. Lets a caller that externalizes the
+    /// vectors align its own store with the (shuffled, reordered) node order after a snapshot load.
+    pub fn node_ids(&self) -> &[String] {
+        &self.ids
+    }
+
     fn search_inner(
         &self,
         query: &[f32],
         k: usize,
         ctx: &mut SearchContext,
         filter: Option<&dyn Fn(usize) -> bool>,
+        ext: Option<&dyn VectorSource>,
     ) -> Result<Vec<SearchResult>> {
         if query.len() != self.embedding_dim {
             return Err(crate::RagError::DimensionMismatch {
                 expected: self.embedding_dim,
                 actual: query.len(),
             });
+        }
+
+        // An index built with externalized vectors has no `full` of its own, so it can only
+        // rerank when the caller lends the vectors back via `with_vectors`. Reaching the f32
+        // rerank arm without a source would read an empty `full` (an out-of-bounds slice in
+        // release, where the `debug_assert` in `get_embedding` is compiled out). Fail loud.
+        if self.vectors_external
+            && ext.is_none()
+            && self.config.storage.rerank_needs_full()
+            && self.config.rerank_candidates > 0
+        {
+            return Err(crate::RagError::InvalidInput(
+                "index was built with external vectors; search it via with_vectors(..)".into(),
+            ));
         }
 
         if self.is_empty() {
@@ -2306,15 +2497,20 @@ impl HNSWIndex {
                 for i in 0..found.len() {
                     let ahead = i + RERANK_PREFETCH_AHEAD;
                     if ahead < found.len() {
-                        // SAFETY: prefetch is a hint — `wrapping_add` cannot leave the
-                        // allocation for a valid node id, and a stale line costs nothing.
+                        // SAFETY: prefetch is a hint — a stale line costs nothing. For the owned
+                        // `full` arena, `wrapping_add` cannot leave the allocation for a valid node
+                        // id. For an external source, the vector slice's own pointer is used, which
+                        // is in-bounds by construction.
                         unsafe {
-                            let p =
-                                self.full.as_ptr().wrapping_add(found[ahead].1 * dim) as *const u8;
+                            let p = match ext {
+                                Some(src) => src.vector(found[ahead].1).as_ptr() as *const u8,
+                                None => self.full.as_ptr().wrapping_add(found[ahead].1 * dim)
+                                    as *const u8,
+                            };
                             prefetch_embedding(p, RERANK_HEAD_LINES);
                         }
                     }
-                    found[i].0 = self.exact_distance(query, found[i].1);
+                    found[i].0 = self.exact_distance_ext(query, found[i].1, ext);
                 }
             }
             found.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -2355,7 +2551,17 @@ impl HNSWIndex {
     ///
     /// # Returns
     /// * `Vec<Document>` - Vector of all documents
+    ///
+    /// # Panics
+    /// If this index was built with externalized vectors ([`Self::vectors_external`]): it holds no
+    /// f32 to reconstruct embeddings from. The owner of the external vectors (the `Collection`)
+    /// already has the documents and does not call this.
     pub fn get_all_documents(&self) -> Vec<Document> {
+        assert!(
+            !self.vectors_external,
+            "get_all_documents() needs the index's own f32 vectors, but this index was built with \
+             externalized vectors (vectors_external); reconstruct documents from the external store"
+        );
         (0..self.len())
             .map(|i| Document {
                 id: self.ids[i].clone(),
@@ -2516,12 +2722,12 @@ impl HNSWIndex {
     /// # Arguments
     /// * `node_id` - ID of the node to insert
     /// * `node_level` - Maximum layer of the node
-    fn insert_node(&mut self, node_id: usize, node_level: usize) {
+    fn insert_node(&mut self, node_id: usize, node_level: usize, ext: Option<&dyn VectorSource>) {
         let entry_point = self.entry_point.unwrap();
         let mut current_nearest = vec![entry_point];
 
         // Get embedding once (hot path optimization)
-        let node_embedding = self.get_embedding(node_id).to_vec();
+        let node_embedding = self.embedding_of(node_id, ext).to_vec();
         let query_norm = crate::vector::simd::norm_simd(&node_embedding);
         // See `search_inner`: prepared once per inserted node, not once per distance call.
         let rq_prepared = self.prepare_rabitq_query(&node_embedding);
@@ -2576,7 +2782,7 @@ impl HNSWIndex {
             };
 
             // Select M nearest neighbors
-            let neighbors = self.select_neighbors(&current_nearest, &node_embedding, m, layer);
+            let neighbors = self.select_neighbors(&current_nearest, &node_embedding, m, layer, ext);
 
             // Add bidirectional links. Layer 0 is owned by the flat array; layers >= 1 by
             // the nested structure. Keeping both would duplicate the hottest data in the index.
@@ -2594,14 +2800,14 @@ impl HNSWIndex {
 
                     let m0 = self.config.m0;
                     if self.get_neighbors_l0(neighbor_id).len() > m0 {
-                        let neighbor_embedding = self.get_embedding(neighbor_id).to_vec();
+                        let neighbor_embedding = self.embedding_of(neighbor_id, ext).to_vec();
                         let current: Vec<usize> = self
                             .get_neighbors_l0(neighbor_id)
                             .iter()
                             .map(|&x| x as usize)
                             .collect();
                         let pruned =
-                            self.select_neighbors(&current, &neighbor_embedding, m0, layer);
+                            self.select_neighbors(&current, &neighbor_embedding, m0, layer, ext);
                         let pruned: Vec<u32> = pruned.into_iter().map(|x| x as u32).collect();
                         self.l0_replace(neighbor_id, &pruned);
                     }
@@ -2620,7 +2826,7 @@ impl HNSWIndex {
 
                     let neighbor_m = self.config.m;
                     if self.connections[neighbor_id][layer].len() > neighbor_m {
-                        let neighbor_embedding = self.get_embedding(neighbor_id).to_vec();
+                        let neighbor_embedding = self.embedding_of(neighbor_id, ext).to_vec();
                         let neighbor_connections: Vec<usize> = self.connections[neighbor_id][layer]
                             .iter()
                             .map(|&x| x as usize)
@@ -2630,6 +2836,7 @@ impl HNSWIndex {
                             &neighbor_embedding,
                             neighbor_m,
                             layer,
+                            ext,
                         );
 
                         self.connections[neighbor_id][layer] =
@@ -2811,10 +3018,11 @@ impl HNSWIndex {
         query: &[f32],
         m: usize,
         layer: usize,
+        ext: Option<&dyn VectorSource>,
     ) -> Vec<usize> {
         let mut scored: Vec<(f32, usize)> = candidates
             .iter()
-            .map(|&id| (self.distance(query, self.get_embedding(id)), id))
+            .map(|&id| (self.distance(query, self.embedding_of(id, ext)), id))
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
 
@@ -2839,8 +3047,8 @@ impl HNSWIndex {
                     Vec::new()
                 }
             },
-            |id| self.distance(query, self.get_embedding(id)),
-            |a, b| self.distance(self.get_embedding(a), self.get_embedding(b)),
+            |id| self.distance(query, self.embedding_of(id, ext)),
+            |a, b| self.distance(self.embedding_of(a, ext), self.embedding_of(b, ext)),
         )
         .into_iter()
         .map(|(_, id)| id)
@@ -3079,9 +3287,18 @@ impl HNSWIndex {
     /// Exact distance against the full-precision vector, for the rerank stage. Honors
     /// `self.config.metric` — a rerank stage that rescores under a different metric than the
     /// walk used would silently corrupt the final ranking regardless of how good the walk was.
+    /// Exact distance against the full-precision vector, sourcing the vector from `ext` when
+    /// supplied (see [`Self::embedding_of`]). The node's L2 norm is read from the arena header,
+    /// which stays valid even when the f32 vector lives externally — the norm was computed from
+    /// the same original embedding at build time.
     #[inline]
-    fn exact_distance(&self, query: &[f32], node_id: usize) -> f32 {
-        let embedding = self.get_embedding(node_id);
+    fn exact_distance_ext(
+        &self,
+        query: &[f32],
+        node_id: usize,
+        ext: Option<&dyn VectorSource>,
+    ) -> f32 {
+        let embedding = self.embedding_of(node_id, ext);
         match self.config.metric {
             DistanceMetric::L2 => crate::vector::simd::l2_squared_distance_simd(query, embedding),
             DistanceMetric::Cosine => {
@@ -3194,8 +3411,23 @@ impl HNSWIndex {
     }
 
     pub fn build_parallel_from_documents(documents: Vec<Document>, config: HNSWConfig) -> Self {
+        Self::build_parallel_from_documents_inner(documents, config).0
+    }
+
+    /// Shared body of the from-documents builders. Returns the built index and, per node slot, the
+    /// index of the input document that became that node (`node_to_input[slot] = original`).
+    ///
+    /// The provenance is reorder-proof and duplicate-id-proof by construction: `build_parallel`
+    /// writes each node's **original input index** as its id, and the reorder permutes ids along
+    /// with the nodes, so reading it back here recovers exactly which input doc each slot holds —
+    /// even when two inputs share an external id. Callers that need to align an external store with
+    /// the (shuffled, reordered) node ids use this map; see `build_parallel_from_documents_external`.
+    fn build_parallel_from_documents_inner(
+        documents: Vec<Document>,
+        config: HNSWConfig,
+    ) -> (Self, Vec<u32>) {
         if documents.is_empty() {
-            return Self::new(0, config);
+            return (Self::new(0, config), Vec::new());
         }
         let embedding_dim = documents[0].embedding.len();
         let embeddings: Vec<Vec<f32>> = documents.iter().map(|d| d.embedding.clone()).collect();
@@ -3214,6 +3446,7 @@ impl HNSWIndex {
             })
             .collect();
 
+        let node_to_input: Vec<u32> = provenance.iter().map(|&o| o as u32).collect();
         for (slot, original) in provenance.into_iter().enumerate() {
             let doc = &documents[original];
             index.ids[slot] = doc.id.clone();
@@ -3221,7 +3454,32 @@ impl HNSWIndex {
             index.metadata[slot] = doc.metadata.clone();
         }
         debug_assert_eq!(index.embedding_dim, embedding_dim);
-        index
+        (index, node_to_input)
+    }
+
+    /// Build a quantized index whose exact rerank vectors live **outside** the index (issue #58).
+    ///
+    /// Same graph as [`Self::build_parallel_from_documents`], but the `full` f32 pool is dropped
+    /// after the build, and the index is flagged `vectors_external`: it no longer holds a second
+    /// copy of every embedding. The caller (a `foxstash-db` `Collection`) already keeps the
+    /// embeddings in its document store and lends them back at search/insert time via
+    /// [`Self::with_vectors`] / [`Self::add_borrowed_with_vectors`].
+    ///
+    /// Returns the index and, per node slot, the index of the input document that became that node
+    /// (`node_to_input[slot]`), so the caller can build its own node-id → document-position map.
+    /// Only meaningful for a quantized storage with `rerank_candidates > 0`; under `Storage::F32`
+    /// the vector lives inline in the walk's arena and nothing is externalized.
+    pub fn build_parallel_from_documents_external(
+        documents: Vec<Document>,
+        config: HNSWConfig,
+    ) -> (Self, Vec<u32>) {
+        let (mut index, node_to_input) =
+            Self::build_parallel_from_documents_inner(documents, config);
+        // Drop the second f32 copy the build populated; the vectors now come from the caller.
+        index.full = Vec::new();
+        index.full.shrink_to_fit();
+        index.vectors_external = true;
+        (index, node_to_input)
     }
 
     pub fn build_parallel(embeddings: Vec<Vec<f32>>, config: HNSWConfig) -> Self {
@@ -3674,6 +3932,8 @@ impl HNSWIndex {
             // Seeded from the same `seed` this build used, so a later incremental `add()` on a
             // bulk-built index continues a reproducible stream rather than starting a random one.
             level_rng: StdRng::seed_from_u64(config.seed.unwrap_or_else(rand::random)),
+            // Standalone bulk build owns its `full`; the external variant flips this after building.
+            vectors_external: false,
             embedding_dim,
             stride: node_stride(
                 config.m0,

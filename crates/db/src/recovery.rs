@@ -1,5 +1,6 @@
 //! Recovery: rebuild index state from checkpoint + WAL replay.
 
+use crate::collection::DocVectors;
 use crate::id_map::IdMap;
 use crate::inverted_index::InvertedIndex;
 use crate::tokenizer::{SimpleTokenizer, Tokenizer};
@@ -7,6 +8,7 @@ use crate::{DbConfig, DbError, Result};
 use foxstash_core::index::HNSWIndex;
 use foxstash_core::storage::incremental::{IncrementalStorage, RecoveryHelper, WalOperation};
 use foxstash_core::Document;
+use std::collections::HashMap;
 use tracing::{debug, info};
 
 /// State recovered from storage.
@@ -14,16 +16,37 @@ pub struct RecoveredState {
     pub index: HNSWIndex,
     pub id_map: IdMap,
     pub documents: Vec<Document>,
+    /// node id -> `documents` position, for an externalized index (#58). Empty when the recovered
+    /// index owns its vectors (the rebuild-in-F32 path, or a non-external snapshot).
+    pub node_doc: Vec<u32>,
     pub text_index: InvertedIndex,
 }
 
 /// Re-insert every document to reconstruct the graph. The slow path, used when no
-/// usable snapshot exists.
+/// usable snapshot exists. Always rebuilds into an owned-`full` (non-external) index, so it needs
+/// no vector source.
 fn rebuild_index(index: &mut HNSWIndex, docs: &[Document]) -> Result<()> {
     for doc in docs {
         index.add_borrowed(doc).map_err(DbError::Core)?;
     }
     Ok(())
+}
+
+/// Map a loaded external index's node ids onto positions in `docs`, which must have unique ids.
+/// `None` if any node id is missing or any id is duplicated — the caller then rebuilds instead of
+/// trusting an ambiguous mapping. See issue #58.
+fn node_doc_from_docs(index: &HNSWIndex, docs: &[Document]) -> Option<Vec<u32>> {
+    let mut pos: HashMap<&str, u32> = HashMap::with_capacity(docs.len());
+    for (i, d) in docs.iter().enumerate() {
+        if pos.insert(d.id.as_str(), i as u32).is_some() {
+            return None; // duplicate id: ambiguous
+        }
+    }
+    let mut node_doc = Vec::with_capacity(index.len());
+    for id in index.node_ids() {
+        node_doc.push(*pos.get(id.as_str())?);
+    }
+    Some(node_doc)
 }
 
 /// Load a checkpoint (if any) and replay the WAL to produce a fully recovered state.
@@ -42,6 +65,8 @@ pub fn recover(
     let mut index = HNSWIndex::new(config.embedding_dim, staging);
     let mut id_map = IdMap::new();
     let mut documents: Vec<Document> = Vec::new();
+    // node id -> documents position, maintained only while `index` is externalized (#58).
+    let mut node_doc: Vec<u32> = Vec::new();
 
     // Phase 1: Load checkpoint.
     if let Some((checkpoint_docs, meta)) = storage
@@ -124,11 +149,34 @@ pub fn recover(
         };
         match loaded {
             Some(loaded) if loaded.len() == checkpoint_docs.len() => {
-                info!(
-                    docs = checkpoint_docs.len(),
-                    "graph loaded from snapshot; skipping rebuild"
-                );
-                index = loaded;
+                if loaded.vectors_external() {
+                    // The snapshot holds no f32 (#58); its rerank vectors come from the
+                    // checkpoint documents. Align node ids to document positions, or rebuild if
+                    // the mapping is ambiguous.
+                    match node_doc_from_docs(&loaded, &checkpoint_docs) {
+                        Some(nd) => {
+                            info!(
+                                docs = checkpoint_docs.len(),
+                                "external graph loaded from snapshot; skipping rebuild"
+                            );
+                            node_doc = nd;
+                            index = loaded;
+                        }
+                        None => {
+                            debug!(
+                                "external snapshot ids do not map uniquely to checkpoint docs; \
+                                 rebuilding"
+                            );
+                            rebuild_index(&mut index, &checkpoint_docs)?;
+                        }
+                    }
+                } else {
+                    info!(
+                        docs = checkpoint_docs.len(),
+                        "graph loaded from snapshot; skipping rebuild"
+                    );
+                    index = loaded;
+                }
             }
             other => {
                 if let Some(loaded) = other {
@@ -153,9 +201,25 @@ pub fn recover(
         WalOperation::Add(doc) => {
             // Tombstone old position if re-adding (no-op if absent).
             id_map.remove(&doc.id);
-            index.add_borrowed(doc)?;
-            id_map.insert(doc.id.clone());
-            documents.push(doc.clone());
+            if index.vectors_external() {
+                // #58: a snapshot-loaded external index has no f32; feed the graph insert the
+                // vectors from the document store. node id == documents position for an
+                // incremental add, so node_doc grows by identity.
+                let new_pos = documents.len();
+                documents.push(doc.clone());
+                node_doc.push(new_pos as u32);
+                let src = DocVectors::new(&documents, &node_doc);
+                if let Err(e) = index.add_borrowed_with_vectors(&documents[new_pos], &src) {
+                    documents.pop();
+                    node_doc.pop();
+                    return Err(e);
+                }
+                id_map.insert(doc.id.clone());
+            } else {
+                index.add_borrowed(doc)?;
+                id_map.insert(doc.id.clone());
+                documents.push(doc.clone());
+            }
             Ok(())
         }
         WalOperation::Remove(id) => {
@@ -166,6 +230,7 @@ pub fn recover(
             index.clear();
             id_map.clear();
             documents.clear();
+            node_doc.clear();
             Ok(())
         }
         WalOperation::Checkpoint { .. } => Ok(()),
@@ -196,6 +261,7 @@ pub fn recover(
         index,
         id_map,
         documents,
+        node_doc,
         text_index,
     })
 }
