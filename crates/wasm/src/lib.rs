@@ -256,6 +256,106 @@ enum IndexType {
     HNSW(HNSWIndex),
 }
 
+/// JS-supplied HNSW tuning knobs for [`LocalRAG::with_config`] (issue #61). Every field is
+/// optional; anything omitted keeps the library default. Metric and storage are strings
+/// (`"cosine"`/`"l2"`, `"f32"`/`"sq8"`/`"rabitq"`/`"turborabit"`/`"mouse"`), mirroring the Python
+/// binding, so JS passes e.g. `{ storage: "sq8", rerankCandidates: 50, metric: "cosine" }`.
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct WasmHnswConfig {
+    metric: Option<String>,
+    m: Option<usize>,
+    m0: Option<usize>,
+    ef_construction: Option<usize>,
+    ef_search: Option<usize>,
+    ml: Option<f32>,
+    use_heuristic: Option<bool>,
+    extend_candidates: Option<bool>,
+    keep_pruned_connections: Option<bool>,
+    seed: Option<u64>,
+    storage: Option<String>,
+    rerank_candidates: Option<usize>,
+    rabit_bits: Option<usize>,
+    reorder_for_locality: Option<bool>,
+}
+
+fn parse_wasm_metric(s: &str) -> Result<foxstash_core::index::DistanceMetric, String> {
+    use foxstash_core::index::DistanceMetric;
+    match s {
+        "cosine" => Ok(DistanceMetric::Cosine),
+        "l2" => Ok(DistanceMetric::L2),
+        other => Err(format!(
+            "unknown metric {other:?} (expected \"cosine\" or \"l2\")"
+        )),
+    }
+}
+
+fn parse_wasm_storage(s: &str) -> Result<foxstash_core::index::Storage, String> {
+    use foxstash_core::index::Storage;
+    match s {
+        "f32" => Ok(Storage::F32),
+        "sq8" => Ok(Storage::SQ8),
+        "rabitq" => Ok(Storage::RaBitQ),
+        "turborabit" => Ok(Storage::TurboRabit),
+        "mouse" => Ok(Storage::Mouse),
+        other => Err(format!(
+            "unknown storage {other:?} (expected \"f32\", \"sq8\", \"rabitq\", \"turborabit\", or \"mouse\")"
+        )),
+    }
+}
+
+impl WasmHnswConfig {
+    /// Overlay the supplied fields onto the library defaults.
+    fn into_hnsw(self) -> Result<foxstash_core::index::HNSWConfig, String> {
+        let mut cfg = foxstash_core::index::HNSWConfig::default();
+        if let Some(metric) = &self.metric {
+            cfg.metric = parse_wasm_metric(metric)?;
+        }
+        if let Some(storage) = &self.storage {
+            cfg.storage = parse_wasm_storage(storage)?;
+        }
+        if let Some(m) = self.m {
+            cfg.m = m;
+            cfg.m0 = m * 2;
+            cfg.ml = 1.0 / (m as f32).ln();
+        }
+        if let Some(m0) = self.m0 {
+            cfg.m0 = m0;
+        }
+        if let Some(v) = self.ef_construction {
+            cfg.ef_construction = v;
+        }
+        if let Some(v) = self.ef_search {
+            cfg.ef_search = v;
+        }
+        if let Some(v) = self.ml {
+            cfg.ml = v;
+        }
+        if let Some(v) = self.use_heuristic {
+            cfg.use_heuristic = v;
+        }
+        if let Some(v) = self.extend_candidates {
+            cfg.extend_candidates = v;
+        }
+        if let Some(v) = self.keep_pruned_connections {
+            cfg.keep_pruned_connections = v;
+        }
+        if self.seed.is_some() {
+            cfg.seed = self.seed;
+        }
+        if let Some(v) = self.rerank_candidates {
+            cfg.rerank_candidates = v;
+        }
+        if let Some(v) = self.rabit_bits {
+            cfg.rabit_bits = v;
+        }
+        if let Some(v) = self.reorder_for_locality {
+            cfg.reorder_for_locality = v;
+        }
+        Ok(cfg)
+    }
+}
+
 /// Internal document store entry for text search lookups.
 ///
 /// We need to maintain a parallel mapping from position IDs (usize) back to
@@ -354,6 +454,56 @@ impl LocalRAG {
             id_to_pos: HashMap::new(),
             next_pos: 0,
             hybrid_config: HybridConfig::default(),
+        }
+    }
+
+    /// Create a `LocalRAG` whose HNSW index uses an explicit configuration (issue #61), exposing
+    /// the metric, storage mode, reranking and graph knobs that the bare constructor leaves at
+    /// their defaults. `config` is a plain JS object; omitted fields keep the library default
+    /// (e.g. `{ storage: "sq8", rerankCandidates: 50, metric: "cosine" }`).
+    ///
+    /// A quantized storage mode needs its codebook fitted before it will accept documents: call
+    /// [`LocalRAG::train`] with a representative sample first. `mouse` keeps no exact vectors and
+    /// cannot be grown incrementally, so it is not usable through this incremental API.
+    ///
+    /// # Errors
+    /// If `config` is not a valid object or names an unknown metric/storage.
+    #[wasm_bindgen(js_name = withConfig)]
+    pub fn with_config(embedding_dim: usize, config: JsValue) -> Result<LocalRAG, JsValue> {
+        let parsed: WasmHnswConfig = serde_wasm_bindgen::from_value(config)
+            .map_err(|e| JsValue::from_str(&format!("invalid config: {e}")))?;
+        let hnsw = parsed
+            .into_hnsw()
+            .map_err(|e| JsValue::from_str(&format!("invalid config: {e}")))?;
+        Ok(LocalRAG {
+            index: IndexType::HNSW(HNSWIndex::new(embedding_dim, hnsw)),
+            embedding_dim,
+            text_index: InvertedIndex::new(),
+            tokenizer: SimpleTokenizer::new(),
+            doc_store: HashMap::new(),
+            id_to_pos: HashMap::new(),
+            next_pos: 0,
+            hybrid_config: HybridConfig::default(),
+        })
+    }
+
+    /// Fit the quantization codebook of an index created with a quantized config, from a sample
+    /// of vectors (a JS array of equal-length number arrays), so it can accept documents (issue
+    /// #61). Under `f32` this is unnecessary; on a flat index it errors.
+    ///
+    /// # Errors
+    /// If `sample` is not an array of vectors, or training fails.
+    #[wasm_bindgen]
+    pub fn train(&mut self, sample: JsValue) -> Result<(), JsValue> {
+        let vectors: Vec<Vec<f32>> = serde_wasm_bindgen::from_value(sample)
+            .map_err(|e| JsValue::from_str(&format!("invalid sample: {e}")))?;
+        match &mut self.index {
+            IndexType::HNSW(index) => index
+                .train(&vectors)
+                .map_err(|e| JsValue::from_str(&format!("train failed: {e}"))),
+            IndexType::Flat(_) => Err(JsValue::from_str(
+                "train() is only supported for an HNSW index",
+            )),
         }
     }
 
@@ -1423,5 +1573,67 @@ mod native_tests {
         let query = tokenizer.tokenize("delta epsilon");
         let results = idx.search(&query, 10);
         assert!(results.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod config_conversion_tests {
+    //! Pure-Rust coverage of the #61 config parsing (the `#[wasm_bindgen]` methods themselves need
+    //! the wasm-bindgen test runner, but the conversion they rely on is host-testable).
+    use super::*;
+    use foxstash_core::index::{DistanceMetric, Storage};
+
+    #[test]
+    fn empty_config_is_all_defaults() {
+        let cfg = WasmHnswConfig::default().into_hnsw().unwrap();
+        assert_eq!(cfg.storage, Storage::default());
+        assert_eq!(cfg.metric, DistanceMetric::default());
+        assert_eq!(cfg.rerank_candidates, 100);
+    }
+
+    #[test]
+    fn overlays_only_supplied_fields() {
+        let cfg = WasmHnswConfig {
+            storage: Some("sq8".into()),
+            metric: Some("l2".into()),
+            rerank_candidates: Some(50),
+            m: Some(16),
+            ..Default::default()
+        }
+        .into_hnsw()
+        .unwrap();
+        assert_eq!(cfg.storage, Storage::SQ8);
+        assert_eq!(cfg.metric, DistanceMetric::L2);
+        assert_eq!(cfg.rerank_candidates, 50);
+        assert_eq!(cfg.m, 16);
+        assert_eq!(cfg.m0, 32, "m0 derives from m when not set explicitly");
+    }
+
+    #[test]
+    fn explicit_m0_overrides_the_m_derivation() {
+        let cfg = WasmHnswConfig {
+            m: Some(16),
+            m0: Some(40),
+            ..Default::default()
+        }
+        .into_hnsw()
+        .unwrap();
+        assert_eq!(cfg.m0, 40);
+    }
+
+    #[test]
+    fn unknown_storage_and_metric_are_rejected() {
+        assert!(WasmHnswConfig {
+            storage: Some("turboquant".into()),
+            ..Default::default()
+        }
+        .into_hnsw()
+        .is_err());
+        assert!(WasmHnswConfig {
+            metric: Some("manhattan".into()),
+            ..Default::default()
+        }
+        .into_hnsw()
+        .is_err());
     }
 }

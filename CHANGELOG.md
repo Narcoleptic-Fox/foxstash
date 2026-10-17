@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable native C ABI and wasm construction** (issue #61). The native ABI gains `rag_create_with_config(dim, *const FoxstashConfig)`, `rag_default_config(*mut FoxstashConfig)`, and `rag_train(handle, sample, n, dim)`, exposing the metric, storage mode, reranking, graph degree, seed and other `HNSWConfig` knobs (via stable integer enum codes) that bare `rag_create` left at their defaults — previously 0 of ~16 fields were reachable from C. The wasm binding gains `LocalRAG.withConfig(dim, config)` (a plain JS object with string metric/storage) and `LocalRAG.train(sample)`. A quantized storage mode requires `train` on a sample before it accepts documents; `f32` does not.
+
 ### Removed
 
 - **`Storage::TurboQuant`** and its `turbo_bits` config field (**breaking**). Deprecated since 0.7.0: dominated by `Storage::TurboRabit` (Extended RaBitQ) at every matched bit budget, and unlike plain TurboQuant it collapses on out-of-distribution data (recall 0.888 vs TurboRabit's 0.987 on the yandex-200 OOD set). Migrate to `Storage::TurboRabit` (set the budget via `rabit_bits`) or `Storage::SQ8`. The Python binding no longer accepts `"turboquant[N]"` storage strings. Snapshot format bumped to v5 (a v4 snapshot is rejected rather than misparsed).
