@@ -20,7 +20,10 @@ use super::*;
 /// index built with externalized vectors serializes an empty `full` and this flag set; a standalone
 /// index serializes `full` as before with the flag clear. A v3 snapshot lacks the field, so its
 /// bincode layout no longer matches and it must be rejected rather than misparsed.
-pub(super) const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+///
+/// v5: `Storage::TurboQuant` and the `turboquant` quantizer field were removed (issue #60), so the
+/// positional bincode layout shifts again and a v4 snapshot must be rejected.
+pub(super) const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// The verbatim on-disk image behind [`HNSWIndex::snapshot_to_file`]. Every field is a direct
 /// clone of the corresponding `HNSWIndex` field except the two version stamps; `stride`, `hdr`
@@ -39,7 +42,6 @@ pub(super) struct HNSWSnapshot {
     pub(super) q_scale: Vec<f32>,
     pub(super) full: Vec<f32>,
     pub(super) rabitq: Option<crate::vector::rabitq::RaBitQuantizer>,
-    pub(super) turboquant: Option<crate::vector::turboquant::TurboQuantizer>,
     pub(super) turborabit: Option<crate::vector::turborabit::TurboRabitQuantizer>,
     pub(super) mouse_res: Vec<u8>,
     pub(super) mouse_rc: Vec<f32>,

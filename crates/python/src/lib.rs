@@ -31,25 +31,13 @@ fn parse_metric(s: &str) -> PyResult<DistanceMetric> {
 }
 
 /// Parse a storage string into `(mode, bits)`. `bits` is meaningful only for the multi-bit
-/// modes: `"turboquant"` defaults to 2 total bits, `"turboquant3"` requests 3; `"turborabit"`
-/// defaults to 3 total bits, `"turborabit4"` requests 4. Encoding the bit budget in the string
-/// keeps the positional constructor (and VIBE's caller) unchanged.
-#[allow(deprecated)] // still accepts Storage::TurboQuant until its 0.8 removal
+/// modes: `"turborabit"` defaults to 3 total bits, `"turborabit4"` requests 4. Encoding the bit
+/// budget in the string keeps the positional constructor (and VIBE's caller) unchanged.
 fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
     match s {
         "f32" => Ok((Storage::F32, 0)),
         "sq8" => Ok((Storage::SQ8, 0)),
         "rabitq" => Ok((Storage::RaBitQ, 0)),
-        other if other.starts_with("turboquant") => {
-            let bits = other["turboquant".len()..].parse::<usize>().unwrap_or(2);
-            if !(1..=4).contains(&bits) {
-                return Err(PyValueError::new_err(
-                    "foxstash: turboquant bit budget must be in 1..=4 (e.g. \"turboquant2\") — \
-                     the packed MSE kernel dequantizes through an 8-entry LUT.",
-                ));
-            }
-            Ok((Storage::TurboQuant, bits))
-        }
         other if other.starts_with("turborabit") => {
             let bits = other["turborabit".len()..].parse::<usize>().unwrap_or(3);
             if !(1..=4).contains(&bits) {
@@ -74,7 +62,7 @@ fn parse_storage(s: &str) -> PyResult<(Storage, usize)> {
         }
         other => Err(PyValueError::new_err(format!(
             "foxstash: unsupported storage {other:?}. Expected \"f32\", \"sq8\", \"rabitq\", \
-             \"turboquant[N]\", \"turborabit[N]\", or \"mouse[N]\"."
+             \"turborabit[N]\", or \"mouse[N]\"."
         ))),
     }
 }
@@ -91,7 +79,7 @@ struct Foxstash {
     ef_construction: usize,
     storage: Storage,
     storage_arg: String,
-    turbo_bits: usize,
+    rabit_bits: usize,
     rerank_candidates: usize,
     ef_query: usize,
 }
@@ -110,7 +98,6 @@ impl Foxstash {
     }
 
     /// The full `HNSWConfig` this instance's constructor args imply — what `fit()` builds.
-    #[allow(deprecated)] // routes turbo_bits for Storage::TurboQuant until its 0.8 removal
     fn target_config(&self) -> HNSWConfig {
         HNSWConfig {
             metric: self.metric,
@@ -126,16 +113,9 @@ impl Foxstash {
             seed: None,
             storage: self.storage,
             rerank_candidates: self.rerank_candidates,
-            // `self.turbo_bits` holds whichever budget the storage string encoded; route it
-            // to the field its storage mode reads and leave the other at its default.
-            turbo_bits: if self.storage == Storage::TurboQuant {
-                self.turbo_bits
-            } else {
-                HNSWConfig::default().turbo_bits
-            },
-            // Mouse's walk IS turborabit's, so it reads the same bit budget.
+            // Mouse's walk IS turborabit's, so it reads the same bit budget; other modes ignore it.
             rabit_bits: if matches!(self.storage, Storage::TurboRabit | Storage::Mouse) {
-                self.turbo_bits
+                self.rabit_bits
             } else {
                 HNSWConfig::default().rabit_bits
             },
@@ -153,7 +133,6 @@ impl Foxstash {
         HNSWConfig {
             storage: Storage::F32,
             rerank_candidates: 0,
-            turbo_bits: HNSWConfig::default().turbo_bits,
             rabit_bits: HNSWConfig::default().rabit_bits,
             ..self.target_config()
         }
@@ -184,7 +163,7 @@ impl Foxstash {
         rerank_candidates: usize,
     ) -> PyResult<Self> {
         let metric_enum = parse_metric(metric)?;
-        let (storage_enum, turbo_bits) = parse_storage(storage)?;
+        let (storage_enum, rabit_bits) = parse_storage(storage)?;
         Ok(Self {
             index: None,
             metric: metric_enum,
@@ -194,7 +173,7 @@ impl Foxstash {
             ef_construction,
             storage: storage_enum,
             storage_arg: storage.to_string(),
-            turbo_bits,
+            rabit_bits,
             rerank_candidates,
             ef_query: ef_construction,
         })

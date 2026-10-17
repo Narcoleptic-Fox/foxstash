@@ -41,11 +41,11 @@ fn main() {
     let k = 100usize;
 
     let storage_s = env("STORAGE", "turborabit4");
-    let (storage, rabit_bits, turbo_bits) = match storage_s.as_str() {
-        "f32" => (Storage::F32, 3, 2),
-        "sq8" => (Storage::SQ8, 3, 2),
-        "turborabit4" => (Storage::TurboRabit, 4, 2),
-        "turborabit3" => (Storage::TurboRabit, 3, 2),
+    let (storage, rabit_bits) = match storage_s.as_str() {
+        "f32" => (Storage::F32, 3),
+        "sq8" => (Storage::SQ8, 3),
+        "turborabit4" => (Storage::TurboRabit, 4),
+        "turborabit3" => (Storage::TurboRabit, 3),
         other => panic!("unsupported STORAGE {other}"),
     };
     let mm: usize = env("M", "32").parse().unwrap();
@@ -81,7 +81,6 @@ fn main() {
         m0: mm * 2,
         ef_construction: efc,
         storage,
-        turbo_bits,
         rabit_bits,
         rerank_candidates: rerank,
         seed: Some(7),
