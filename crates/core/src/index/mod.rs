@@ -76,8 +76,8 @@ pub mod hnsw;
 
 pub use flat::FlatIndex;
 pub use hnsw::{
-    BuildStrategy, DistanceMetric, FilterMask, HNSWConfig, HNSWIndex, MemoryBreakdown, Searcher,
-    Storage,
+    BoundIndex, BuildStrategy, DistanceMetric, FilterMask, HNSWConfig, HNSWIndex, MemoryBreakdown,
+    Searcher, Storage, VectorSource,
 };
 
 use crate::{Document, Result, SearchResult};

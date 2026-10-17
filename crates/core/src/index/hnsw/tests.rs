@@ -998,7 +998,7 @@ fn an_undersized_scratch_context_is_regrown_before_use() {
     assert!(stale.capacity < index.len());
 
     let results = index
-        .search_inner(&[1.0, 0.0, 0.0], 5, &mut stale, None)
+        .search_inner(&[1.0, 0.0, 0.0], 5, &mut stale, None, None)
         .unwrap();
 
     assert_eq!(results.len(), 5);
@@ -3290,11 +3290,11 @@ fn use_heuristic_selects_a_different_neighbor_set_than_simple() {
     };
 
     let heuristic_selected: HashSet<usize> = build_index(true)
-        .select_neighbors(&[0, 1, 2], &query, 2, 0)
+        .select_neighbors(&[0, 1, 2], &query, 2, 0, None)
         .into_iter()
         .collect();
     let simple_selected: HashSet<usize> = build_index(false)
-        .select_neighbors(&[0, 1, 2], &query, 2, 0)
+        .select_neighbors(&[0, 1, 2], &query, 2, 0, None)
         .into_iter()
         .collect();
 
@@ -3355,8 +3355,8 @@ fn extend_candidates_pulls_in_neighbors_of_candidates() {
         index
     };
 
-    let extended = build_index(true).select_neighbors(&[0], &query, 2, 0);
-    let not_extended = build_index(false).select_neighbors(&[0], &query, 2, 0);
+    let extended = build_index(true).select_neighbors(&[0], &query, 2, 0, None);
+    let not_extended = build_index(false).select_neighbors(&[0], &query, 2, 0, None);
 
     assert_eq!(
         not_extended.len(),
@@ -4634,5 +4634,196 @@ fn requantize_rejects_every_incompatible_config_field() {
             index.requantize(cfg).is_err(),
             "requantize accepted a changed `{label}` — the graph was not built under it"
         );
+    }
+}
+
+// ─── Issue #58: externalized rerank vectors (VectorSource / BoundIndex) ───────────────────────
+
+/// A trivial [`VectorSource`] over a node-id-indexed vector table, standing in for a
+/// `foxstash-db` Collection's document store.
+struct VecSrc {
+    vecs: Vec<Vec<f32>>,
+}
+impl VectorSource for VecSrc {
+    fn vector(&self, node: usize) -> &[f32] {
+        &self.vecs[node]
+    }
+}
+
+fn external_test_config() -> HNSWConfig {
+    HNSWConfig {
+        metric: DistanceMetric::Cosine,
+        m: 12,
+        m0: 24,
+        ef_construction: 100,
+        ef_search: 60,
+        storage: Storage::TurboRabit,
+        rabit_bits: 4,
+        rerank_candidates: 100,
+        seed: Some(4),
+        ..Default::default()
+    }
+}
+
+/// The injected-source rerank path must compute **exactly** the same thing as the owned-`full`
+/// path. Proven on one graph (no parallel-build nondeterminism): bind a source over the index's
+/// own vectors and assert `with_vectors(src).search` equals `search` id-for-id and score-for-score.
+/// If the two ever diverge, the rerank logic has been forked — the bug class this crate paid for
+/// in its 1.0 audit.
+#[test]
+fn external_vector_source_matches_owned_rerank_exactly() {
+    let dim = 64;
+    let (base, queries) = rerank_fixture(dim);
+    let index = HNSWIndex::build_parallel(base, external_test_config());
+    assert!(
+        !index.full.is_empty(),
+        "fixture must retain f32 so the owned path has something to rerank against"
+    );
+    // Node-id-indexed view of the index's own exact vectors.
+    let own: Vec<Vec<f32>> = index
+        .get_all_documents()
+        .into_iter()
+        .map(|d| d.embedding)
+        .collect();
+    let src = VecSrc { vecs: own };
+
+    for q in &queries {
+        let owned = index.search(q, 10).expect("owned search");
+        let ext = index.with_vectors(&src).search(q, 10).expect("ext search");
+        assert_eq!(owned.len(), ext.len());
+        for (a, b) in owned.iter().zip(&ext) {
+            assert_eq!(
+                a.id, b.id,
+                "rerank picked a different node via the external source"
+            );
+            assert_eq!(
+                a.score.to_bits(),
+                b.score.to_bits(),
+                "same node scored differently through the external source"
+            );
+        }
+    }
+}
+
+/// `build_parallel_from_documents_external` drops `full`, flags the index external, and hands back
+/// a node → input-index map that aligns with the (shuffled, reordered) node order. Searching it via
+/// `with_vectors` recovers the same recall as the owned path, and a plain `search` is refused.
+#[test]
+fn external_build_provenance_full_dropped_and_search_guarded() {
+    let dim = 64;
+    let (base, queries) = rerank_fixture(dim);
+    let docs: Vec<Document> = base
+        .iter()
+        .enumerate()
+        .map(|(i, v)| create_test_document(&i.to_string(), v.clone()))
+        .collect();
+
+    // Standalone baseline recall (owns full).
+    let standalone = HNSWIndex::build_parallel_from_documents(docs.clone(), external_test_config());
+    let standalone_recall = recall_against_exact(&standalone, &base, &queries, 10);
+
+    let (ext, node_to_input) =
+        HNSWIndex::build_parallel_from_documents_external(docs.clone(), external_test_config());
+    assert!(ext.vectors_external());
+    assert!(
+        ext.full.is_empty(),
+        "external build must not retain a full pool"
+    );
+    assert_eq!(ext.len(), base.len());
+    assert_eq!(node_to_input.len(), ext.len());
+
+    // Provenance is exact: node n carries input doc node_to_input[n].
+    for n in 0..ext.len() {
+        assert_eq!(
+            ext.node_ids()[n],
+            docs[node_to_input[n] as usize].id,
+            "node {n} id does not match its provenance input index"
+        );
+    }
+
+    // Plain search is refused (no owned f32 to rerank against).
+    assert!(
+        ext.search(&queries[0], 10).is_err(),
+        "an external index must refuse a plain search"
+    );
+
+    // Node-id-indexed source built from the external store, exactly as a Collection would.
+    let vecs: Vec<Vec<f32>> = (0..ext.len())
+        .map(|n| docs[node_to_input[n] as usize].embedding.clone())
+        .collect();
+    let src = VecSrc { vecs };
+
+    // Recall through the external source matches the standalone within a small tolerance (the two
+    // graphs differ because the parallel builder is not reproducible, so this is not bit-equal).
+    let mut total = 0.0;
+    for q in &queries {
+        let got: HashSet<usize> = ext
+            .with_vectors(&src)
+            .search(q, 10)
+            .expect("ext search")
+            .into_iter()
+            .filter_map(|r| r.id.parse::<usize>().ok())
+            .collect();
+        let mut exact: Vec<(f32, usize)> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let d: f32 = v.iter().zip(q).map(|(a, b)| a * b).sum();
+                let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                (-d / n.max(1e-12), i)
+            })
+            .collect();
+        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let truth: HashSet<usize> = exact.iter().take(10).map(|(_, i)| *i).collect();
+        total += truth.intersection(&got).count() as f32 / 10.0;
+    }
+    let ext_recall = total / queries.len() as f32;
+    assert!(
+        (ext_recall - standalone_recall).abs() < 0.05,
+        "external recall {ext_recall:.4} diverged from standalone {standalone_recall:.4}"
+    );
+}
+
+/// A v4 snapshot of an external index round-trips: the flag and the empty `full` survive, and
+/// searching the reloaded index via `with_vectors` gives bit-identical results to the original.
+#[test]
+fn external_index_snapshot_round_trips() {
+    let dim = 64;
+    let (base, queries) = rerank_fixture(dim);
+    let docs: Vec<Document> = base
+        .iter()
+        .enumerate()
+        .map(|(i, v)| create_test_document(&i.to_string(), v.clone()))
+        .collect();
+    let (ext, node_to_input) =
+        HNSWIndex::build_parallel_from_documents_external(docs.clone(), external_test_config());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("external.snapshot");
+    ext.snapshot_to_file(&path).expect("snapshot");
+    let reloaded = HNSWIndex::snapshot_from_file(&path).expect("load");
+
+    assert!(
+        reloaded.vectors_external(),
+        "external flag lost across snapshot"
+    );
+    assert!(
+        reloaded.full.is_empty(),
+        "reloaded external index must have no full"
+    );
+    assert_eq!(reloaded.node_ids(), ext.node_ids());
+
+    let vecs: Vec<Vec<f32>> = (0..ext.len())
+        .map(|n| docs[node_to_input[n] as usize].embedding.clone())
+        .collect();
+    let src = VecSrc { vecs };
+    for q in &queries {
+        let before = ext.with_vectors(&src).search(q, 10).expect("before");
+        let after = reloaded.with_vectors(&src).search(q, 10).expect("after");
+        assert_eq!(before.len(), after.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
+        }
     }
 }
