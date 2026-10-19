@@ -29,8 +29,10 @@ use tracing::debug;
 /// the purged content. See the KB page `projects/foxstash/deletion-retention`.
 ///
 /// Note: this erases the plaintext artifacts. Unlinked blocks are not zeroed; for cryptographic
-/// erasure, pair with encryption at rest and destroy the key (the caller owns it). In-place key
-/// rotation is not supported yet (issue #71).
+/// erasure, pair with encryption at rest and destroy the key (the caller owns it). A store has one
+/// key, so destroying it discards the whole store; in-place key rotation is not supported yet (issue
+/// #71), so erasing only the purged content means rebuilding into a new store under a new key and
+/// destroying the old.
 #[derive(Debug, Clone)]
 pub struct PurgeReport {
     /// How many of the requested ids existed and were deleted.
