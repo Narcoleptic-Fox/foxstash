@@ -20,7 +20,9 @@ construction surface.
   artifact older than the first post-delete checkpoint is pruned, and the report proves
   `surviving_min_generation >= purge_generation` (a violation is a hard error, never a silent partial
   purge). It erases the plaintext artifacts; `fs::remove_file` does not zero blocks, so cryptographic
-  erasure still needs encryption at rest plus key rotation. (#59)
+  erasure still needs encryption at rest plus destroying the key. With one store-wide key and no
+  in-place rotation yet (#71), that means rebuilding into a new store under a new key and destroying
+  the old. (#59) *Corrected 2026-10-19: this entry said "key rotation".*
 - **Externalized rerank vectors** so a reranking `Collection` keeps the full f32 embeddings **once**,
   not twice. The index reranks against the document store via a new `VectorSource` trait and
   `HNSWIndex::with_vectors` / `build_parallel_from_documents_external` / `node_ids`, instead of
