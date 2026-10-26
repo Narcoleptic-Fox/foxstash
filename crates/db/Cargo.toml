@@ -18,7 +18,7 @@ serde_json.workspace = true
 # Desktop-only dependencies (filesystem, concurrency, error handling)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 thiserror = "2.0"
-parking_lot = "0.12"
+parking_lot = "0.13"
 tracing = "0.1"
 
 [dev-dependencies]

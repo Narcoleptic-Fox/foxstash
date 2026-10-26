@@ -23,7 +23,7 @@ lru = { workspace = true, optional = true }
 
 # Parallelism
 rayon = "1.10"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # SIMD dependencies
 pulp = "0.22"
